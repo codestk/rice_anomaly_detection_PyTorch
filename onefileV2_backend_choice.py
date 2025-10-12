@@ -578,7 +578,7 @@ class MainWindow(QMainWindow):
         self.res_combo.setDisabled(not enable); self.list_cam_btn.setDisabled(not enable); self.test_image_btn.setDisabled(not enable)
         if hasattr(self, 'backend_combo'):
             self.backend_combo.setDisabled(not enable)
-        self.stop_btn.setDisabled(enable); self.capture_btn.setDisabled(enable); self.fps_combo.setDisabled(not enable)
+        self.stop_btn.setDisabled(enable); self.capture_btn.setDisabled(not enable); self.fps_combo.setDisabled(not enable)
 
     def _capture_image(self):
         if not self.is_detection_running or self.current_frame is None:
