@@ -17,9 +17,9 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QObject, pyqtSlot
 from PyQt6.QtGui import QImage, QPixmap
-from PyQt6.QtMultimedia import QMediaDevices
+from PyQt6.QtMultimedia import QMediaDevices # <--- แก้ไขจุดที่ 1
 
-# ... (ส่วน THEME และ open_camera_by_index เหมือนเดิม) ...
+# -------------------- THEME --------------------
 DARK_THEME_STYLESHEET = """
 QWidget { background-color: #2b2b2b; color: #f0f0f0; font-size: 10pt; border: none; }
 QMainWindow { background-color: #3c3c3c; }
@@ -36,13 +36,16 @@ QCheckBox::indicator:checked { background-color: #0078d7; border: 1px solid #007
 QStatusBar { background-color: #3c3c3c; font-size: 11pt; }
 """
 
+# -------------------- CAMERA HELPERS --------------------
 def open_camera_by_index(index, resolution=None, prefer_backend="MSMF"):
+    """Try multiple backends for maximum compatibility on Windows."""
     if prefer_backend == "MSMF":
         backends = [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]
     elif prefer_backend == "DSHOW":
         backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
     else:
         backends = [cv2.CAP_ANY, cv2.CAP_MSMF, cv2.CAP_DSHOW]
+
     cap = None
     for be in backends:
         tmp = cv2.VideoCapture(index, be)
@@ -58,7 +61,13 @@ def open_camera_by_index(index, resolution=None, prefer_backend="MSMF"):
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resolution[1])
     return cap
 
+# -------------------- DETECTOR --------------------
 class AnomalyDetector:
+    """Modes:
+    - 'recon': model/diff anomalies (moth/shape/texture)
+    - 'color': HSV yellow detection
+    - 'hybrid': OR-combine recon + color
+    """
     def __init__(self):
         self.model = None
         self.device = "cpu"
@@ -68,7 +77,6 @@ class AnomalyDetector:
         self.h_low, self.h_high = 15, 35
         self.s_min, self.v_min = 60, 120
         self.mode = 'recon'
-        self.first_inference = True # <--- LOGGING FLAG
 
     def set_mode(self, mode: str):
         self.mode = mode
@@ -123,25 +131,14 @@ class AnomalyDetector:
         upper2 = np.array([min(self.h_high+5,179), 255, 255], dtype=np.uint8)
         return cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
 
-    def _mask_recon_or_dummy(self, frame, is_first_frame=False):
+    def _mask_recon_or_dummy(self, frame):
         try:
             if self.model is not None and self.model != "loaded" and callable(self.model):
                 with torch.no_grad():
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     inp = F.to_tensor(rgb).unsqueeze(0).to(torch.device(self.device))
                     if hasattr(self.model, 'eval'): self.model.eval()
-
-                    if self.first_inference: # <--- LOGGING
-                         print(f"[LOG {time.time():.2f}]   - Performing FIRST model inference (model warm-up)...")
-                         start_infer_time = time.time()
-
                     rec = self.model(inp)
-
-                    if self.first_inference: # <--- LOGGING
-                        end_infer_time = time.time()
-                        print(f"[LOG {end_infer_time:.2f}]   - FIRST model inference took {end_infer_time - start_infer_time:.4f} seconds.")
-                        self.first_inference = False
-
                     rec = rec.squeeze(0).detach().cpu().numpy()
                     rec = np.transpose(rec, (1,2,0))
                     rec = np.clip(rec*255, 0, 255).astype(np.uint8)
@@ -160,7 +157,7 @@ class AnomalyDetector:
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
         return mask, float((np.square(diff)).mean())
 
-    def process_frame(self, frame, is_first_frame=False):
+    def process_frame(self, frame):
         if self.mode == 'color':
             mask = self._mask_color(frame)
             contours = self._contours_from_mask(mask)
@@ -175,7 +172,7 @@ class AnomalyDetector:
             return out, mse, is_anom
 
         if self.mode == 'recon':
-            mask, mse = self._mask_recon_or_dummy(frame, is_first_frame)
+            mask, mse = self._mask_recon_or_dummy(frame)
             contours = self._contours_from_mask(mask)
             out = frame.copy()
             for c in contours:
@@ -187,7 +184,7 @@ class AnomalyDetector:
             return out, mse, is_anom
 
         # HYBRID OR
-        mask_recon, mse = self._mask_recon_or_dummy(frame, is_first_frame)
+        mask_recon, mse = self._mask_recon_or_dummy(frame)
         mask_color = self._mask_color(frame)
         contours_recon = self._contours_from_mask(mask_recon)
         contours_color = self._contours_from_mask(mask_color)
@@ -204,6 +201,7 @@ class AnomalyDetector:
         mse_hybrid = 0.5*mse + 0.5*(mask_color.mean()/255.0)
         return out, float(mse_hybrid), is_anom
 
+# -------------------- THREADS --------------------
 class VideoThread(QThread):
     change_pixmap_signal = pyqtSignal(np.ndarray)
     def __init__(self, camera_index=0, resolution=None, fps_limit=None):
@@ -213,16 +211,10 @@ class VideoThread(QThread):
         self._run_flag = True
         self.sleep_duration_ms = int(1000 / fps_limit) if fps_limit else 0
     def run(self):
-        print(f"[LOG {time.time():.2f}] VideoThread entered run() method.")
-        print(f"[LOG {time.time():.2f}] Starting to open camera index {self.camera_index}...")
-        start_cam_time = time.time()
         cap = open_camera_by_index(self.camera_index, self.resolution, prefer_backend="MSMF")
-        end_cam_time = time.time()
-        print(f"[LOG {end_cam_time:.2f}] Camera opened. Took {end_cam_time - start_cam_time:.4f} seconds.")
         if cap is None:
             print(f"Error: Cannot open camera {self.camera_index} with any backend")
             return
-        print(f"[LOG {time.time():.2f}] Entering main capture loop...")
         while self._run_flag:
             ret, frame = cap.read()
             if ret:
@@ -232,8 +224,6 @@ class VideoThread(QThread):
             else:
                 self.msleep(50)
         cap.release()
-        print(f"[LOG {time.time():.2f}] VideoThread capture loop finished.")
-
     def stop(self):
         self._run_flag = False
         self.wait()
@@ -249,11 +239,10 @@ class DetectionWorker(QObject):
         self.last_save_time = 0
         self.anomaly_count = 0
         self.beep_enabled = False
-        self.first_frame_processed = False # <--- LOGGING FLAG
 
     def _beep_thread_target(self):
         try:
-            winsound.Beep(1000, 200)
+            winsound.Beep(1000, 200) # Frequency 1000 Hz, Duration 200 ms
         except Exception as e:
             print(f"Error playing beep sound: {e}")
 
@@ -266,20 +255,8 @@ class DetectionWorker(QObject):
     def process_frame(self, cv_img):
         if self.is_busy: return
         self.is_busy = True
-
-        is_first_frame = not self.first_frame_processed
-        if is_first_frame:
-            print(f"[LOG {time.time():.2f}] Processing FIRST frame in DetectionWorker...")
-            start_process_time = time.time()
-
         original_frame = cv_img.copy()
-        processed_frame, mse, is_anomaly = self.detector.process_frame(cv_img, is_first_frame)
-
-        if is_first_frame:
-            end_process_time = time.time()
-            print(f"[LOG {end_process_time:.2f}] FIRST frame processed. Took {end_process_time - start_process_time:.4f} seconds.")
-            self.first_frame_processed = True
-
+        processed_frame, mse, is_anomaly = self.detector.process_frame(cv_img)
         if is_anomaly:
             self.anomaly_count += 1
             self._play_beep_async()
@@ -300,16 +277,15 @@ class DetectionWorker(QObject):
     @pyqtSlot(bool)
     def set_beep_enabled(self, status):
         self.beep_enabled = status
+
     @pyqtSlot(bool)
     def set_auto_save(self, status):
         self.auto_save = status
     def reset_counter(self):
         self.anomaly_count = 0
-        self.first_frame_processed = False
-        self.detector.first_inference = True
 
+# -------------------- GUI --------------------
 class MainWindow(QMainWindow):
-    # ... (ส่วน __init__ และอื่นๆ เหมือนเดิม) ...
     trigger_process = pyqtSignal(np.ndarray)
     def __init__(self):
         super().__init__()
@@ -373,6 +349,7 @@ class MainWindow(QMainWindow):
         cr.addWidget(QLabel('Resolution:'))
 
         self.fps_combo = QComboBox(); self.fps_options = ['Uncapped','60','30','15']; self.fps_combo.addItems(self.fps_options); cr.addWidget(self.fps_combo)
+        #["Source/Native","2592x1440","2304x1296","1920x1080","1600x900","1280x720","1024x576","960x540","800x450","640x480"]  
         self.res_combo = QComboBox(); self.resolution_options = ['Source/Native','2592x1944', '2560x1440', '2048x1536', '1600x1200', '1280X960', '1024x768', '960X720', '800x600', '848x480', '640x360', '2592x1440', '2304x1296', '1920x1080', '1600x900', '1280x720', '1024x576', '960x540', '800x450', '640x480']; self.res_combo.addItems(self.resolution_options); cr.addWidget(self.res_combo)
         cr.addWidget(QLabel('Frame Rate:'))
         left.addLayout(cr)
@@ -463,12 +440,14 @@ class MainWindow(QMainWindow):
             if self.mode_combo.currentIndex() == 0:
                 self.start_btn.setDisabled(True); self.test_image_btn.setDisabled(True)
 
-    def _list_cameras(self):
+    def _list_cameras(self): # <--- แก้ไขจุดที่ 2
         self.cam_combo.clear()
+        # Get the list of available video input devices
         available_cameras = QMediaDevices.videoInputs()
         if not available_cameras:
             self.cam_combo.addItem('No Camera Found')
         else:
+            # Add the camera's friendly name to the combo box
             for camera_device in available_cameras:
                 self.cam_combo.addItem(camera_device.description())
 
@@ -525,25 +504,15 @@ class MainWindow(QMainWindow):
         self._reprocess_image()
 
     def _start_detection(self):
-        start_time_total = time.time()
-        print(f"\n[LOG {start_time_total:.2f}] 'Start Detection' button clicked.")
-
         if self.cam_combo.currentText() == 'No Camera Found':
             self.status_bar.showMessage('Error: No camera selected or found.'); return
         self.last_tested_image = None; self.status_bar.showMessage('Starting detection...')
         self.frame_count = 0; self.start_time = time.time(); self.detection_worker.reset_counter()
         res_text = self.res_combo.currentText(); resolution = tuple(map(int, res_text.split('x'))) if res_text != 'Source/Native' else None
         fps_text = self.fps_combo.currentText(); fps_limit = int(fps_text) if fps_text != 'Uncapped' else None
-
-        print(f"[LOG {time.time():.2f}] Creating VideoThread...")
         self.video_thread = VideoThread(camera_index=self.cam_combo.currentIndex(), resolution=resolution, fps_limit=fps_limit)
-        self.video_thread.change_pixmap_signal.connect(self.update_image)
-        
-        print(f"[LOG {time.time():.2f}] Starting VideoThread...")
-        self.video_thread.start()
-        
+        self.video_thread.change_pixmap_signal.connect(self.update_image); self.video_thread.start()
         self.is_detection_running = True; self._toggle_controls(False)
-        print(f"[LOG {time.time():.2f}] _start_detection function finished. Total time: {time.time() - start_time_total:.4f} seconds.")
 
     def _stop_detection(self):
         if hasattr(self,'video_thread') and self.video_thread.isRunning(): self.video_thread.stop()
@@ -552,7 +521,6 @@ class MainWindow(QMainWindow):
             self.video_label.setText("Press 'Start Detection' or 'Test Image' to begin")
         self.status_bar.showMessage('Detection stopped.'); self._toggle_controls(True)
 
-    # ... (ส่วนที่เหลือของ MainWindow เหมือนเดิม) ...
     def _toggle_controls(self, enable):
         self.start_btn.setDisabled(not enable); self.browse_btn.setDisabled(not enable); self.cam_combo.setDisabled(not enable)
         self.res_combo.setDisabled(not enable); self.list_cam_btn.setDisabled(not enable); self.test_image_btn.setDisabled(not enable)
@@ -565,8 +533,8 @@ class MainWindow(QMainWindow):
         processed_frame, _, _ = self.detector.process_frame(original_frame.copy())
         anomaly_count = self.detection_worker.anomaly_count
         h,w,_ = processed_frame.shape; margin = 10
-        fps_text = f'FPS: {self.fps:.2f}'; cv2.putText(processed_frame, fps_text, (margin, h-margin), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 2)
-        res_text = f'{w}x{h}'; (res_w,_),_ = cv2.getTextSize(res_text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 2); cv2.putText(processed_frame, res_text, (w-res_w-margin, h-margin), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 2)
+        fps_text = f'FPS: {self.fps:.2f}'; cv2.putText(processed_frame, fps_text, (margin, h-margin), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
+        res_text = f'{w}x{h}'; (res_w,_),_ = cv2.getTextSize(res_text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2); cv2.putText(processed_frame, res_text, (w-res_w-margin, h-margin), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
         det_text = f'Detections: {anomaly_count}'; (det_w,_),_ = cv2.getTextSize(det_text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3); cv2.putText(processed_frame, det_text, (w-det_w-margin, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
         ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]; fname = f'capture_{ts}.jpg'
         det_dir = os.path.join('output','captures_detected'); ori_dir = os.path.join('output','captures_original')
@@ -630,6 +598,7 @@ class MainWindow(QMainWindow):
             out_dir = 'output'
             if os.path.exists(out_dir):
                 shutil.rmtree(out_dir)
+            # recreate base structure (optional)
             os.makedirs(os.path.join(out_dir, 'detections'), exist_ok=True)
             os.makedirs(os.path.join(out_dir, 'original'), exist_ok=True)
             os.makedirs(os.path.join(out_dir, 'captures_detected'), exist_ok=True)
@@ -699,7 +668,7 @@ class MainWindow(QMainWindow):
         s.setValue('h_high', self.h_high_slider.value())
         s.setValue('s_min', self.s_min_slider.value())
         s.setValue('v_min', self.v_min_slider.value())
-        s.setValue('beep_enabled', self.beep_check.isChecked())
+        s.setValue('beep_enabled', self.beep_check.isChecked()) # Save beep check state
 
     def _load_settings(self):
         s = QSettings('MyCompany','AnomalyApp')
@@ -723,6 +692,7 @@ class MainWindow(QMainWindow):
         self.s_min_label.setText(str(self.s_min_slider.value())); self.v_min_label.setText(str(self.v_min_slider.value()))
         self.detector.set_hsv_thresholds(self.h_low_slider.value(), self.h_high_slider.value(), self.s_min_slider.value(), self.v_min_slider.value())
         self._enable_hsv_controls(self.mode_combo.currentIndex() in (1,2))
+        # Load beep check state
         self.beep_check.setChecked(s.value('beep_enabled', False, type=bool))
         self.detection_worker.set_beep_enabled(self.beep_check.isChecked())
         if mode_idx in (1,2) and not model_path:
