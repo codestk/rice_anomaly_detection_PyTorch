@@ -37,9 +37,10 @@ QStatusBar { background-color: #3c3c3c; font-size: 11pt; }
 """
 
 def open_camera_by_index(index, resolution=None, prefer_backend="MSMF"):
-    if prefer_backend == "MSMF":
+    pref = (prefer_backend or "AUTO").upper()
+    if pref == "MSMF":
         backends = [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]
-    elif prefer_backend == "DSHOW":
+    elif pref == "DSHOW":
         backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
     else:
         backends = [cv2.CAP_ANY, cv2.CAP_MSMF, cv2.CAP_DSHOW]
@@ -206,17 +207,18 @@ class AnomalyDetector:
 
 class VideoThread(QThread):
     change_pixmap_signal = pyqtSignal(np.ndarray)
-    def __init__(self, camera_index=0, resolution=None, fps_limit=None):
+    def __init__(self, camera_index=0, resolution=None, fps_limit=None, prefer_backend="AUTO"):
         super().__init__()
         self.camera_index = camera_index
         self.resolution = resolution
         self._run_flag = True
         self.sleep_duration_ms = int(1000 / fps_limit) if fps_limit else 0
+        self.prefer_backend = prefer_backend
     def run(self):
         print(f"[LOG {time.time():.2f}] VideoThread entered run() method.")
-        print(f"[LOG {time.time():.2f}] Starting to open camera index {self.camera_index}...")
+        print(f"[LOG {time.time():.2f}] Starting to open camera index {self.camera_index} using backend {self.prefer_backend}...")
         start_cam_time = time.time()
-        cap = open_camera_by_index(self.camera_index, self.resolution, prefer_backend="MSMF")
+        cap = open_camera_by_index(self.camera_index, self.resolution, prefer_backend=self.prefer_backend)
         end_cam_time = time.time()
         print(f"[LOG {end_cam_time:.2f}] Camera opened. Took {end_cam_time - start_cam_time:.4f} seconds.")
         if cap is None:
@@ -370,6 +372,10 @@ class MainWindow(QMainWindow):
         cr = QHBoxLayout(); cr.addWidget(QLabel('Source:'))
         self.cam_combo = QComboBox(); cr.addWidget(self.cam_combo)
         self.list_cam_btn = QPushButton('List Cameras'); self.list_cam_btn.clicked.connect(self._list_cameras); cr.addWidget(self.list_cam_btn)
+        cr.addWidget(QLabel('Backend:'))
+        self.backend_combo = QComboBox(); self.backend_options = ['Auto','MSMF','DSHOW']; self.backend_combo.addItems(self.backend_options)
+        self.backend_combo.currentIndexChanged.connect(lambda _: self._list_cameras())
+        cr.addWidget(self.backend_combo)
         cr.addWidget(QLabel('Resolution:'))
 
         self.fps_combo = QComboBox(); self.fps_options = ['Uncapped','60','30','15']; self.fps_combo.addItems(self.fps_options); cr.addWidget(self.fps_combo)
@@ -465,12 +471,19 @@ class MainWindow(QMainWindow):
 
     def _list_cameras(self):
         self.cam_combo.clear()
+        prefer_backend = getattr(self, 'backend_combo', None)
+        backend_label = prefer_backend.currentText() if prefer_backend else 'Auto'
         available_cameras = QMediaDevices.videoInputs()
         if not available_cameras:
             self.cam_combo.addItem('No Camera Found')
-        else:
-            for camera_device in available_cameras:
-                self.cam_combo.addItem(camera_device.description())
+            if hasattr(self, 'status_bar'):
+                self.status_bar.showMessage(f'No cameras found. Selected backend: {backend_label}.', 3000)
+            return
+        for idx, camera_device in enumerate(available_cameras):
+            description = camera_device.description() or f'Camera {idx}'
+            self.cam_combo.addItem(description)
+        if hasattr(self, 'status_bar'):
+            self.status_bar.showMessage(f'Detected {len(available_cameras)} camera(s). Backend: {backend_label}.', 3000)
 
     def _update_mse_threshold(self, value):
         self.thresh_label.setText(f"{value/1000:.3f}"); self.detector.set_threshold(value/1000.0); self._reprocess_image()
@@ -532,11 +545,18 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage('Error: No camera selected or found.'); return
         self.last_tested_image = None; self.status_bar.showMessage('Starting detection...')
         self.frame_count = 0; self.start_time = time.time(); self.detection_worker.reset_counter()
-        res_text = self.res_combo.currentText(); resolution = tuple(map(int, res_text.split('x'))) if res_text != 'Source/Native' else None
+        res_text = self.res_combo.currentText()
+        resolution = tuple(map(int, res_text.lower().split('x'))) if res_text != 'Source/Native' else None
         fps_text = self.fps_combo.currentText(); fps_limit = int(fps_text) if fps_text != 'Uncapped' else None
+        backend_choice = self.backend_combo.currentText() if hasattr(self, 'backend_combo') else 'Auto'
 
-        print(f"[LOG {time.time():.2f}] Creating VideoThread...")
-        self.video_thread = VideoThread(camera_index=self.cam_combo.currentIndex(), resolution=resolution, fps_limit=fps_limit)
+        print(f"[LOG {time.time():.2f}] Creating VideoThread with backend {backend_choice}...")
+        self.video_thread = VideoThread(
+            camera_index=self.cam_combo.currentIndex(),
+            resolution=resolution,
+            fps_limit=fps_limit,
+            prefer_backend=backend_choice
+        )
         self.video_thread.change_pixmap_signal.connect(self.update_image)
         
         print(f"[LOG {time.time():.2f}] Starting VideoThread...")
@@ -556,7 +576,9 @@ class MainWindow(QMainWindow):
     def _toggle_controls(self, enable):
         self.start_btn.setDisabled(not enable); self.browse_btn.setDisabled(not enable); self.cam_combo.setDisabled(not enable)
         self.res_combo.setDisabled(not enable); self.list_cam_btn.setDisabled(not enable); self.test_image_btn.setDisabled(not enable)
-        self.stop_btn.setDisabled(enable); self.capture_btn.setDisabled(not enable); self.fps_combo.setDisabled(not enable)
+        if hasattr(self, 'backend_combo'):
+            self.backend_combo.setDisabled(not enable)
+        self.stop_btn.setDisabled(enable); self.capture_btn.setDisabled(enable); self.fps_combo.setDisabled(not enable)
 
     def _capture_image(self):
         if not self.is_detection_running or self.current_frame is None:
@@ -690,6 +712,8 @@ class MainWindow(QMainWindow):
         s.setValue('mse_threshold', self.thresh_slider.value())
         s.setValue('cv_threshold', self.cv_thresh_slider.value())
         s.setValue('contour_area', self.contour_slider.value())
+        if hasattr(self, 'backend_combo'):
+            s.setValue('backend_index', self.backend_combo.currentIndex())
         s.setValue('camera_index', self.cam_combo.currentIndex())
         s.setValue('resolution_text', self.res_combo.currentText())
         s.setValue('fps_limit_text', self.fps_combo.currentText())
@@ -708,6 +732,12 @@ class MainWindow(QMainWindow):
         self.thresh_slider.setValue(s.value('mse_threshold',10,type=int))
         self.cv_thresh_slider.setValue(s.value('cv_threshold',40,type=int))
         self.contour_slider.setValue(s.value('contour_area',10,type=int))
+        if hasattr(self, 'backend_combo'):
+            backend_idx = s.value('backend_index', 0, type=int)
+            if 0 <= backend_idx < self.backend_combo.count():
+                self.backend_combo.setCurrentIndex(backend_idx)
+            else:
+                self.backend_combo.setCurrentIndex(0)
         if self.cam_combo.count()>0:
             idx = s.value('camera_index',0,type=int)
             if idx < self.cam_combo.count(): self.cam_combo.setCurrentIndex(idx)

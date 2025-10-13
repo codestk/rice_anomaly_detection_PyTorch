@@ -13,10 +13,10 @@ import threading
 from PyQt6.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QLineEdit, QSlider, QCheckBox,
-    QStatusBar, QComboBox, QSizePolicy, QMessageBox
+    QStatusBar, QComboBox, QSizePolicy, QMessageBox, QColorDialog
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QObject, pyqtSlot
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QObject, pyqtSlot, QPoint
+from PyQt6.QtGui import QImage, QPixmap, QColor
 from PyQt6.QtMultimedia import QMediaDevices
 
 # ... (ส่วน THEME และ open_camera_by_index เหมือนเดิม) ...
@@ -310,6 +310,16 @@ class DetectionWorker(QObject):
         self.first_frame_processed = False
         self.detector.first_inference = True
 
+class ClickableLabel(QLabel):
+    clicked = pyqtSignal(int, int)
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position() if hasattr(event, "position") else event.pos()
+            point = pos.toPoint() if hasattr(pos, "toPoint") else QPoint(int(pos.x()), int(pos.y()))
+            self.clicked.emit(point.x(), point.y())
+        super().mousePressEvent(event)
+
+
 class MainWindow(QMainWindow):
     # ... (ส่วน __init__ และอื่นๆ เหมือนเดิม) ...
     trigger_process = pyqtSignal(np.ndarray)
@@ -324,6 +334,7 @@ class MainWindow(QMainWindow):
         self.frame_count = 0
         self.start_time = 0
         self.fps = 0.0
+        self._last_pixmap_size = (0, 0)
         self.central_widget = QWidget(); self.main_layout = QVBoxLayout(self.central_widget); self.setCentralWidget(self.central_widget)
         self._create_top_bar(); self._create_video_display(); self._create_controls(); self._create_status_bar(); self._setup_detection_thread()
         self.setStyleSheet(DARK_THEME_STYLESHEET)
@@ -350,7 +361,8 @@ class MainWindow(QMainWindow):
     def _create_video_display(self):
         self.video_container = QWidget(); self.video_container.setStyleSheet('background-color:#000; border:1px solid #555;'); self.video_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         lay = QVBoxLayout(self.video_container); lay.setContentsMargins(0,0,0,0)
-        self.video_label = QLabel("Press 'Start Detection' or 'Test Image' to begin"); self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter); self.video_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.video_label = ClickableLabel("Press 'Start Detection' or 'Test Image' to begin"); self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter); self.video_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.video_label.clicked.connect(self._handle_video_click)
         lay.addWidget(self.video_label); self.main_layout.addWidget(self.video_container, stretch=1)
 
     def _create_controls(self):
@@ -419,6 +431,15 @@ class MainWindow(QMainWindow):
         v_min_l = QHBoxLayout(); v_min_l.addWidget(QLabel('Value Min:'))
         self.v_min_slider = QSlider(Qt.Orientation.Horizontal); self.v_min_slider.setRange(0,255); self.v_min_slider.setValue(120); self.v_min_slider.valueChanged.connect(self._update_hsv)
         self.v_min_label = QLabel('120'); v_min_l.addWidget(self.v_min_slider); v_min_l.addWidget(self.v_min_label); right.addLayout(v_min_l)
+        hsv_summary_row = QHBoxLayout()
+        self.hsv_pick_btn = QPushButton('Pick Color…')
+        self.hsv_pick_btn.clicked.connect(self._open_hsv_picker)
+        hsv_summary_row.addWidget(self.hsv_pick_btn)
+        self.hsv_summary_label = QLabel()
+        self.hsv_summary_label.setStyleSheet('padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #222; font-weight: bold;')
+        hsv_summary_row.addWidget(self.hsv_summary_label)
+        hsv_summary_row.addStretch()
+        right.addLayout(hsv_summary_row)
 
         # buttons row
         self.start_btn = QPushButton('Start Detection'); self.start_btn.clicked.connect(self._start_detection); self.start_btn.setDisabled(True)
@@ -440,6 +461,7 @@ class MainWindow(QMainWindow):
 
         controls.addLayout(left,3); controls.addLayout(right,2)
         self.main_layout.addLayout(controls); self.main_layout.addLayout(buttons)
+        self._update_hsv_summary()
 
         self._list_cameras(); self._enable_hsv_controls(False)
 
@@ -509,13 +531,19 @@ class MainWindow(QMainWindow):
             self.detection_worker.set_beep_enabled(checked)
 
     def _enable_hsv_controls(self, enabled: bool):
-        for w in [self.h_low_slider, self.h_high_slider, self.s_min_slider, self.v_min_slider, self.h_low_label, self.h_high_label, self.s_min_label, self.v_min_label]:
+        for w in [self.h_low_slider, self.h_high_slider, self.s_min_slider, self.v_min_slider,
+                  self.h_low_label, self.h_high_label, self.s_min_label, self.v_min_label]:
             w.setEnabled(enabled)
+        if hasattr(self, 'hsv_pick_btn'):
+            self.hsv_pick_btn.setEnabled(enabled)
+        if hasattr(self, 'hsv_summary_label'):
+            self.hsv_summary_label.setEnabled(True)
 
     def _mode_changed(self, idx):
         mode = ['reconstruction/model','color','hybrid'][idx]
         self.detector.set_mode({'reconstruction/model':'recon','color':'color','hybrid':'hybrid'}[mode])
         self._enable_hsv_controls(idx in (1,2))
+        self._update_hsv_summary()
         if idx in (1,2):
             self.start_btn.setDisabled(False); self.test_image_btn.setDisabled(False)
         else:
@@ -535,7 +563,86 @@ class MainWindow(QMainWindow):
         self.h_low_label.setText(str(h_low)); self.h_high_label.setText(str(h_high))
         self.s_min_label.setText(str(s_min)); self.v_min_label.setText(str(v_min))
         self.detector.set_hsv_thresholds(h_low=h_low, h_high=h_high, s_min=s_min, v_min=v_min)
+        self._update_hsv_summary()
         self._reprocess_image()
+
+    def _update_hsv_summary(self):
+        if not hasattr(self, 'hsv_summary_label'):
+            return
+        h_low = self.h_low_slider.value(); h_high = self.h_high_slider.value()
+        s_min = self.s_min_slider.value(); v_min = self.v_min_slider.value()
+        self.hsv_summary_label.setText(f'H {h_low}-{h_high} | S ≥ {s_min} | V ≥ {v_min}')
+        hue_mid = max(0, min(179, (h_low + h_high) // 2))
+        sat_preview = max(s_min, min(255, s_min + (255 - s_min) // 2))
+        val_preview = max(v_min, min(255, v_min + (255 - v_min) // 2))
+        preview_color = QColor.fromHsv(hue_mid * 2, sat_preview, val_preview)
+        text_color = '#000' if preview_color.value() > 160 else '#fff'
+        self.hsv_summary_label.setStyleSheet(
+            f'padding: 4px 8px; border: 1px solid #555; border-radius: 4px;'
+            f'background-color: {preview_color.name()}; color: {text_color}; font-weight: bold;'
+        )
+
+    def _apply_sampled_hsv(self, h_cv, s, v):
+        h_cv = int(max(0, min(179, h_cv)))
+        s = int(max(0, min(255, s)))
+        v = int(max(0, min(255, v)))
+        current_span = max(2, self.h_high_slider.value() - self.h_low_slider.value())
+        half_span = current_span // 2
+        new_low = max(0, min(179, h_cv - half_span))
+        new_high = max(0, min(179, h_cv + half_span))
+        updates = (
+            (self.h_low_slider, new_low),
+            (self.h_high_slider, new_high),
+            (self.s_min_slider, s),
+            (self.v_min_slider, v),
+        )
+        for slider, value in updates:
+            slider.blockSignals(True)
+            slider.setValue(value)
+            slider.blockSignals(False)
+        self._update_hsv(None)
+
+    def _open_hsv_picker(self):
+        initial_color = QColor.fromHsv(self.h_low_slider.value() * 2, self.s_min_slider.value(), max(0, self.v_min_slider.value()))
+        color = QColorDialog.getColor(initial_color, self, 'Select HSV Color')
+        if not color.isValid():
+            return
+        h, s, v, _ = color.getHsv()
+        if h < 0:
+            h = 0
+        self._apply_sampled_hsv(int(round(h / 2)), s, v)
+
+    def _handle_video_click(self, x, y):
+        if self.mode_combo.currentIndex() not in (1,2):
+            return
+        frame = None
+        if self.is_detection_running and self.current_frame is not None:
+            frame = self.current_frame
+        elif not self.is_detection_running and self.last_tested_image is not None:
+            frame = self.last_tested_image
+        if frame is None:
+            return
+        pixmap = self.video_label.pixmap()
+        if pixmap is None or pixmap.isNull():
+            return
+        pix_w, pix_h = pixmap.width(), pixmap.height()
+        label_w, label_h = self.video_label.width(), self.video_label.height()
+        offset_x = max(0.0, (label_w - pix_w) / 2.0)
+        offset_y = max(0.0, (label_h - pix_h) / 2.0)
+        img_x = x - offset_x
+        img_y = y - offset_y
+        if img_x < 0 or img_y < 0 or img_x >= pix_w or img_y >= pix_h:
+            return
+        frame_h, frame_w = frame.shape[:2]
+        sample_x = int(np.clip((img_x / pix_w) * frame_w, 0, frame_w - 1))
+        sample_y = int(np.clip((img_y / pix_h) * frame_h, 0, frame_h - 1))
+        patch = frame[sample_y:sample_y+1, sample_x:sample_x+1]
+        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)[0,0]
+        self._apply_sampled_hsv(int(hsv[0]), int(hsv[1]), int(hsv[2]))
+        self.status_bar.showMessage(
+            f'Sampled HSV at ({sample_x},{sample_y}) → H:{int(hsv[0])} S:{int(hsv[1])} V:{int(hsv[2])}',
+            4000
+        )
 
     def _start_detection(self):
         start_time_total = time.time()
@@ -578,7 +685,9 @@ class MainWindow(QMainWindow):
         self.res_combo.setDisabled(not enable); self.list_cam_btn.setDisabled(not enable); self.test_image_btn.setDisabled(not enable)
         if hasattr(self, 'backend_combo'):
             self.backend_combo.setDisabled(not enable)
-        self.stop_btn.setDisabled(enable); self.capture_btn.setDisabled(not enable); self.fps_combo.setDisabled(not enable)
+        if hasattr(self, 'hsv_pick_btn'):
+            self.hsv_pick_btn.setDisabled((not enable) or self.mode_combo.currentIndex() not in (1,2))
+        self.stop_btn.setDisabled(enable); self.capture_btn.setDisabled(enable); self.fps_combo.setDisabled(not enable)
 
     def _capture_image(self):
         if not self.is_detection_running or self.current_frame is None:
@@ -674,13 +783,16 @@ class MainWindow(QMainWindow):
 
     def _reprocess_image(self):
         if self.last_tested_image is None or self.is_detection_running: return
+        self.current_frame = self.last_tested_image.copy()
         processed_frame, mse, is_anomaly = self.detector.process_frame(self.last_tested_image.copy())
         if is_anomaly:
             h,w,_ = processed_frame.shape; text='Detections: 1'; (tw,_),_ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)
             cv2.putText(processed_frame, text, (w-tw-10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
         mode_map = {'recon':'Recon','color':'HSV','hybrid':'Hybrid'}; mode = mode_map[self.detector.mode]
         self.status_bar.showMessage(f"Last Image Test | Mode: {mode} | MSE: {mse:.4f} | Anomaly: {'Yes' if is_anomaly else 'No'}")
-        self.video_label.setPixmap(self.convert_cv_qt(processed_frame))
+        pixmap = self.convert_cv_qt(processed_frame)
+        self.video_label.setPixmap(pixmap)
+        self._last_pixmap_size = (pixmap.width(), pixmap.height())
 
     @pyqtSlot(np.ndarray)
     def update_image(self, cv_img):
@@ -698,7 +810,9 @@ class MainWindow(QMainWindow):
         cv2.putText(processed_frame, res_text, (w-rw-margin, h-margin), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
         det_text = f'Detections: {anomaly_count}'; (dw,_),_ = cv2.getTextSize(det_text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)
         cv2.putText(processed_frame, det_text, (w-dw-margin, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
-        self.video_label.setPixmap(self.convert_cv_qt(processed_frame))
+        pixmap = self.convert_cv_qt(processed_frame)
+        self.video_label.setPixmap(pixmap)
+        self._last_pixmap_size = (pixmap.width(), pixmap.height())
 
     def convert_cv_qt(self, cv_img):
         rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
@@ -753,6 +867,7 @@ class MainWindow(QMainWindow):
         self.s_min_label.setText(str(self.s_min_slider.value())); self.v_min_label.setText(str(self.v_min_slider.value()))
         self.detector.set_hsv_thresholds(self.h_low_slider.value(), self.h_high_slider.value(), self.s_min_slider.value(), self.v_min_slider.value())
         self._enable_hsv_controls(self.mode_combo.currentIndex() in (1,2))
+        self._update_hsv_summary()
         self.beep_check.setChecked(s.value('beep_enabled', False, type=bool))
         self.detection_worker.set_beep_enabled(self.beep_check.isChecked())
         if mode_idx in (1,2) and not model_path:
