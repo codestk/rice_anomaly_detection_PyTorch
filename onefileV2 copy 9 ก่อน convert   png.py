@@ -293,7 +293,7 @@ class DetectionWorker(QObject):
         now_ts = time.time()
         if is_anomaly and self.auto_save and now_ts - self.last_save_time > 2:
             ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-            fname = f"anomaly_{ts}.png"
+            fname = f"anomaly_{ts}.jpg"
             det_dir = os.path.join('output','detections')
             ori_dir = os.path.join('output','original')
             os.makedirs(det_dir, exist_ok=True)
@@ -307,7 +307,7 @@ class DetectionWorker(QObject):
             if random.random() < self.random_save_probability:
                 ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
                 rand_suffix = random.randint(0, 9999)
-                base_name = f"train_{ts}_{rand_suffix:04d}.png"
+                base_name = f"train_{ts}_{rand_suffix:04d}.jpg"
                 det_dir = os.path.join('output', 'training_samples', 'detected')
                 ori_dir = os.path.join('output', 'training_samples', 'original')
                 os.makedirs(det_dir, exist_ok=True)
@@ -845,7 +845,7 @@ class MainWindow(QMainWindow):
         fps_text = f'FPS: {self.fps:.2f}'; cv2.putText(processed_frame, fps_text, (margin, h-margin), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 2)
         res_text = f'{w}x{h}'; (res_w,_),_ = cv2.getTextSize(res_text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 2); cv2.putText(processed_frame, res_text, (w-res_w-margin, h-margin), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 2)
         det_text = f'Detections: {anomaly_count}'; (det_w,_),_ = cv2.getTextSize(det_text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3); cv2.putText(processed_frame, det_text, (w-det_w-margin, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]; fname = f'capture_{ts}.png'
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]; fname = f'capture_{ts}.jpg'
         det_dir = os.path.join('output','captures_detected'); ori_dir = os.path.join('output','captures_original')
         os.makedirs(det_dir, exist_ok=True); os.makedirs(ori_dir, exist_ok=True)
         cv2.imwrite(os.path.join(det_dir,fname), processed_frame); cv2.imwrite(os.path.join(ori_dir,fname), original_frame)
