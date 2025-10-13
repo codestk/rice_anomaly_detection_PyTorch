@@ -48,43 +48,45 @@ def open_camera_by_index(index, resolution=None, prefer_backend="MSMF", fps=None
 
     fourcc_list = preferred_fourcc or ["YUY2", "MJPG", "H264", None]
 
-    def _apply_settings(cap, fourcc_code):
+    def _apply_settings(capture, fourcc_code):
         if fourcc_code:
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc_code))
+            capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc_code))
         if resolution:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, resolution[0])
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resolution[1])
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, resolution[0])
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, resolution[1])
         if fps:
-            cap.set(cv2.CAP_PROP_FPS, fps)
+            capture.set(cv2.CAP_PROP_FPS, fps)
 
     for backend in backends:
-        base_cap = cv2.VideoCapture(index, backend)
-        if not base_cap.isOpened():
-            base_cap.release()
+        cap = cv2.VideoCapture(index, backend)
+        if not cap.isOpened():
+            cap.release()
             continue
 
         for attempt, fourcc_code in enumerate(fourcc_list):
             if attempt > 0:
-                base_cap.release()
-                base_cap = cv2.VideoCapture(index, backend)
-                if not base_cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(index, backend)
+                if not cap.isOpened():
                     break
 
-            _apply_settings(base_cap, fourcc_code)
+            _apply_settings(cap, fourcc_code)
+
             ok = True
             for _ in range(max(1, warmup_frames)):
-                ret, _ = base_cap.read()
+                ret, _ = cap.read()
                 if not ret:
                     ok = False
                     break
+
             if ok:
                 if fourcc_code:
                     print(f"[LOG {time.time():.2f}] Camera {index}: using FOURCC {fourcc_code} via backend {backend}.")
                 else:
                     print(f"[LOG {time.time():.2f}] Camera {index}: using default FOURCC via backend {backend}.")
-                return base_cap
+                return cap
 
-        base_cap.release()
+        cap.release()
 
     print(f"[LOG {time.time():.2f}] Unable to configure camera {index} with requested formats.")
     return None
@@ -98,8 +100,6 @@ class AnomalyDetector:
         self.mse_threshold = 0.01
         self.h_low, self.h_high = 15, 35
         self.s_min, self.v_min = 60, 120
-        self.h2_low, self.h2_high = 75, 95
-        self.s2_min, self.v2_min = 60, 120
         self.mode = 'recon'
         self.first_inference = True # <--- LOGGING FLAG
 
@@ -112,14 +112,6 @@ class AnomalyDetector:
             self.h_low, self.h_high = self.h_high, self.h_low
         if s_min is not None:  self.s_min  = int(max(0, min(255, s_min)))
         if v_min is not None:  self.v_min  = int(max(0, min(255, v_min)))
-
-    def set_hsv_secondary(self, h_low=None, h_high=None, s_min=None, v_min=None):
-        if h_low is not None:  self.h2_low  = int(max(0, min(179, h_low)))
-        if h_high is not None: self.h2_high = int(max(0, min(179, h_high)))
-        if self.h2_low > self.h2_high:
-            self.h2_low, self.h2_high = self.h2_high, self.h2_low
-        if s_min is not None:  self.s2_min  = int(max(0, min(255, s_min)))
-        if v_min is not None:  self.v2_min  = int(max(0, min(255, v_min)))
     def set_cv_threshold(self, value):
         self.cv_threshold = int(value)
     def set_contour_threshold(self, value):
@@ -164,14 +156,6 @@ class AnomalyDetector:
         upper2 = np.array([min(self.h_high+5,179), 255, 255], dtype=np.uint8)
         return cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
 
-    def _mask_color_secondary(self, frame):
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        lower1 = np.array([self.h2_low, self.s2_min, self.v2_min], dtype=np.uint8)
-        upper1 = np.array([self.h2_high, 255, 255], dtype=np.uint8)
-        lower2 = np.array([max(self.h2_low-5,0), self.s2_min, self.v2_min], dtype=np.uint8)
-        upper2 = np.array([min(self.h2_high+5,179), 255, 255], dtype=np.uint8)
-        return cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
-
     def _mask_recon_or_dummy(self, frame, is_first_frame=False):
         try:
             if self.model is not None and self.model != "loaded" and callable(self.model):
@@ -211,21 +195,16 @@ class AnomalyDetector:
 
     def process_frame(self, frame, is_first_frame=False):
         if self.mode == 'color':
-            mask_primary = self._mask_color(frame)
-            mask_secondary = self._mask_color_secondary(frame)
-            contours_primary = self._contours_from_mask(mask_primary)
-            contours_secondary = self._contours_from_mask(mask_secondary)
+            mask = self._mask_color(frame)
+            contours = self._contours_from_mask(mask)
             out = frame.copy()
-            for c in contours_primary:
+            for c in contours:
                 x,y,w,h = cv2.boundingRect(c)
                 cv2.rectangle(out, (x,y), (x+w,y+h), (0,255,255), 2)
-            for c in contours_secondary:
-                x,y,w,h = cv2.boundingRect(c)
-                cv2.rectangle(out, (x,y), (x+w,y+h), (0,255,0), 2)
-            is_anom = (len(contours_primary) + len(contours_secondary)) > 0
+            is_anom = len(contours) > 0
             if is_anom:
-                cv2.putText(out, 'Color Anomaly (Yellow/Green)', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,255,0), 3)
-            mse = float((mask_primary.mean() + mask_secondary.mean())/(2*255.0))
+                cv2.putText(out, 'Color Anomaly (Yellow)', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,255,255), 3)
+            mse = float(mask.mean()/255.0)
             return out, mse, is_anom
 
         if self.mode == 'recon':
@@ -243,10 +222,8 @@ class AnomalyDetector:
         # HYBRID OR
         mask_recon, mse = self._mask_recon_or_dummy(frame, is_first_frame)
         mask_color = self._mask_color(frame)
-        mask_color_secondary = self._mask_color_secondary(frame)
         contours_recon = self._contours_from_mask(mask_recon)
         contours_color = self._contours_from_mask(mask_color)
-        contours_color_secondary = self._contours_from_mask(mask_color_secondary)
         out = frame.copy()
         for c in contours_recon:
             x,y,w,h = cv2.boundingRect(c)
@@ -254,13 +231,10 @@ class AnomalyDetector:
         for c in contours_color:
             x,y,w,h = cv2.boundingRect(c)
             cv2.rectangle(out, (x,y), (x+w,y+h), (0,255,255), 2)
-        for c in contours_color_secondary:
-            x,y,w,h = cv2.boundingRect(c)
-            cv2.rectangle(out, (x,y), (x+w,y+h), (0,255,0), 2)
-        is_anom = (len(contours_recon) + len(contours_color) + len(contours_color_secondary)) > 0
+        is_anom = (len(contours_recon) + len(contours_color)) > 0
         if is_anom:
             cv2.putText(out, 'HYBRID: Color OR Recon', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255,255,255), 3)
-        mse_hybrid = 0.5*mse + 0.5*((mask_color.mean() + mask_color_secondary.mean())/(2*255.0))
+        mse_hybrid = 0.5*mse + 0.5*(mask_color.mean()/255.0)
         return out, float(mse_hybrid), is_anom
 
 class VideoThread(QThread):
@@ -273,7 +247,6 @@ class VideoThread(QThread):
         self.target_fps = fps_limit
         self.sleep_duration_ms = int(1000 / fps_limit) if fps_limit else 0
         self.prefer_backend = prefer_backend
-        self._paused = False
     def run(self):
         print(f"[LOG {time.time():.2f}] VideoThread entered run() method.")
         print(f"[LOG {time.time():.2f}] Starting to open camera index {self.camera_index} using backend {self.prefer_backend}...")
@@ -291,9 +264,6 @@ class VideoThread(QThread):
             return
         print(f"[LOG {time.time():.2f}] Entering main capture loop...")
         while self._run_flag:
-            if self._paused:
-                self.msleep(50)
-                continue
             ret, frame = cap.read()
             if ret:
                 self.change_pixmap_signal.emit(frame)
@@ -306,14 +276,7 @@ class VideoThread(QThread):
 
     def stop(self):
         self._run_flag = False
-        self._paused = False
         self.wait()
-
-    def pause(self):
-        self._paused = True
-
-    def resume(self):
-        self._paused = False
 
 class DetectionWorker(QObject):
     result_ready = pyqtSignal(np.ndarray, np.ndarray, float, bool, int)
@@ -429,18 +392,17 @@ class MainWindow(QMainWindow):
         self.setGeometry(100,100,1200,800)
         self.detector = AnomalyDetector()
         self.is_detection_running = False
-        self.is_paused = False
         self.current_frame = None
         self.last_tested_image = None
         self.frame_count = 0
         self.start_time = 0
         self.fps = 0.0
         self._last_pixmap_size = (0, 0)
-        self._sample_state = {
-            'primary': {'pending': None, 'timestamp': 0.0, 'first': None, 'second': None, 'combined': None},
-            'secondary': {'pending': None, 'timestamp': 0.0, 'first': None, 'second': None, 'combined': None},
-        }
-        self._current_sample_target = 'primary'
+        self._pending_hsv_sample = None
+        self._pending_hsv_timestamp = 0.0
+        self._hsv_first_sample = None
+        self._hsv_second_sample = None
+        self._hsv_combined_range = None
         self.central_widget = QWidget(); self.main_layout = QVBoxLayout(self.central_widget); self.setCentralWidget(self.central_widget)
         self._create_top_bar(); self._create_video_display(); self._create_controls(); self._create_status_bar(); self._setup_detection_thread()
         self.setStyleSheet(DARK_THEME_STYLESHEET)
@@ -545,20 +507,6 @@ class MainWindow(QMainWindow):
         v_min_l = QHBoxLayout(); v_min_l.addWidget(QLabel('Value Min:'))
         self.v_min_slider = QSlider(Qt.Orientation.Horizontal); self.v_min_slider.setRange(0,255); self.v_min_slider.setValue(120); self.v_min_slider.valueChanged.connect(self._update_hsv)
         self.v_min_label = QLabel('120'); v_min_l.addWidget(self.v_min_slider); v_min_l.addWidget(self.v_min_label); right.addLayout(v_min_l)
-
-        h2_low_l = QHBoxLayout(); h2_low_l.addWidget(QLabel('Hue2 Low:'))
-        self.h2_low_slider = QSlider(Qt.Orientation.Horizontal); self.h2_low_slider.setRange(0,179); self.h2_low_slider.setValue(75); self.h2_low_slider.valueChanged.connect(self._update_hsv_secondary)
-        self.h2_low_label = QLabel('75'); h2_low_l.addWidget(self.h2_low_slider); h2_low_l.addWidget(self.h2_low_label); right.addLayout(h2_low_l)
-        h2_high_l = QHBoxLayout(); h2_high_l.addWidget(QLabel('Hue2 High:'))
-        self.h2_high_slider = QSlider(Qt.Orientation.Horizontal); self.h2_high_slider.setRange(0,179); self.h2_high_slider.setValue(95); self.h2_high_slider.valueChanged.connect(self._update_hsv_secondary)
-        self.h2_high_label = QLabel('95'); h2_high_l.addWidget(self.h2_high_slider); h2_high_l.addWidget(self.h2_high_label); right.addLayout(h2_high_l)
-        s2_min_l = QHBoxLayout(); s2_min_l.addWidget(QLabel('Saturation2 Min:'))
-        self.s2_min_slider = QSlider(Qt.Orientation.Horizontal); self.s2_min_slider.setRange(0,255); self.s2_min_slider.setValue(60); self.s2_min_slider.valueChanged.connect(self._update_hsv_secondary)
-        self.s2_min_label = QLabel('60'); s2_min_l.addWidget(self.s2_min_slider); s2_min_l.addWidget(self.s2_min_label); right.addLayout(s2_min_l)
-        v2_min_l = QHBoxLayout(); v2_min_l.addWidget(QLabel('Value2 Min:'))
-        self.v2_min_slider = QSlider(Qt.Orientation.Horizontal); self.v2_min_slider.setRange(0,255); self.v2_min_slider.setValue(120); self.v2_min_slider.valueChanged.connect(self._update_hsv_secondary)
-        self.v2_min_label = QLabel('120'); v2_min_l.addWidget(self.v2_min_slider); v2_min_l.addWidget(self.v2_min_label); right.addLayout(v2_min_l)
-
         hsv_summary_row = QHBoxLayout()
         hsv_summary_row.addWidget(QLabel('HSV Range:'))
         self.hsv_summary_label = QLabel()
@@ -566,22 +514,6 @@ class MainWindow(QMainWindow):
         hsv_summary_row.addWidget(self.hsv_summary_label)
         hsv_summary_row.addStretch()
         right.addLayout(hsv_summary_row)
-
-        hsv2_summary_row = QHBoxLayout()
-        hsv2_summary_row.addWidget(QLabel('HSV Range (Secondary):'))
-        self.hsv2_summary_label = QLabel()
-        self.hsv2_summary_label.setStyleSheet('padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #222; font-weight: bold;')
-        hsv2_summary_row.addWidget(self.hsv2_summary_label)
-        hsv2_summary_row.addStretch()
-        right.addLayout(hsv2_summary_row)
-
-        target_row = QHBoxLayout()
-        target_row.addWidget(QLabel('Sample Target:'))
-        self.hsv_target_combo = QComboBox(); self.hsv_target_combo.addItems(['Hue1 (Yellow)', 'Hue2 (Green)'])
-        self.hsv_target_combo.currentIndexChanged.connect(self._change_sample_target)
-        target_row.addWidget(self.hsv_target_combo)
-        target_row.addStretch()
-        right.addLayout(target_row)
 
         hsv_samples_row = QHBoxLayout()
         self.hsv_sample1_label = QLabel('Sample 1: -')
@@ -595,20 +527,19 @@ class MainWindow(QMainWindow):
 
         # buttons row
         self.start_btn = QPushButton('Start Detection'); self.start_btn.clicked.connect(self._start_detection); self.start_btn.setDisabled(True)
-        self.pause_btn = QPushButton('Pause Detection'); self.pause_btn.clicked.connect(self._pause_detection); self.pause_btn.setDisabled(True)
-        self.resume_btn = QPushButton('Resume Detection'); self.resume_btn.clicked.connect(self._resume_detection); self.resume_btn.setDisabled(True)
         self.stop_btn = QPushButton('Stop Detection'); self.stop_btn.clicked.connect(self._stop_detection); self.stop_btn.setDisabled(True)
         self.test_image_btn = QPushButton('Test Image'); self.test_image_btn.clicked.connect(self._test_image); self.test_image_btn.setDisabled(True)
         self.capture_btn = QPushButton('Capture Image'); self.capture_btn.clicked.connect(self._capture_image); self.capture_btn.setDisabled(True)
+        self.clear_det_ori_btn = QPushButton('Clear Detected & Original')
+        self.clear_det_ori_btn.clicked.connect(self._clear_detections_and_originals)
         self.clear_all_btn = QPushButton('Clear ALL output')
         self.clear_all_btn.clicked.connect(self._clear_output_folder)
 
         buttons.addWidget(self.start_btn)
-        buttons.addWidget(self.pause_btn)
-        buttons.addWidget(self.resume_btn)
         buttons.addWidget(self.stop_btn)
         buttons.addWidget(self.test_image_btn)
         buttons.addWidget(self.capture_btn)
+        buttons.addWidget(self.clear_det_ori_btn)
         buttons.addWidget(self.clear_all_btn)
         buttons.addStretch()
 
@@ -692,20 +623,12 @@ class MainWindow(QMainWindow):
             2000
         )
 
-    def _change_sample_target(self, idx):
-        self._current_sample_target = 'primary' if idx == 0 else 'secondary'
-        self._update_hsv_sample_labels()
-
     def _enable_hsv_controls(self, enabled: bool):
         for w in [self.h_low_slider, self.h_high_slider, self.s_min_slider, self.v_min_slider,
-                  self.h_low_label, self.h_high_label, self.s_min_label, self.v_min_label,
-                  self.h2_low_slider, self.h2_high_slider, self.s2_min_slider, self.v2_min_slider,
-                  self.h2_low_label, self.h2_high_label, self.s2_min_label, self.v2_min_label]:
+                  self.h_low_label, self.h_high_label, self.s_min_label, self.v_min_label]:
             w.setEnabled(enabled)
         if hasattr(self, 'hsv_summary_label'):
             self.hsv_summary_label.setEnabled(True)
-        if hasattr(self, 'hsv2_summary_label'):
-            self.hsv2_summary_label.setEnabled(True)
 
     def _mode_changed(self, idx):
         mode = ['reconstruction/model','color','hybrid'][idx]
@@ -734,21 +657,6 @@ class MainWindow(QMainWindow):
         self._update_hsv_summary()
         self._reprocess_image()
 
-    def _update_hsv_secondary(self, _):
-        h_low = self.h2_low_slider.value(); h_high = self.h2_high_slider.value()
-        if h_low > h_high:
-            sender = self.sender()
-            if sender is self.h2_low_slider:
-                self.h2_high_slider.setValue(h_low); h_high = h_low
-            else:
-                self.h2_low_slider.setValue(h_high); h_low = h_high
-        s_min = self.s2_min_slider.value(); v_min = self.v2_min_slider.value()
-        self.h2_low_label.setText(str(h_low)); self.h2_high_label.setText(str(h_high))
-        self.s2_min_label.setText(str(s_min)); self.v2_min_label.setText(str(v_min))
-        self.detector.set_hsv_secondary(h_low=h_low, h_high=h_high, s_min=s_min, v_min=v_min)
-        self._update_hsv2_summary()
-        self._reprocess_image()
-
     def _update_hsv_summary(self):
         if not hasattr(self, 'hsv_summary_label'):
             return
@@ -761,23 +669,6 @@ class MainWindow(QMainWindow):
         preview_color = QColor.fromHsv(hue_mid * 2, sat_preview, val_preview)
         text_color = '#000' if preview_color.value() > 160 else '#fff'
         self.hsv_summary_label.setStyleSheet(
-            f'padding: 4px 8px; border: 1px solid #555; border-radius: 4px;'
-            f'background-color: {preview_color.name()}; color: {text_color}; font-weight: bold;'
-        )
-        self._update_hsv2_summary()
-
-    def _update_hsv2_summary(self):
-        if not hasattr(self, 'hsv2_summary_label'):
-            return
-        h_low = self.h2_low_slider.value(); h_high = self.h2_high_slider.value()
-        s_min = self.s2_min_slider.value(); v_min = self.v2_min_slider.value()
-        self.hsv2_summary_label.setText(f'H {h_low}-{h_high} | S >= {s_min} | V >= {v_min}')
-        hue_mid = max(0, min(179, (h_low + h_high) // 2))
-        sat_preview = max(s_min, min(255, s_min + (255 - s_min) // 2))
-        val_preview = max(v_min, min(255, v_min + (255 - v_min) // 2))
-        preview_color = QColor.fromHsv(hue_mid * 2, sat_preview, val_preview)
-        text_color = '#000' if preview_color.value() > 160 else '#fff'
-        self.hsv2_summary_label.setStyleSheet(
             f'padding: 4px 8px; border: 1px solid #555; border-radius: 4px;'
             f'background-color: {preview_color.name()}; color: {text_color}; font-weight: bold;'
         )
@@ -801,58 +692,46 @@ class MainWindow(QMainWindow):
     def _update_hsv_sample_labels(self):
         if not hasattr(self, 'hsv_sample1_label'):
             return
-        target = self._current_sample_target
-        state = self._sample_state[target]
-        target_name = 'Hue1' if target == 'primary' else 'Hue2'
-        self._set_sample_label(self.hsv_sample1_label, f'Sample 1 ({target_name})', state['first'])
-        self._set_sample_label(self.hsv_sample2_label, f'Sample 2 ({target_name})', state['second'])
+        self._set_sample_label(self.hsv_sample1_label, 'Sample 1', self._hsv_first_sample)
+        self._set_sample_label(self.hsv_sample2_label, 'Sample 2', self._hsv_second_sample)
         base_style = 'padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #222; color: #f0f0f0;'
-        if state['combined'] is None:
-            self.hsv_sample_avg_label.setText(f'Combined ({target_name}): -')
+        if self._hsv_combined_range is None:
+            self.hsv_sample_avg_label.setText('Combined: -')
             self.hsv_sample_avg_label.setStyleSheet(base_style)
         else:
-            h_low, h_high, s_thr, v_thr = state['combined']
+            h_low, h_high, s_thr, v_thr = self._hsv_combined_range
             hue_mid = max(0, min(179, (h_low + h_high) // 2))
             sat_preview = max(s_thr, min(255, s_thr + (255 - s_thr) // 2))
             val_preview = max(v_thr, min(255, v_thr + (255 - v_thr) // 2))
             preview_color = QColor.fromHsv(hue_mid * 2, sat_preview, val_preview)
             text_color = '#000' if preview_color.value() > 160 else '#fff'
-            self.hsv_sample_avg_label.setText(f'Combined ({target_name}): H{h_low}-{h_high} | S>={s_thr} | V>={v_thr}')
+            self.hsv_sample_avg_label.setText(f'Combined: H{h_low}-{h_high} | S>={s_thr} | V>={v_thr}')
             self.hsv_sample_avg_label.setStyleSheet(
                 f'padding: 4px 8px; border: 1px solid #555; border-radius: 4px; '
                 f'background-color: {preview_color.name()}; color: {text_color};'
             )
 
-    def _apply_sampled_hsv(self, h_cv, s, v, target='primary'):
+    def _apply_sampled_hsv(self, h_cv, s, v):
         h_cv = int(max(0, min(179, h_cv)))
         s = int(max(0, min(255, s)))
         v = int(max(0, min(255, v)))
-        if target == 'primary':
-            low_slider, high_slider = self.h_low_slider, self.h_high_slider
-            s_slider, v_slider = self.s_min_slider, self.v_min_slider
-            updater = self._update_hsv
-        else:
-            low_slider, high_slider = self.h2_low_slider, self.h2_high_slider
-            s_slider, v_slider = self.s2_min_slider, self.v2_min_slider
-            updater = self._update_hsv_secondary
-
-        current_span = max(2, high_slider.value() - low_slider.value())
+        current_span = max(2, self.h_high_slider.value() - self.h_low_slider.value())
         half_span = current_span // 2
         new_low = max(0, min(179, h_cv - half_span))
         new_high = max(0, min(179, h_cv + half_span))
         updates = (
-            (low_slider, new_low),
-            (high_slider, new_high),
-            (s_slider, s),
-            (v_slider, v),
+            (self.h_low_slider, new_low),
+            (self.h_high_slider, new_high),
+            (self.s_min_slider, s),
+            (self.v_min_slider, v),
         )
         for slider, value in updates:
             slider.blockSignals(True)
             slider.setValue(value)
             slider.blockSignals(False)
-        updater(None)
+        self._update_hsv(None)
 
-    def _apply_dual_samples(self, sample_a, sample_b, target='primary'):
+    def _apply_dual_samples(self, sample_a, sample_b):
         h_vals = [int(sample_a[0]), int(sample_b[0])]
         s_vals = [int(sample_a[1]), int(sample_b[1])]
         v_vals = [int(sample_a[2]), int(sample_b[2])]
@@ -878,27 +757,17 @@ class MainWindow(QMainWindow):
         s_thr = min(255, s_thr)
         v_thr = min(255, v_thr)
 
-        if target == 'primary':
-            updates = (
-                (self.h_low_slider, h_low),
-                (self.h_high_slider, h_high),
-                (self.s_min_slider, s_thr),
-                (self.v_min_slider, v_thr),
-            )
-            updater = self._update_hsv
-        else:
-            updates = (
-                (self.h2_low_slider, h_low),
-                (self.h2_high_slider, h_high),
-                (self.s2_min_slider, s_thr),
-                (self.v2_min_slider, v_thr),
-            )
-            updater = self._update_hsv_secondary
+        updates = (
+            (self.h_low_slider, h_low),
+            (self.h_high_slider, h_high),
+            (self.s_min_slider, s_thr),
+            (self.v_min_slider, v_thr),
+        )
         for slider, value in updates:
             slider.blockSignals(True)
             slider.setValue(int(value))
             slider.blockSignals(False)
-        updater(None)
+        self._update_hsv(None)
         return (int(h_low), int(h_high), int(s_thr), int(v_thr))
 
     def _handle_video_click(self, x, y):
@@ -929,38 +798,34 @@ class MainWindow(QMainWindow):
         hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)[0, 0]
         sample = (int(hsv[0]), int(hsv[1]), int(hsv[2]))
         now = time.time()
-        target = 'primary' if self.hsv_target_combo.currentIndex() == 0 else 'secondary'
-        state = self._sample_state[target]
-        target_name = 'Hue1 (Yellow)' if target == 'primary' else 'Hue2 (Green)'
-        self._current_sample_target = target
-        if state['pending'] is not None and (now - state['timestamp']) > 6.0:
-            state['pending'] = None
-            state['timestamp'] = 0.0
-            state['first'] = None
-            state['second'] = None
-            state['combined'] = None
-        if state['pending'] is None:
-            state['pending'] = sample
-            state['timestamp'] = now
-            state['first'] = sample
-            state['second'] = None
-            state['combined'] = None
-            self._apply_sampled_hsv(*sample, target=target)
+        if self._pending_hsv_sample is not None and (now - self._pending_hsv_timestamp) > 6.0:
+            self._pending_hsv_sample = None
+            self._hsv_first_sample = None
+            self._hsv_second_sample = None
+            self._hsv_combined_range = None
             self._update_hsv_sample_labels()
+        if self._pending_hsv_sample is None:
+            self._pending_hsv_sample = sample
+            self._pending_hsv_timestamp = now
+            self._hsv_first_sample = sample
+            self._hsv_second_sample = None
+            self._hsv_combined_range = None
+            self._update_hsv_sample_labels()
+            self._apply_sampled_hsv(*sample)
             self.status_bar.showMessage(
-                f'[{target_name}] HSV sample at ({sample_x},{sample_y}) -> H:{sample[0]} S:{sample[1]} V:{sample[2]} (click another point within 6s to average)',
+                f'HSV sample at ({sample_x},{sample_y}) -> H:{sample[0]} S:{sample[1]} V:{sample[2]} (click another point within 6s to average)',
                 5000,
             )
         else:
-            first_sample = state['pending']
-            state['second'] = sample
-            combined = self._apply_dual_samples(first_sample, sample, target=target)
-            state['pending'] = None
-            state['timestamp'] = 0.0
-            state['combined'] = combined
+            first_sample = self._pending_hsv_sample
+            self._hsv_second_sample = sample
+            combined = self._apply_dual_samples(first_sample, sample)
+            self._pending_hsv_sample = None
+            self._pending_hsv_timestamp = 0.0
+            self._hsv_combined_range = combined
             self._update_hsv_sample_labels()
             self.status_bar.showMessage(
-                f'[{target_name}] Combined HSV from two samples -> H:{combined[0]}-{combined[1]} | S>={combined[2]} | V>={combined[3]}',
+                f'Combined HSV from two samples -> H:{combined[0]}-{combined[1]} | S>={combined[2]} | V>={combined[3]}',
                 5000,
             )
 
@@ -989,63 +854,26 @@ class MainWindow(QMainWindow):
         print(f"[LOG {time.time():.2f}] Starting VideoThread...")
         self.video_thread.start()
         
-        self.is_detection_running = True
-        self.is_paused = False
-        self.start_time = time.time()
-        self.frame_count = 0
-        self._toggle_controls(False)
+        self.is_detection_running = True; self._toggle_controls(False)
         print(f"[LOG {time.time():.2f}] _start_detection function finished. Total time: {time.time() - start_time_total:.4f} seconds.")
-
-    def _pause_detection(self):
-        if not self.is_detection_running or self.is_paused:
-            return
-        if hasattr(self, 'video_thread') and self.video_thread.isRunning():
-            self.video_thread.pause()
-        self.is_paused = True
-        self.frame_count = 0
-        self.start_time = time.time()
-        self.status_bar.showMessage('Detection paused.')
-        self._toggle_controls(False)
-
-    def _resume_detection(self):
-        if not self.is_detection_running or not self.is_paused:
-            return
-        if hasattr(self, 'video_thread') and self.video_thread.isRunning():
-            self.video_thread.resume()
-        self.is_paused = False
-        self.frame_count = 0
-        self.start_time = time.time()
-        self.status_bar.showMessage('Detection resumed.')
-        self._toggle_controls(False)
 
     def _stop_detection(self):
         if hasattr(self,'video_thread') and self.video_thread.isRunning(): self.video_thread.stop()
         self.is_detection_running = False
-        self.is_paused = False
         if self.last_tested_image is None and (self.video_label.pixmap() is None or self.video_label.pixmap().isNull()):
             self.video_label.setText("Press 'Start Detection' or 'Test Image' to begin")
         self.status_bar.showMessage('Detection stopped.'); self._toggle_controls(True)
 
     # ... (ส่วนที่เหลือของ MainWindow เหมือนเดิม) ...
     def _toggle_controls(self, enable):
-        running = not enable
-        paused = self.is_paused if running else False
-
-        self.start_btn.setDisabled(running)
-        self.pause_btn.setDisabled((not running) or paused)
-        self.resume_btn.setDisabled((not running) or (not paused))
-        self.stop_btn.setDisabled(not running)
-
-        allow_config = enable
-        self.browse_btn.setDisabled(not allow_config); self.cam_combo.setDisabled(not allow_config)
-        self.res_combo.setDisabled(not allow_config); self.list_cam_btn.setDisabled(not allow_config); self.test_image_btn.setDisabled(not allow_config)
+        self.start_btn.setDisabled(not enable); self.browse_btn.setDisabled(not enable); self.cam_combo.setDisabled(not enable)
+        self.res_combo.setDisabled(not enable); self.list_cam_btn.setDisabled(not enable); self.test_image_btn.setDisabled(not enable)
         if hasattr(self, 'backend_combo'):
-            self.backend_combo.setDisabled(not allow_config)
-        self.capture_btn.setDisabled((not running) or paused)
-        self.fps_combo.setDisabled(not allow_config)
+            self.backend_combo.setDisabled(not enable)
+        self.stop_btn.setDisabled(enable); self.capture_btn.setDisabled(enable); self.fps_combo.setDisabled(not enable)
 
     def _capture_image(self):
-        if not self.is_detection_running or self.is_paused or self.current_frame is None:
+        if not self.is_detection_running or self.current_frame is None:
             self.status_bar.showMessage('Capture only available during live detection.', 3000); return
         original_frame = self.current_frame.copy()
         processed_frame, _, _ = self.detector.process_frame(original_frame.copy())
@@ -1059,6 +887,43 @@ class MainWindow(QMainWindow):
         os.makedirs(det_dir, exist_ok=True); os.makedirs(ori_dir, exist_ok=True)
         cv2.imwrite(os.path.join(det_dir,fname), processed_frame); cv2.imwrite(os.path.join(ori_dir,fname), original_frame)
         self.status_bar.showMessage(f'Image captured and saved as {fname}', 4000)
+
+    def _clear_detections_and_originals(self):
+        was_running = self.is_detection_running
+        if was_running:
+            self._stop_detection()
+        reply = QMessageBox.question(
+            self,
+            'Confirm Clear',
+            'Delete ALL files inside "output/detections" and "output/original"? (captures_* will be kept)',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            if was_running:
+                self._start_detection()
+            return
+        try:
+            for sub in ['detections', 'original']:
+                path = os.path.join('output', sub)
+                if os.path.isdir(path):
+                    for name in os.listdir(path):
+                        fpath = os.path.join(path, name)
+                        try:
+                            if os.path.isfile(fpath) or os.path.islink(fpath):
+                                os.remove(fpath)
+                            elif os.path.isdir(fpath):
+                                shutil.rmtree(fpath, ignore_errors=True)
+                        except Exception:
+                            pass
+                else:
+                    os.makedirs(path, exist_ok=True)
+            self.status_bar.showMessage('Cleared output/detections and output/original.', 3000)
+        except Exception as e:
+            self.status_bar.showMessage(f'Failed to clear: {e}', 5000)
+        finally:
+            if was_running:
+                self._start_detection()
 
     def _clear_output_folder(self):
         was_running = self.is_detection_running
@@ -1114,8 +979,6 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(np.ndarray)
     def update_image(self, cv_img):
-        if self.is_paused:
-            return
         self.trigger_process.emit(cv_img)
 
     @pyqtSlot(np.ndarray, np.ndarray, float, bool, int)
@@ -1157,10 +1020,6 @@ class MainWindow(QMainWindow):
         s.setValue('h_high', self.h_high_slider.value())
         s.setValue('s_min', self.s_min_slider.value())
         s.setValue('v_min', self.v_min_slider.value())
-        s.setValue('h2_low', self.h2_low_slider.value())
-        s.setValue('h2_high', self.h2_high_slider.value())
-        s.setValue('s2_min', self.s2_min_slider.value())
-        s.setValue('v2_min', self.v2_min_slider.value())
         s.setValue('beep_enabled', self.beep_check.isChecked())
         s.setValue('random_save', self.random_save_check.isChecked())
 
@@ -1188,14 +1047,9 @@ class MainWindow(QMainWindow):
         mode_idx = s.value('mode_index',0,type=int); self.mode_combo.setCurrentIndex(mode_idx)
         self.h_low_slider.setValue(s.value('h_low',15,type=int)); self.h_high_slider.setValue(s.value('h_high',35,type=int))
         self.s_min_slider.setValue(s.value('s_min',60,type=int)); self.v_min_slider.setValue(s.value('v_min',120,type=int))
-        self.h2_low_slider.setValue(s.value('h2_low',75,type=int)); self.h2_high_slider.setValue(s.value('h2_high',95,type=int))
-        self.s2_min_slider.setValue(s.value('s2_min',60,type=int)); self.v2_min_slider.setValue(s.value('v2_min',120,type=int))
         self.h_low_label.setText(str(self.h_low_slider.value())); self.h_high_label.setText(str(self.h_high_slider.value()))
         self.s_min_label.setText(str(self.s_min_slider.value())); self.v_min_label.setText(str(self.v_min_slider.value()))
-        self.h2_low_label.setText(str(self.h2_low_slider.value())); self.h2_high_label.setText(str(self.h2_high_slider.value()))
-        self.s2_min_label.setText(str(self.s2_min_slider.value())); self.v2_min_label.setText(str(self.v2_min_slider.value()))
         self.detector.set_hsv_thresholds(self.h_low_slider.value(), self.h_high_slider.value(), self.s_min_slider.value(), self.v_min_slider.value())
-        self.detector.set_hsv_secondary(self.h2_low_slider.value(), self.h2_high_slider.value(), self.s2_min_slider.value(), self.v2_min_slider.value())
         self._enable_hsv_controls(self.mode_combo.currentIndex() in (1,2))
         self._update_hsv_summary()
         self.beep_check.setChecked(s.value('beep_enabled', False, type=bool))

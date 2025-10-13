@@ -420,6 +420,21 @@ class ClickableLabel(QLabel):
         super().mousePressEvent(event)
 
 
+class VideoWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('Live Feed')
+        self.resize(960, 720)
+        self.setStyleSheet('background-color:#000;')
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.video_label = ClickableLabel("Press 'Start Detection' or 'Test Image' to begin")
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        layout.addWidget(self.video_label)
+
+
 class MainWindow(QMainWindow):
     # ... (ส่วน __init__ และอื่นๆ เหมือนเดิม) ...
     trigger_process = pyqtSignal(np.ndarray)
@@ -441,6 +456,8 @@ class MainWindow(QMainWindow):
             'secondary': {'pending': None, 'timestamp': 0.0, 'first': None, 'second': None, 'combined': None},
         }
         self._current_sample_target = 'primary'
+        self.video_window = VideoWindow()
+        self.video_window.video_label.clicked.connect(self._handle_video_click)
         self.central_widget = QWidget(); self.main_layout = QVBoxLayout(self.central_widget); self.setCentralWidget(self.central_widget)
         self._create_top_bar(); self._create_video_display(); self._create_controls(); self._create_status_bar(); self._setup_detection_thread()
         self.setStyleSheet(DARK_THEME_STYLESHEET)
@@ -466,11 +483,9 @@ class MainWindow(QMainWindow):
         self.main_layout.addLayout(top)
 
     def _create_video_display(self):
-        self.video_container = QWidget(); self.video_container.setStyleSheet('background-color:#000; border:1px solid #555;'); self.video_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        lay = QVBoxLayout(self.video_container); lay.setContentsMargins(0,0,0,0)
-        self.video_label = ClickableLabel("Press 'Start Detection' or 'Test Image' to begin"); self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter); self.video_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-        self.video_label.clicked.connect(self._handle_video_click)
-        lay.addWidget(self.video_label); self.main_layout.addWidget(self.video_container, stretch=1)
+        self.video_window.show()
+        self.video_window.raise_()
+        self.video_window.activateWindow()
 
     def _create_controls(self):
         controls = QHBoxLayout(); left = QVBoxLayout(); right = QVBoxLayout(); buttons = QHBoxLayout()
@@ -911,11 +926,11 @@ class MainWindow(QMainWindow):
             frame = self.last_tested_image
         if frame is None:
             return
-        pixmap = self.video_label.pixmap()
+        pixmap = self.video_window.video_label.pixmap()
         if pixmap is None or pixmap.isNull():
             return
         pix_w, pix_h = pixmap.width(), pixmap.height()
-        label_w, label_h = self.video_label.width(), self.video_label.height()
+        label_w, label_h = self.video_window.video_label.width(), self.video_window.video_label.height()
         offset_x = max(0.0, (label_w - pix_w) / 2.0)
         offset_y = max(0.0, (label_h - pix_h) / 2.0)
         img_x = x - offset_x
@@ -1022,8 +1037,8 @@ class MainWindow(QMainWindow):
         if hasattr(self,'video_thread') and self.video_thread.isRunning(): self.video_thread.stop()
         self.is_detection_running = False
         self.is_paused = False
-        if self.last_tested_image is None and (self.video_label.pixmap() is None or self.video_label.pixmap().isNull()):
-            self.video_label.setText("Press 'Start Detection' or 'Test Image' to begin")
+        if self.last_tested_image is None and (self.video_window.video_label.pixmap() is None or self.video_window.video_label.pixmap().isNull()):
+            self.video_window.video_label.setText("Press 'Start Detection' or 'Test Image' to begin")
         self.status_bar.showMessage('Detection stopped.'); self._toggle_controls(True)
 
     # ... (ส่วนที่เหลือของ MainWindow เหมือนเดิม) ...
@@ -1109,7 +1124,7 @@ class MainWindow(QMainWindow):
         mode_map = {'recon':'Recon','color':'HSV','hybrid':'Hybrid'}; mode = mode_map[self.detector.mode]
         self.status_bar.showMessage(f"Last Image Test | Mode: {mode} | MSE: {mse:.4f} | Anomaly: {'Yes' if is_anomaly else 'No'}")
         pixmap = self.convert_cv_qt(processed_frame)
-        self.video_label.setPixmap(pixmap)
+        self.video_window.video_label.setPixmap(pixmap)
         self._last_pixmap_size = (pixmap.width(), pixmap.height())
 
     @pyqtSlot(np.ndarray)
@@ -1131,14 +1146,17 @@ class MainWindow(QMainWindow):
         det_text = f'Detections: {anomaly_count}'; (dw,_),_ = cv2.getTextSize(det_text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)
         cv2.putText(processed_frame, det_text, (w-dw-margin, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
         pixmap = self.convert_cv_qt(processed_frame)
-        self.video_label.setPixmap(pixmap)
+        self.video_window.video_label.setPixmap(pixmap)
         self._last_pixmap_size = (pixmap.width(), pixmap.height())
 
     def convert_cv_qt(self, cv_img):
         rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
         h,w,ch = rgb.shape; bytes_per_line = ch*w
         qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        return QPixmap.fromImage(qimg).scaled(self.video_container.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        target_size = self.video_window.video_label.size()
+        if target_size.width() <= 1 or target_size.height() <= 1:
+            target_size = self.video_window.size()
+        return QPixmap.fromImage(qimg).scaled(target_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
 
     def _save_settings(self):
         s = QSettings('MyCompany','AnomalyApp')
@@ -1207,7 +1225,7 @@ class MainWindow(QMainWindow):
             self.start_btn.setDisabled(False); self.test_image_btn.setDisabled(False)
 
     def closeEvent(self, event):
-        self._save_settings(); self._stop_detection(); self.detection_thread.quit(); self.detection_thread.wait(); event.accept()
+        self._save_settings(); self._stop_detection(); self.video_window.close(); self.detection_thread.quit(); self.detection_thread.wait(); event.accept()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
