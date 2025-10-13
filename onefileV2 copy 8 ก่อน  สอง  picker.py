@@ -3,7 +3,6 @@ import cv2
 import os
 import time
 import shutil
-import random
 from datetime import datetime
 import numpy as np
 import torch
@@ -250,10 +249,6 @@ class DetectionWorker(QObject):
         self.is_busy = False
         self.auto_save = False
         self.last_save_time = 0
-        self.random_save_enabled = False
-        self.random_save_probability = 0.05
-        self.random_save_min_interval = 2.0
-        self.last_random_save_time = 0
         self.anomaly_count = 0
         self.beep_enabled = False
         self.first_frame_processed = False # <--- LOGGING FLAG
@@ -290,8 +285,7 @@ class DetectionWorker(QObject):
         if is_anomaly:
             self.anomaly_count += 1
             self._play_beep_async()
-        now_ts = time.time()
-        if is_anomaly and self.auto_save and now_ts - self.last_save_time > 2:
+        if is_anomaly and self.auto_save and time.time() - self.last_save_time > 2:
             ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
             fname = f"anomaly_{ts}.jpg"
             det_dir = os.path.join('output','detections')
@@ -301,22 +295,7 @@ class DetectionWorker(QObject):
             cv2.imwrite(os.path.join(det_dir,fname), processed_frame)
             cv2.imwrite(os.path.join(ori_dir,fname), original_frame)
             self.status_update.emit(f"Anomaly saved as {fname}")
-            self.last_save_time = now_ts
-
-        if self.random_save_enabled and (now_ts - self.last_random_save_time) >= self.random_save_min_interval:
-            if random.random() < self.random_save_probability:
-                ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-                rand_suffix = random.randint(0, 9999)
-                base_name = f"train_{ts}_{rand_suffix:04d}.jpg"
-                det_dir = os.path.join('output', 'training_samples', 'detected')
-                ori_dir = os.path.join('output', 'training_samples', 'original')
-                os.makedirs(det_dir, exist_ok=True)
-                os.makedirs(ori_dir, exist_ok=True)
-                cv2.imwrite(os.path.join(det_dir, base_name), processed_frame)
-                cv2.imwrite(os.path.join(ori_dir, base_name), original_frame)
-                self.status_update.emit(f"Training sample saved as {base_name}")
-                self.last_random_save_time = now_ts
-
+            self.last_save_time = time.time()
         self.result_ready.emit(processed_frame, original_frame, mse, is_anomaly, self.anomaly_count)
         self.is_busy = False
 
@@ -326,11 +305,6 @@ class DetectionWorker(QObject):
     @pyqtSlot(bool)
     def set_auto_save(self, status):
         self.auto_save = status
-    @pyqtSlot(bool)
-    def set_random_save_enabled(self, status):
-        self.random_save_enabled = status
-        if not status:
-            self.last_random_save_time = 0
     def reset_counter(self):
         self.anomaly_count = 0
         self.first_frame_processed = False
@@ -361,11 +335,6 @@ class MainWindow(QMainWindow):
         self.start_time = 0
         self.fps = 0.0
         self._last_pixmap_size = (0, 0)
-        self._pending_hsv_sample = None
-        self._pending_hsv_timestamp = 0.0
-        self._hsv_first_sample = None
-        self._hsv_second_sample = None
-        self._hsv_combined_range = None
         self.central_widget = QWidget(); self.main_layout = QVBoxLayout(self.central_widget); self.setCentralWidget(self.central_widget)
         self._create_top_bar(); self._create_video_display(); self._create_controls(); self._create_status_bar(); self._setup_detection_thread()
         self.setStyleSheet(DARK_THEME_STYLESHEET)
@@ -381,7 +350,6 @@ class MainWindow(QMainWindow):
         self.auto_save_check.toggled.connect(self.detection_worker.set_auto_save)
         self.detection_thread.start()
         self.detection_worker.set_beep_enabled(self.beep_check.isChecked())
-        self._update_random_save_status(self.random_save_check.isChecked())
 
     def _create_top_bar(self):
         top = QHBoxLayout()
@@ -446,13 +414,6 @@ class MainWindow(QMainWindow):
         beep_row.addStretch()
         right.addLayout(beep_row)
 
-        training_row = QHBoxLayout()
-        self.random_save_check = QCheckBox('Random Save for Training')
-        self.random_save_check.toggled.connect(self._update_random_save_status)
-        training_row.addWidget(self.random_save_check)
-        training_row.addStretch()
-        right.addLayout(training_row)
-
         mode_row = QHBoxLayout(); mode_row.addWidget(QLabel('Mode:'))
         self.mode_combo = QComboBox(); self.mode_combo.addItems(['Reconstruction/Model','Color (HSV • Yellow)','Hybrid (OR)'])
         self.mode_combo.currentIndexChanged.connect(self._mode_changed)
@@ -478,16 +439,6 @@ class MainWindow(QMainWindow):
         hsv_summary_row.addStretch()
         right.addLayout(hsv_summary_row)
 
-        hsv_samples_row = QHBoxLayout()
-        self.hsv_sample1_label = QLabel('Sample 1: -')
-        self.hsv_sample2_label = QLabel('Sample 2: -')
-        self.hsv_sample_avg_label = QLabel('Combined: -')
-        for lbl in (self.hsv_sample1_label, self.hsv_sample2_label, self.hsv_sample_avg_label):
-            lbl.setStyleSheet('padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #222; color: #f0f0f0;')
-            hsv_samples_row.addWidget(lbl)
-        hsv_samples_row.addStretch()
-        right.addLayout(hsv_samples_row)
-
         # buttons row
         self.start_btn = QPushButton('Start Detection'); self.start_btn.clicked.connect(self._start_detection); self.start_btn.setDisabled(True)
         self.stop_btn = QPushButton('Stop Detection'); self.stop_btn.clicked.connect(self._stop_detection); self.stop_btn.setDisabled(True)
@@ -509,7 +460,6 @@ class MainWindow(QMainWindow):
         controls.addLayout(left,3); controls.addLayout(right,2)
         self.main_layout.addLayout(controls); self.main_layout.addLayout(buttons)
         self._update_hsv_summary()
-        self._update_hsv_sample_labels()
 
         self._list_cameras(); self._enable_hsv_controls(False)
 
@@ -578,14 +528,6 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'detection_worker'):
             self.detection_worker.set_beep_enabled(checked)
 
-    def _update_random_save_status(self, checked):
-        if hasattr(self, 'detection_worker'):
-            self.detection_worker.set_random_save_enabled(checked)
-        self.status_bar.showMessage(
-            'Random training capture enabled.' if checked else 'Random training capture disabled.',
-            2000
-        )
-
     def _enable_hsv_controls(self, enabled: bool):
         for w in [self.h_low_slider, self.h_high_slider, self.s_min_slider, self.v_min_slider,
                   self.h_low_label, self.h_high_label, self.s_min_label, self.v_min_label]:
@@ -625,7 +567,7 @@ class MainWindow(QMainWindow):
             return
         h_low = self.h_low_slider.value(); h_high = self.h_high_slider.value()
         s_min = self.s_min_slider.value(); v_min = self.v_min_slider.value()
-        self.hsv_summary_label.setText(f'H {h_low}-{h_high} | S >= {s_min} | V >= {v_min}')
+        self.hsv_summary_label.setText(f'H {h_low}-{h_high} | S ≥ {s_min} | V ≥ {v_min}')
         hue_mid = max(0, min(179, (h_low + h_high) // 2))
         sat_preview = max(s_min, min(255, s_min + (255 - s_min) // 2))
         val_preview = max(v_min, min(255, v_min + (255 - v_min) // 2))
@@ -635,44 +577,6 @@ class MainWindow(QMainWindow):
             f'padding: 4px 8px; border: 1px solid #555; border-radius: 4px;'
             f'background-color: {preview_color.name()}; color: {text_color}; font-weight: bold;'
         )
-
-    def _set_sample_label(self, label, title, sample):
-        base_style = 'padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #222; color: #f0f0f0;'
-        if sample is None:
-            label.setText(f'{title}: -')
-            label.setStyleSheet(base_style)
-            return
-        h, s, v = (int(sample[0]), int(sample[1]), int(sample[2]))
-        hue_qt = max(0, min(359, h * 2))
-        qcolor = QColor.fromHsv(hue_qt, max(0, min(255, s)), max(0, min(255, v)))
-        text_color = '#000' if qcolor.value() > 160 else '#fff'
-        label.setText(f'{title}: H{h} S{s} V{v}')
-        label.setStyleSheet(
-            f'padding: 4px 8px; border: 1px solid #555; border-radius: 4px; '
-            f'background-color: {qcolor.name()}; color: {text_color};'
-        )
-
-    def _update_hsv_sample_labels(self):
-        if not hasattr(self, 'hsv_sample1_label'):
-            return
-        self._set_sample_label(self.hsv_sample1_label, 'Sample 1', self._hsv_first_sample)
-        self._set_sample_label(self.hsv_sample2_label, 'Sample 2', self._hsv_second_sample)
-        base_style = 'padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #222; color: #f0f0f0;'
-        if self._hsv_combined_range is None:
-            self.hsv_sample_avg_label.setText('Combined: -')
-            self.hsv_sample_avg_label.setStyleSheet(base_style)
-        else:
-            h_low, h_high, s_thr, v_thr = self._hsv_combined_range
-            hue_mid = max(0, min(179, (h_low + h_high) // 2))
-            sat_preview = max(s_thr, min(255, s_thr + (255 - s_thr) // 2))
-            val_preview = max(v_thr, min(255, v_thr + (255 - v_thr) // 2))
-            preview_color = QColor.fromHsv(hue_mid * 2, sat_preview, val_preview)
-            text_color = '#000' if preview_color.value() > 160 else '#fff'
-            self.hsv_sample_avg_label.setText(f'Combined: H{h_low}-{h_high} | S>={s_thr} | V>={v_thr}')
-            self.hsv_sample_avg_label.setStyleSheet(
-                f'padding: 4px 8px; border: 1px solid #555; border-radius: 4px; '
-                f'background-color: {preview_color.name()}; color: {text_color};'
-            )
 
     def _apply_sampled_hsv(self, h_cv, s, v):
         h_cv = int(max(0, min(179, h_cv)))
@@ -693,45 +597,6 @@ class MainWindow(QMainWindow):
             slider.setValue(value)
             slider.blockSignals(False)
         self._update_hsv(None)
-
-    def _apply_dual_samples(self, sample_a, sample_b):
-        h_vals = [int(sample_a[0]), int(sample_b[0])]
-        s_vals = [int(sample_a[1]), int(sample_b[1])]
-        v_vals = [int(sample_a[2]), int(sample_b[2])]
-
-        h1, h2 = h_vals
-        diff = abs(h1 - h2)
-        if diff > 90 and ((min(h_vals) < 20 and max(h_vals) > 159) or diff >= 120):
-            h_low = 0
-            h_high = 179
-        else:
-            h_low = min(h_vals)
-            h_high = max(h_vals)
-        margin = 5
-        h_low = max(0, h_low - margin)
-        h_high = min(179, h_high + margin)
-        if h_high < h_low:
-            h_low, h_high = h_high, h_low
-        if h_high - h_low < 2:
-            h_high = min(179, h_low + 2)
-
-        s_thr = max(0, min(s_vals) - 20)
-        v_thr = max(0, min(v_vals) - 20)
-        s_thr = min(255, s_thr)
-        v_thr = min(255, v_thr)
-
-        updates = (
-            (self.h_low_slider, h_low),
-            (self.h_high_slider, h_high),
-            (self.s_min_slider, s_thr),
-            (self.v_min_slider, v_thr),
-        )
-        for slider, value in updates:
-            slider.blockSignals(True)
-            slider.setValue(int(value))
-            slider.blockSignals(False)
-        self._update_hsv(None)
-        return (int(h_low), int(h_high), int(s_thr), int(v_thr))
 
     def _handle_video_click(self, x, y):
         if self.mode_combo.currentIndex() not in (1,2):
@@ -758,39 +623,12 @@ class MainWindow(QMainWindow):
         sample_x = int(np.clip((img_x / pix_w) * frame_w, 0, frame_w - 1))
         sample_y = int(np.clip((img_y / pix_h) * frame_h, 0, frame_h - 1))
         patch = frame[sample_y:sample_y+1, sample_x:sample_x+1]
-        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)[0, 0]
-        sample = (int(hsv[0]), int(hsv[1]), int(hsv[2]))
-        now = time.time()
-        if self._pending_hsv_sample is not None and (now - self._pending_hsv_timestamp) > 6.0:
-            self._pending_hsv_sample = None
-            self._hsv_first_sample = None
-            self._hsv_second_sample = None
-            self._hsv_combined_range = None
-            self._update_hsv_sample_labels()
-        if self._pending_hsv_sample is None:
-            self._pending_hsv_sample = sample
-            self._pending_hsv_timestamp = now
-            self._hsv_first_sample = sample
-            self._hsv_second_sample = None
-            self._hsv_combined_range = None
-            self._update_hsv_sample_labels()
-            self._apply_sampled_hsv(*sample)
-            self.status_bar.showMessage(
-                f'HSV sample at ({sample_x},{sample_y}) -> H:{sample[0]} S:{sample[1]} V:{sample[2]} (click another point within 6s to average)',
-                5000,
-            )
-        else:
-            first_sample = self._pending_hsv_sample
-            self._hsv_second_sample = sample
-            combined = self._apply_dual_samples(first_sample, sample)
-            self._pending_hsv_sample = None
-            self._pending_hsv_timestamp = 0.0
-            self._hsv_combined_range = combined
-            self._update_hsv_sample_labels()
-            self.status_bar.showMessage(
-                f'Combined HSV from two samples -> H:{combined[0]}-{combined[1]} | S>={combined[2]} | V>={combined[3]}',
-                5000,
-            )
+        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)[0,0]
+        self._apply_sampled_hsv(int(hsv[0]), int(hsv[1]), int(hsv[2]))
+        self.status_bar.showMessage(
+            f'Sampled HSV at ({sample_x},{sample_y}) → H:{int(hsv[0])} S:{int(hsv[1])} V:{int(hsv[2])}',
+            4000
+        )
 
     def _start_detection(self):
         start_time_total = time.time()
@@ -984,7 +822,6 @@ class MainWindow(QMainWindow):
         s.setValue('s_min', self.s_min_slider.value())
         s.setValue('v_min', self.v_min_slider.value())
         s.setValue('beep_enabled', self.beep_check.isChecked())
-        s.setValue('random_save', self.random_save_check.isChecked())
 
     def _load_settings(self):
         s = QSettings('MyCompany','AnomalyApp')
@@ -1017,9 +854,6 @@ class MainWindow(QMainWindow):
         self._update_hsv_summary()
         self.beep_check.setChecked(s.value('beep_enabled', False, type=bool))
         self.detection_worker.set_beep_enabled(self.beep_check.isChecked())
-        random_save = s.value('random_save', False, type=bool)
-        self.random_save_check.setChecked(random_save)
-        self.detection_worker.set_random_save_enabled(random_save)
         if mode_idx in (1,2) and not model_path:
             self.start_btn.setDisabled(False); self.test_image_btn.setDisabled(False)
 
