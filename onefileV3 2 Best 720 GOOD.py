@@ -37,7 +37,7 @@ QCheckBox::indicator:checked { background-color: #0078d7; border: 1px solid #007
 QStatusBar { background-color: #3c3c3c; font-size: 11pt; }
 """
 
-def open_camera_by_index(index, resolution=None, prefer_backend="DSHOW", fps=None, preferred_fourcc="YUY2", warmup_frames=10):
+def open_camera_by_index(index, resolution=None, prefer_backend="MSMF", fps=None, preferred_fourcc=None, warmup_frames=10):
     pref = (prefer_backend or "AUTO").upper()
     if pref == "MSMF":
         backends = [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]
@@ -483,8 +483,6 @@ class MainWindow(QMainWindow):
         }
         self._current_sample_target = 'primary'
         self.hsv_target_locked = False
-        self.machine_guide_enabled = True
-        self.center_marker_enabled = True
         self.video_window = VideoWindow()
         self.video_window.video_label.clicked.connect(self._handle_video_click)
         self.central_widget = QWidget(); self.main_layout = QVBoxLayout(self.central_widget); self.setCentralWidget(self.central_widget)
@@ -564,18 +562,6 @@ class MainWindow(QMainWindow):
         beep_row.addWidget(self.beep_check)
         beep_row.addStretch()
         right.addLayout(beep_row)
-
-        guide_row = QHBoxLayout()
-        self.machine_guide_check = QCheckBox('Show Machine Guide')
-        self.machine_guide_check.setChecked(self.machine_guide_enabled)
-        self.machine_guide_check.toggled.connect(self._toggle_machine_guide)
-        guide_row.addWidget(self.machine_guide_check)
-        self.center_marker_check = QCheckBox('Show Center Marker')
-        self.center_marker_check.setChecked(self.center_marker_enabled)
-        self.center_marker_check.toggled.connect(self._toggle_center_marker)
-        guide_row.addWidget(self.center_marker_check)
-        guide_row.addStretch()
-        right.addLayout(guide_row)
 
         training_row = QHBoxLayout()
         self.random_save_check = QCheckBox('Random Save for Training')
@@ -750,22 +736,6 @@ class MainWindow(QMainWindow):
             'Random training capture enabled.' if checked else 'Random training capture disabled.',
             2000
         )
-
-    def _toggle_machine_guide(self, checked):
-        self.machine_guide_enabled = checked
-        if hasattr(self, 'status_bar'):
-            msg = 'Machine guide overlay enabled.' if checked else 'Machine guide overlay hidden.'
-            self.status_bar.showMessage(msg, 2000)
-        if not self.is_detection_running and self.last_tested_image is not None:
-            self._reprocess_image()
-
-    def _toggle_center_marker(self, checked):
-        self.center_marker_enabled = checked
-        if hasattr(self, 'status_bar'):
-            msg = 'Center marker enabled.' if checked else 'Center marker hidden.'
-            self.status_bar.showMessage(msg, 2000)
-        if not self.is_detection_running and self.last_tested_image is not None:
-            self._reprocess_image()
 
     def _change_sample_target(self, idx):
         self._current_sample_target = 'primary' if idx == 0 else 'secondary'
@@ -1184,45 +1154,6 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage('Error: Could not read image file', 4000); self.last_tested_image = None; return
         self.status_bar.showMessage(f'Loaded image: {os.path.basename(file_name)}'); self.last_tested_image = cv_img; self._reprocess_image()
 
-    def _apply_visual_guides(self, frame):
-        if frame is None or frame.size == 0:
-            return
-        if not (self.machine_guide_enabled or self.center_marker_enabled):
-            return
-        h, w = frame.shape[:2]
-        if h == 0 or w == 0:
-            return
-        thickness = max(1, min(w, h) // 200)
-        guide_color = (0, 165, 255)
-        marker_color = (0, 255, 255)
-
-        if self.machine_guide_enabled:
-            margin_x = int(w * 0.1)
-            margin_y = int(h * 0.1)
-            top_left = (margin_x, margin_y)
-            bottom_right = (w - margin_x, h - margin_y)
-            cv2.rectangle(frame, top_left, bottom_right, guide_color, thickness)
-
-            tick = max(thickness * 4, int(min(w, h) * 0.04))
-            corner_points = [
-                top_left,
-                (bottom_right[0], top_left[1]),
-                (top_left[0], bottom_right[1]),
-                bottom_right
-            ]
-            offsets = [(tick, 0), (-tick, 0), (tick, 0), (-tick, 0)]
-            vertical_offsets = [(0, tick), (0, tick), (0, -tick), (0, -tick)]
-            for (x, y), (dx, dy), (vx, vy) in zip(corner_points, offsets, vertical_offsets):
-                cv2.line(frame, (x, y), (x + dx, y + dy), guide_color, thickness)
-                cv2.line(frame, (x, y), (x + vx, y + vy), guide_color, thickness)
-
-        if self.center_marker_enabled:
-            cx, cy = w // 2, h // 2
-            arm = max(thickness * 8, int(min(w, h) * 0.06))
-            cv2.line(frame, (cx - arm, cy), (cx + arm, cy), marker_color, thickness)
-            cv2.line(frame, (cx, cy - arm), (cx, cy + arm), marker_color, thickness)
-            cv2.circle(frame, (cx, cy), max(2, thickness * 2), marker_color, -1)
-
     def _reprocess_image(self):
         if self.last_tested_image is None or self.is_detection_running: return
         self.current_frame = self.last_tested_image.copy()
@@ -1232,7 +1163,6 @@ class MainWindow(QMainWindow):
             cv2.putText(processed_frame, text, (w-tw-10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
         mode_map = {'recon':'Recon','color':'HSV','hybrid':'Hybrid'}; mode = mode_map[self.detector.mode]
         self.status_bar.showMessage(f"Last Image Test | Mode: {mode} | MSE: {mse:.4f} | Anomaly: {'Yes' if is_anomaly else 'No'}")
-        self._apply_visual_guides(processed_frame)
         pixmap = self.convert_cv_qt(processed_frame)
         self.video_window.video_label.setPixmap(pixmap)
         self._last_pixmap_size = (pixmap.width(), pixmap.height())
@@ -1255,7 +1185,6 @@ class MainWindow(QMainWindow):
         cv2.putText(processed_frame, res_text, (w-rw-margin, h-margin), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
         det_text = f'Detections: {anomaly_count}'; (dw,_),_ = cv2.getTextSize(det_text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)
         cv2.putText(processed_frame, det_text, (w-dw-margin, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
-        self._apply_visual_guides(processed_frame)
         pixmap = self.convert_cv_qt(processed_frame)
         self.video_window.video_label.setPixmap(pixmap)
         self._last_pixmap_size = (pixmap.width(), pixmap.height())
@@ -1293,8 +1222,6 @@ class MainWindow(QMainWindow):
         s.setValue('beep_enabled', self.beep_check.isChecked())
         s.setValue('random_save', self.random_save_check.isChecked())
         s.setValue('hsv_target_lock', self.hsv_lock_check.isChecked())
-        s.setValue('machine_guide', self.machine_guide_check.isChecked())
-        s.setValue('center_marker', self.center_marker_check.isChecked())
 
     def _load_settings(self):
         s = QSettings('MyCompany','AnomalyApp')
@@ -1331,8 +1258,6 @@ class MainWindow(QMainWindow):
         self._enable_hsv_controls(self.mode_combo.currentIndex() in (1,2))
         self._update_hsv_summary()
         self.beep_check.setChecked(s.value('beep_enabled', False, type=bool))
-        self.machine_guide_check.setChecked(s.value('machine_guide', True, type=bool))
-        self.center_marker_check.setChecked(s.value('center_marker', True, type=bool))
         self.detection_worker.set_beep_enabled(self.beep_check.isChecked())
         random_save = s.value('random_save', False, type=bool)
         self.random_save_check.setChecked(random_save)
