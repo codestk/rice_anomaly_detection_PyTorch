@@ -151,8 +151,6 @@ class AnomalyDetector:
         self.s2_min, self.v2_min = 60, 120
         self.mode = 'recon'
         self.first_inference = True # <--- LOGGING FLAG
-        self.primary_hue_enabled = True
-        self.secondary_hue_enabled = True
 
     def set_mode(self, mode: str):
         self.mode = mode
@@ -177,10 +175,6 @@ class AnomalyDetector:
         self.contour_area_threshold = int(value)
     def set_threshold(self, value):
         self.mse_threshold = float(value)
-    def set_primary_hue_enabled(self, enabled: bool):
-        self.primary_hue_enabled = bool(enabled)
-    def set_secondary_hue_enabled(self, enabled: bool):
-        self.secondary_hue_enabled = bool(enabled)
 
     def load_model(self, model_path):
         if model_path and model_path.endswith('.pth'):
@@ -212,8 +206,6 @@ class AnomalyDetector:
         return [c for c in contours if cv2.contourArea(c) > self.contour_area_threshold]
 
     def _mask_color(self, frame):
-        if not self.primary_hue_enabled:
-            return np.zeros(frame.shape[:2], dtype=np.uint8)
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         lower1 = np.array([self.h_low, self.s_min, self.v_min], dtype=np.uint8)
         upper1 = np.array([self.h_high, 255, 255], dtype=np.uint8)
@@ -222,8 +214,6 @@ class AnomalyDetector:
         return cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
 
     def _mask_color_secondary(self, frame):
-        if not self.secondary_hue_enabled:
-            return np.zeros(frame.shape[:2], dtype=np.uint8)
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         lower1 = np.array([self.h2_low, self.s2_min, self.v2_min], dtype=np.uint8)
         upper1 = np.array([self.h2_high, 255, 255], dtype=np.uint8)
@@ -649,18 +639,6 @@ class MainWindow(QMainWindow):
         training_row.addStretch()
         right.addLayout(training_row)
 
-        hue_toggle_row = QHBoxLayout()
-        self.hue1_enable_check = QCheckBox('Enable Hue1 (Yellow)')
-        self.hue1_enable_check.setChecked(True)
-        self.hue1_enable_check.toggled.connect(self._toggle_primary_hue_enabled)
-        hue_toggle_row.addWidget(self.hue1_enable_check)
-        self.hue2_enable_check = QCheckBox('Enable Hue2 (Green)')
-        self.hue2_enable_check.setChecked(True)
-        self.hue2_enable_check.toggled.connect(self._toggle_secondary_hue_enabled)
-        hue_toggle_row.addWidget(self.hue2_enable_check)
-        hue_toggle_row.addStretch()
-        right.addLayout(hue_toggle_row)
-
         mode_row = QHBoxLayout(); mode_row.addWidget(QLabel('Mode:'))
         self.mode_combo = QComboBox(); self.mode_combo.addItems(['Reconstruction/Model','Color (HSV • Yellow)','Hybrid (OR)'])
         self.mode_combo.currentIndexChanged.connect(self._mode_changed)
@@ -864,10 +842,6 @@ class MainWindow(QMainWindow):
                   self.h2_low_slider, self.h2_high_slider, self.s2_min_slider, self.v2_min_slider,
                   self.h2_low_label, self.h2_high_label, self.s2_min_label, self.v2_min_label]:
             w.setEnabled(enabled)
-        if hasattr(self, 'hue1_enable_check'):
-            self.hue1_enable_check.setEnabled(enabled)
-        if hasattr(self, 'hue2_enable_check'):
-            self.hue2_enable_check.setEnabled(enabled)
         if hasattr(self, 'hsv_summary_label'):
             self.hsv_summary_label.setEnabled(True)
         if hasattr(self, 'hsv2_summary_label'):
@@ -915,31 +889,8 @@ class MainWindow(QMainWindow):
         self._update_hsv2_summary()
         self._reprocess_image()
 
-    def _toggle_primary_hue_enabled(self, checked: bool):
-        self.detector.set_primary_hue_enabled(checked)
-        if hasattr(self, 'status_bar'):
-            msg = 'Hue1 (Yellow) detection enabled.' if checked else 'Hue1 (Yellow) detection disabled.'
-            self.status_bar.showMessage(msg, 2000)
-        self._update_hsv_summary()
-        self._reprocess_image()
-
-    def _toggle_secondary_hue_enabled(self, checked: bool):
-        self.detector.set_secondary_hue_enabled(checked)
-        if hasattr(self, 'status_bar'):
-            msg = 'Hue2 (Green) detection enabled.' if checked else 'Hue2 (Green) detection disabled.'
-            self.status_bar.showMessage(msg, 2000)
-        self._update_hsv2_summary()
-        self._reprocess_image()
-
     def _update_hsv_summary(self):
         if not hasattr(self, 'hsv_summary_label'):
-            return
-        if not self.detector.primary_hue_enabled:
-            self.hsv_summary_label.setText('Hue1 Disabled')
-            self.hsv_summary_label.setStyleSheet(
-                'padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #333; color: #888; font-weight: bold;'
-            )
-            self._update_hsv2_summary()
             return
         h_low = self.h_low_slider.value(); h_high = self.h_high_slider.value()
         s_min = self.s_min_slider.value(); v_min = self.v_min_slider.value()
@@ -957,12 +908,6 @@ class MainWindow(QMainWindow):
 
     def _update_hsv2_summary(self):
         if not hasattr(self, 'hsv2_summary_label'):
-            return
-        if not self.detector.secondary_hue_enabled:
-            self.hsv2_summary_label.setText('Hue2 Disabled')
-            self.hsv2_summary_label.setStyleSheet(
-                'padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #333; color: #888; font-weight: bold;'
-            )
             return
         h_low = self.h2_low_slider.value(); h_high = self.h2_high_slider.value()
         s_min = self.s2_min_slider.value(); v_min = self.v2_min_slider.value()
@@ -1253,11 +1198,6 @@ class MainWindow(QMainWindow):
             self.fourcc_combo.setDisabled(not allow_config)
         self.capture_btn.setDisabled((not running) or paused)
         self.fps_combo.setDisabled(not allow_config)
-        hue_controls_allowed = allow_config and (self.mode_combo.currentIndex() in (1,2) if hasattr(self, 'mode_combo') else False)
-        if hasattr(self, 'hue1_enable_check'):
-            self.hue1_enable_check.setDisabled(not hue_controls_allowed)
-        if hasattr(self, 'hue2_enable_check'):
-            self.hue2_enable_check.setDisabled(not hue_controls_allowed)
 
     @pyqtSlot(str)
     def _update_fourcc_label(self, mode_text):
@@ -1414,10 +1354,6 @@ class MainWindow(QMainWindow):
             s.setValue('backend_index', self.backend_combo.currentIndex())
         if hasattr(self, 'fourcc_combo'):
             s.setValue('fourcc_text', self.fourcc_combo.currentText())
-        if hasattr(self, 'hue1_enable_check'):
-            s.setValue('hue1_enabled', self.hue1_enable_check.isChecked())
-        if hasattr(self, 'hue2_enable_check'):
-            s.setValue('hue2_enabled', self.hue2_enable_check.isChecked())
         s.setValue('camera_index', self.cam_combo.currentIndex())
         s.setValue('resolution_text', self.res_combo.currentText())
         s.setValue('fps_limit_text', self.fps_combo.currentText())
@@ -1482,19 +1418,6 @@ class MainWindow(QMainWindow):
         random_save = s.value('random_save', False, type=bool)
         self.random_save_check.setChecked(random_save)
         self.detection_worker.set_random_save_enabled(random_save)
-        if hasattr(self, 'hue1_enable_check'):
-            hue1_enabled = s.value('hue1_enabled', True, type=bool)
-            self.hue1_enable_check.blockSignals(True)
-            self.hue1_enable_check.setChecked(hue1_enabled)
-            self.hue1_enable_check.blockSignals(False)
-            self.detector.set_primary_hue_enabled(hue1_enabled)
-        if hasattr(self, 'hue2_enable_check'):
-            hue2_enabled = s.value('hue2_enabled', True, type=bool)
-            self.hue2_enable_check.blockSignals(True)
-            self.hue2_enable_check.setChecked(hue2_enabled)
-            self.hue2_enable_check.blockSignals(False)
-            self.detector.set_secondary_hue_enabled(hue2_enabled)
-        self._update_hsv_summary()
         lock_hsv = s.value('hsv_target_lock', False, type=bool)
         self.hsv_lock_check.setChecked(lock_hsv)
         self.hsv_target_locked = lock_hsv
