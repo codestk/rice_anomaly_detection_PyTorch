@@ -149,13 +149,10 @@ class AnomalyDetector:
         self.s_min, self.v_min = 60, 120
         self.h2_low, self.h2_high = 75, 95
         self.s2_min, self.v2_min = 60, 120
-        self.h3_low, self.h3_high = 105, 125
-        self.s3_min, self.v3_min = 60, 120
         self.mode = 'recon'
         self.first_inference = True # <--- LOGGING FLAG
         self.primary_hue_enabled = True
         self.secondary_hue_enabled = True
-        self.tertiary_hue_enabled = True
 
     def set_mode(self, mode: str):
         self.mode = mode
@@ -174,13 +171,6 @@ class AnomalyDetector:
             self.h2_low, self.h2_high = self.h2_high, self.h2_low
         if s_min is not None:  self.s2_min  = int(max(0, min(255, s_min)))
         if v_min is not None:  self.v2_min  = int(max(0, min(255, v_min)))
-    def set_hsv_tertiary(self, h_low=None, h_high=None, s_min=None, v_min=None):
-        if h_low is not None:  self.h3_low  = int(max(0, min(179, h_low)))
-        if h_high is not None: self.h3_high = int(max(0, min(179, h_high)))
-        if self.h3_low > self.h3_high:
-            self.h3_low, self.h3_high = self.h3_high, self.h3_low
-        if s_min is not None:  self.s3_min  = int(max(0, min(255, s_min)))
-        if v_min is not None:  self.v3_min  = int(max(0, min(255, v_min)))
     def set_cv_threshold(self, value):
         self.cv_threshold = int(value)
     def set_contour_threshold(self, value):
@@ -191,8 +181,6 @@ class AnomalyDetector:
         self.primary_hue_enabled = bool(enabled)
     def set_secondary_hue_enabled(self, enabled: bool):
         self.secondary_hue_enabled = bool(enabled)
-    def set_tertiary_hue_enabled(self, enabled: bool):
-        self.tertiary_hue_enabled = bool(enabled)
 
     def load_model(self, model_path):
         if model_path and model_path.endswith('.pth'):
@@ -243,16 +231,6 @@ class AnomalyDetector:
         upper2 = np.array([min(self.h2_high+5,179), 255, 255], dtype=np.uint8)
         return cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
 
-    def _mask_color_tertiary(self, frame):
-        if not self.tertiary_hue_enabled:
-            return np.zeros(frame.shape[:2], dtype=np.uint8)
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        lower1 = np.array([self.h3_low, self.s3_min, self.v3_min], dtype=np.uint8)
-        upper1 = np.array([self.h3_high, 255, 255], dtype=np.uint8)
-        lower2 = np.array([max(self.h3_low-5,0), self.s3_min, self.v3_min], dtype=np.uint8)
-        upper2 = np.array([min(self.h3_high+5,179), 255, 255], dtype=np.uint8)
-        return cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
-
     def _mask_recon_or_dummy(self, frame, is_first_frame=False):
         try:
             if self.model is not None and self.model != "loaded" and callable(self.model):
@@ -294,10 +272,8 @@ class AnomalyDetector:
         if self.mode == 'color':
             mask_primary = self._mask_color(frame)
             mask_secondary = self._mask_color_secondary(frame)
-            mask_tertiary = self._mask_color_tertiary(frame)
             contours_primary = self._contours_from_mask(mask_primary)
             contours_secondary = self._contours_from_mask(mask_secondary)
-            contours_tertiary = self._contours_from_mask(mask_tertiary)
             out = frame.copy()
             for c in contours_primary:
                 x,y,w,h = cv2.boundingRect(c)
@@ -305,14 +281,10 @@ class AnomalyDetector:
             for c in contours_secondary:
                 x,y,w,h = cv2.boundingRect(c)
                 cv2.rectangle(out, (x,y), (x+w,y+h), (0,255,0), 2)
-            for c in contours_tertiary:
-                x,y,w,h = cv2.boundingRect(c)
-                cv2.rectangle(out, (x,y), (x+w,y+h), (255,0,0), 2)
-            is_anom = (len(contours_primary) + len(contours_secondary) + len(contours_tertiary)) > 0
+            is_anom = (len(contours_primary) + len(contours_secondary)) > 0
             if is_anom:
-                cv2.putText(out, 'Color Anomaly (Hue1/Hue2/Hue3)', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,255,0), 3)
-            mask_means = [mask_primary.mean(), mask_secondary.mean(), mask_tertiary.mean()]
-            mse = float(sum(mask_means)/(len(mask_means)*255.0))
+                cv2.putText(out, 'Color Anomaly (Yellow/Green)', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,255,0), 3)
+            mse = float((mask_primary.mean() + mask_secondary.mean())/(2*255.0))
             return out, mse, is_anom
 
         if self.mode == 'recon':
@@ -329,36 +301,25 @@ class AnomalyDetector:
 
         # HYBRID OR
         mask_recon, mse = self._mask_recon_or_dummy(frame, is_first_frame)
-        mask_color_primary = self._mask_color(frame)
+        mask_color = self._mask_color(frame)
         mask_color_secondary = self._mask_color_secondary(frame)
-        mask_color_tertiary = self._mask_color_tertiary(frame)
         contours_recon = self._contours_from_mask(mask_recon)
-        contours_color_primary = self._contours_from_mask(mask_color_primary)
+        contours_color = self._contours_from_mask(mask_color)
         contours_color_secondary = self._contours_from_mask(mask_color_secondary)
-        contours_color_tertiary = self._contours_from_mask(mask_color_tertiary)
         out = frame.copy()
         for c in contours_recon:
             x,y,w,h = cv2.boundingRect(c)
             cv2.rectangle(out, (x,y), (x+w,y+h), (0,0,255), 2)
-        for c in contours_color_primary:
+        for c in contours_color:
             x,y,w,h = cv2.boundingRect(c)
             cv2.rectangle(out, (x,y), (x+w,y+h), (0,255,255), 2)
         for c in contours_color_secondary:
             x,y,w,h = cv2.boundingRect(c)
             cv2.rectangle(out, (x,y), (x+w,y+h), (0,255,0), 2)
-        for c in contours_color_tertiary:
-            x,y,w,h = cv2.boundingRect(c)
-            cv2.rectangle(out, (x,y), (x+w,y+h), (255,0,0), 2)
-        is_anom = (
-            len(contours_recon)
-            + len(contours_color_primary)
-            + len(contours_color_secondary)
-            + len(contours_color_tertiary)
-        ) > 0
+        is_anom = (len(contours_recon) + len(contours_color) + len(contours_color_secondary)) > 0
         if is_anom:
             cv2.putText(out, 'HYBRID: Color OR Recon', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255,255,255), 3)
-        mask_mean_component = (mask_color_primary.mean() + mask_color_secondary.mean() + mask_color_tertiary.mean())/(3*255.0)
-        mse_hybrid = 0.5*mse + 0.5*mask_mean_component
+        mse_hybrid = 0.5*mse + 0.5*((mask_color.mean() + mask_color_secondary.mean())/(2*255.0))
         return out, float(mse_hybrid), is_anom
 
 class VideoThread(QThread):
@@ -562,7 +523,6 @@ class MainWindow(QMainWindow):
         self._sample_state = {
             'primary': {'pending': None, 'timestamp': 0.0, 'first': None, 'second': None, 'combined': None},
             'secondary': {'pending': None, 'timestamp': 0.0, 'first': None, 'second': None, 'combined': None},
-            'tertiary': {'pending': None, 'timestamp': 0.0, 'first': None, 'second': None, 'combined': None},
         }
         self._current_sample_target = 'primary'
         self.hsv_target_locked = False
@@ -698,15 +658,11 @@ class MainWindow(QMainWindow):
         self.hue2_enable_check.setChecked(True)
         self.hue2_enable_check.toggled.connect(self._toggle_secondary_hue_enabled)
         hue_toggle_row.addWidget(self.hue2_enable_check)
-        self.hue3_enable_check = QCheckBox('Enable Hue3 (Blue)')
-        self.hue3_enable_check.setChecked(True)
-        self.hue3_enable_check.toggled.connect(self._toggle_tertiary_hue_enabled)
-        hue_toggle_row.addWidget(self.hue3_enable_check)
         hue_toggle_row.addStretch()
         right.addLayout(hue_toggle_row)
 
         mode_row = QHBoxLayout(); mode_row.addWidget(QLabel('Mode:'))
-        self.mode_combo = QComboBox(); self.mode_combo.addItems(['Reconstruction/Model','Color (HSV)','Hybrid (OR)'])
+        self.mode_combo = QComboBox(); self.mode_combo.addItems(['Reconstruction/Model','Color (HSV • Yellow)','Hybrid (OR)'])
         self.mode_combo.currentIndexChanged.connect(self._mode_changed)
         mode_row.addWidget(self.mode_combo); right.addLayout(mode_row)
         # HSV sliders
@@ -736,19 +692,6 @@ class MainWindow(QMainWindow):
         self.v2_min_slider = QSlider(Qt.Orientation.Horizontal); self.v2_min_slider.setRange(0,255); self.v2_min_slider.setValue(120); self.v2_min_slider.valueChanged.connect(self._update_hsv_secondary)
         self.v2_min_label = QLabel('120'); v2_min_l.addWidget(self.v2_min_slider); v2_min_l.addWidget(self.v2_min_label); right.addLayout(v2_min_l)
 
-        h3_low_l = QHBoxLayout(); h3_low_l.addWidget(QLabel('Hue3 Low:'))
-        self.h3_low_slider = QSlider(Qt.Orientation.Horizontal); self.h3_low_slider.setRange(0,179); self.h3_low_slider.setValue(105); self.h3_low_slider.valueChanged.connect(self._update_hsv_tertiary)
-        self.h3_low_label = QLabel('105'); h3_low_l.addWidget(self.h3_low_slider); h3_low_l.addWidget(self.h3_low_label); right.addLayout(h3_low_l)
-        h3_high_l = QHBoxLayout(); h3_high_l.addWidget(QLabel('Hue3 High:'))
-        self.h3_high_slider = QSlider(Qt.Orientation.Horizontal); self.h3_high_slider.setRange(0,179); self.h3_high_slider.setValue(125); self.h3_high_slider.valueChanged.connect(self._update_hsv_tertiary)
-        self.h3_high_label = QLabel('125'); h3_high_l.addWidget(self.h3_high_slider); h3_high_l.addWidget(self.h3_high_label); right.addLayout(h3_high_l)
-        s3_min_l = QHBoxLayout(); s3_min_l.addWidget(QLabel('Saturation3 Min:'))
-        self.s3_min_slider = QSlider(Qt.Orientation.Horizontal); self.s3_min_slider.setRange(0,255); self.s3_min_slider.setValue(60); self.s3_min_slider.valueChanged.connect(self._update_hsv_tertiary)
-        self.s3_min_label = QLabel('60'); s3_min_l.addWidget(self.s3_min_slider); s3_min_l.addWidget(self.s3_min_label); right.addLayout(s3_min_l)
-        v3_min_l = QHBoxLayout(); v3_min_l.addWidget(QLabel('Value3 Min:'))
-        self.v3_min_slider = QSlider(Qt.Orientation.Horizontal); self.v3_min_slider.setRange(0,255); self.v3_min_slider.setValue(120); self.v3_min_slider.valueChanged.connect(self._update_hsv_tertiary)
-        self.v3_min_label = QLabel('120'); v3_min_l.addWidget(self.v3_min_slider); v3_min_l.addWidget(self.v3_min_label); right.addLayout(v3_min_l)
-
         hsv_summary_row = QHBoxLayout()
         hsv_summary_row.addWidget(QLabel('HSV Range Yellow:'))
         self.hsv_summary_label = QLabel()
@@ -765,17 +708,9 @@ class MainWindow(QMainWindow):
         hsv2_summary_row.addStretch()
         right.addLayout(hsv2_summary_row)
 
-        hsv3_summary_row = QHBoxLayout()
-        hsv3_summary_row.addWidget(QLabel('HSV Range Blue:'))
-        self.hsv3_summary_label = QLabel()
-        self.hsv3_summary_label.setStyleSheet('padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #222; font-weight: bold;')
-        hsv3_summary_row.addWidget(self.hsv3_summary_label)
-        hsv3_summary_row.addStretch()
-        right.addLayout(hsv3_summary_row)
-
         target_row = QHBoxLayout()
         target_row.addWidget(QLabel('Sample Target:'))
-        self.hsv_target_combo = QComboBox(); self.hsv_target_combo.addItems(['Hue1 (Yellow)', 'Hue2 (Green)', 'Hue3 (Blue)'])
+        self.hsv_target_combo = QComboBox(); self.hsv_target_combo.addItems(['Hue1 (Yellow)', 'Hue2 (Green)'])
         self.hsv_target_combo.currentIndexChanged.connect(self._change_sample_target)
         target_row.addWidget(self.hsv_target_combo)
         self.hsv_lock_check = QCheckBox('Hue Target Lock')
@@ -914,8 +849,7 @@ class MainWindow(QMainWindow):
             self._reprocess_image()
 
     def _change_sample_target(self, idx):
-        targets = {0: 'primary', 1: 'secondary', 2: 'tertiary'}
-        self._current_sample_target = targets.get(idx, 'primary')
+        self._current_sample_target = 'primary' if idx == 0 else 'secondary'
         self._update_hsv_sample_labels()
 
     def _toggle_hsv_target_lock(self, locked):
@@ -928,22 +862,16 @@ class MainWindow(QMainWindow):
         for w in [self.h_low_slider, self.h_high_slider, self.s_min_slider, self.v_min_slider,
                   self.h_low_label, self.h_high_label, self.s_min_label, self.v_min_label,
                   self.h2_low_slider, self.h2_high_slider, self.s2_min_slider, self.v2_min_slider,
-                  self.h2_low_label, self.h2_high_label, self.s2_min_label, self.v2_min_label,
-                  self.h3_low_slider, self.h3_high_slider, self.s3_min_slider, self.v3_min_slider,
-                  self.h3_low_label, self.h3_high_label, self.s3_min_label, self.v3_min_label]:
+                  self.h2_low_label, self.h2_high_label, self.s2_min_label, self.v2_min_label]:
             w.setEnabled(enabled)
         if hasattr(self, 'hue1_enable_check'):
             self.hue1_enable_check.setEnabled(enabled)
         if hasattr(self, 'hue2_enable_check'):
             self.hue2_enable_check.setEnabled(enabled)
-        if hasattr(self, 'hue3_enable_check'):
-            self.hue3_enable_check.setEnabled(enabled)
         if hasattr(self, 'hsv_summary_label'):
             self.hsv_summary_label.setEnabled(True)
         if hasattr(self, 'hsv2_summary_label'):
             self.hsv2_summary_label.setEnabled(True)
-        if hasattr(self, 'hsv3_summary_label'):
-            self.hsv3_summary_label.setEnabled(True)
 
     def _mode_changed(self, idx):
         mode = ['reconstruction/model','color','hybrid'][idx]
@@ -985,22 +913,6 @@ class MainWindow(QMainWindow):
         self.s2_min_label.setText(str(s_min)); self.v2_min_label.setText(str(v_min))
         self.detector.set_hsv_secondary(h_low=h_low, h_high=h_high, s_min=s_min, v_min=v_min)
         self._update_hsv2_summary()
-        self._update_hsv3_summary()
-        self._reprocess_image()
-
-    def _update_hsv_tertiary(self, _):
-        h_low = self.h3_low_slider.value(); h_high = self.h3_high_slider.value()
-        if h_low > h_high:
-            sender = self.sender()
-            if sender is self.h3_low_slider:
-                self.h3_high_slider.setValue(h_low); h_high = h_low
-            else:
-                self.h3_low_slider.setValue(h_high); h_low = h_high
-        s_min = self.s3_min_slider.value(); v_min = self.v3_min_slider.value()
-        self.h3_low_label.setText(str(h_low)); self.h3_high_label.setText(str(h_high))
-        self.s3_min_label.setText(str(s_min)); self.v3_min_label.setText(str(v_min))
-        self.detector.set_hsv_tertiary(h_low=h_low, h_high=h_high, s_min=s_min, v_min=v_min)
-        self._update_hsv3_summary()
         self._reprocess_image()
 
     def _toggle_primary_hue_enabled(self, checked: bool):
@@ -1019,14 +931,6 @@ class MainWindow(QMainWindow):
         self._update_hsv2_summary()
         self._reprocess_image()
 
-    def _toggle_tertiary_hue_enabled(self, checked: bool):
-        self.detector.set_tertiary_hue_enabled(checked)
-        if hasattr(self, 'status_bar'):
-            msg = 'Hue3 (Blue) detection enabled.' if checked else 'Hue3 (Blue) detection disabled.'
-            self.status_bar.showMessage(msg, 2000)
-        self._update_hsv3_summary()
-        self._reprocess_image()
-
     def _update_hsv_summary(self):
         if not hasattr(self, 'hsv_summary_label'):
             return
@@ -1035,21 +939,21 @@ class MainWindow(QMainWindow):
             self.hsv_summary_label.setStyleSheet(
                 'padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #333; color: #888; font-weight: bold;'
             )
-        else:
-            h_low = self.h_low_slider.value(); h_high = self.h_high_slider.value()
-            s_min = self.s_min_slider.value(); v_min = self.v_min_slider.value()
-            self.hsv_summary_label.setText(f'H {h_low}-{h_high} | S >= {s_min} | V >= {v_min}')
-            hue_mid = max(0, min(179, (h_low + h_high) // 2))
-            sat_preview = max(s_min, min(255, s_min + (255 - s_min) // 2))
-            val_preview = max(v_min, min(255, v_min + (255 - v_min) // 2))
-            preview_color = QColor.fromHsv(hue_mid * 2, sat_preview, val_preview)
-            text_color = '#000' if preview_color.value() > 160 else '#fff'
-            self.hsv_summary_label.setStyleSheet(
-                f'padding: 4px 8px; border: 1px solid #555; border-radius: 4px;'
-                f'background-color: {preview_color.name()}; color: {text_color}; font-weight: bold;'
-            )
+            self._update_hsv2_summary()
+            return
+        h_low = self.h_low_slider.value(); h_high = self.h_high_slider.value()
+        s_min = self.s_min_slider.value(); v_min = self.v_min_slider.value()
+        self.hsv_summary_label.setText(f'H {h_low}-{h_high} | S >= {s_min} | V >= {v_min}')
+        hue_mid = max(0, min(179, (h_low + h_high) // 2))
+        sat_preview = max(s_min, min(255, s_min + (255 - s_min) // 2))
+        val_preview = max(v_min, min(255, v_min + (255 - v_min) // 2))
+        preview_color = QColor.fromHsv(hue_mid * 2, sat_preview, val_preview)
+        text_color = '#000' if preview_color.value() > 160 else '#fff'
+        self.hsv_summary_label.setStyleSheet(
+            f'padding: 4px 8px; border: 1px solid #555; border-radius: 4px;'
+            f'background-color: {preview_color.name()}; color: {text_color}; font-weight: bold;'
+        )
         self._update_hsv2_summary()
-        self._update_hsv3_summary()
 
     def _update_hsv2_summary(self):
         if not hasattr(self, 'hsv2_summary_label'):
@@ -1069,28 +973,6 @@ class MainWindow(QMainWindow):
         preview_color = QColor.fromHsv(hue_mid * 2, sat_preview, val_preview)
         text_color = '#000' if preview_color.value() > 160 else '#fff'
         self.hsv2_summary_label.setStyleSheet(
-            f'padding: 4px 8px; border: 1px solid #555; border-radius: 4px;'
-            f'background-color: {preview_color.name()}; color: {text_color}; font-weight: bold;'
-        )
-
-    def _update_hsv3_summary(self):
-        if not hasattr(self, 'hsv3_summary_label'):
-            return
-        if not self.detector.tertiary_hue_enabled:
-            self.hsv3_summary_label.setText('Hue3 Disabled')
-            self.hsv3_summary_label.setStyleSheet(
-                'padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #333; color: #888; font-weight: bold;'
-            )
-            return
-        h_low = self.h3_low_slider.value(); h_high = self.h3_high_slider.value()
-        s_min = self.s3_min_slider.value(); v_min = self.v3_min_slider.value()
-        self.hsv3_summary_label.setText(f'H {h_low}-{h_high} | S >= {s_min} | V >= {v_min}')
-        hue_mid = max(0, min(179, (h_low + h_high) // 2))
-        sat_preview = max(s_min, min(255, s_min + (255 - s_min) // 2))
-        val_preview = max(v_min, min(255, v_min + (255 - v_min) // 2))
-        preview_color = QColor.fromHsv(hue_mid * 2, sat_preview, val_preview)
-        text_color = '#000' if preview_color.value() > 160 else '#fff'
-        self.hsv3_summary_label.setStyleSheet(
             f'padding: 4px 8px; border: 1px solid #555; border-radius: 4px;'
             f'background-color: {preview_color.name()}; color: {text_color}; font-weight: bold;'
         )
@@ -1116,12 +998,7 @@ class MainWindow(QMainWindow):
             return
         target = self._current_sample_target
         state = self._sample_state[target]
-        target_name_map = {
-            'primary': 'Hue1',
-            'secondary': 'Hue2',
-            'tertiary': 'Hue3'
-        }
-        target_name = target_name_map.get(target, 'Hue1')
+        target_name = 'Hue1' if target == 'primary' else 'Hue2'
         self._set_sample_label(self.hsv_sample1_label, f'Sample 1 ({target_name})', state['first'])
         self._set_sample_label(self.hsv_sample2_label, f'Sample 2 ({target_name})', state['second'])
         base_style = 'padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #222; color: #f0f0f0;'
@@ -1149,14 +1026,10 @@ class MainWindow(QMainWindow):
             low_slider, high_slider = self.h_low_slider, self.h_high_slider
             s_slider, v_slider = self.s_min_slider, self.v_min_slider
             updater = self._update_hsv
-        elif target == 'secondary':
+        else:
             low_slider, high_slider = self.h2_low_slider, self.h2_high_slider
             s_slider, v_slider = self.s2_min_slider, self.v2_min_slider
             updater = self._update_hsv_secondary
-        else:
-            low_slider, high_slider = self.h3_low_slider, self.h3_high_slider
-            s_slider, v_slider = self.s3_min_slider, self.v3_min_slider
-            updater = self._update_hsv_tertiary
 
         current_span = max(2, high_slider.value() - low_slider.value())
         half_span = current_span // 2
@@ -1208,7 +1081,7 @@ class MainWindow(QMainWindow):
                 (self.v_min_slider, v_thr),
             )
             updater = self._update_hsv
-        elif target == 'secondary':
+        else:
             updates = (
                 (self.h2_low_slider, h_low),
                 (self.h2_high_slider, h_high),
@@ -1216,14 +1089,6 @@ class MainWindow(QMainWindow):
                 (self.v2_min_slider, v_thr),
             )
             updater = self._update_hsv_secondary
-        else:
-            updates = (
-                (self.h3_low_slider, h_low),
-                (self.h3_high_slider, h_high),
-                (self.s3_min_slider, s_thr),
-                (self.v3_min_slider, v_thr),
-            )
-            updater = self._update_hsv_tertiary
         for slider, value in updates:
             slider.blockSignals(True)
             slider.setValue(int(value))
@@ -1263,16 +1128,9 @@ class MainWindow(QMainWindow):
         hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)[0, 0]
         sample = (int(hsv[0]), int(hsv[1]), int(hsv[2]))
         now = time.time()
-        target_index = self.hsv_target_combo.currentIndex()
-        target_map = {0: 'primary', 1: 'secondary', 2: 'tertiary'}
-        target = target_map.get(target_index, 'primary')
+        target = 'primary' if self.hsv_target_combo.currentIndex() == 0 else 'secondary'
         state = self._sample_state[target]
-        target_name_lookup = {
-            'primary': 'Hue1 (Yellow)',
-            'secondary': 'Hue2 (Green)',
-            'tertiary': 'Hue3 (Blue)',
-        }
-        target_name = target_name_lookup.get(target, 'Hue1 (Yellow)')
+        target_name = 'Hue1 (Yellow)' if target == 'primary' else 'Hue2 (Green)'
         self._current_sample_target = target
         if state['pending'] is not None and (now - state['timestamp']) > 6.0:
             state['pending'] = None
@@ -1400,8 +1258,6 @@ class MainWindow(QMainWindow):
             self.hue1_enable_check.setDisabled(not hue_controls_allowed)
         if hasattr(self, 'hue2_enable_check'):
             self.hue2_enable_check.setDisabled(not hue_controls_allowed)
-        if hasattr(self, 'hue3_enable_check'):
-            self.hue3_enable_check.setDisabled(not hue_controls_allowed)
 
     @pyqtSlot(str)
     def _update_fourcc_label(self, mode_text):
@@ -1562,8 +1418,6 @@ class MainWindow(QMainWindow):
             s.setValue('hue1_enabled', self.hue1_enable_check.isChecked())
         if hasattr(self, 'hue2_enable_check'):
             s.setValue('hue2_enabled', self.hue2_enable_check.isChecked())
-        if hasattr(self, 'hue3_enable_check'):
-            s.setValue('hue3_enabled', self.hue3_enable_check.isChecked())
         s.setValue('camera_index', self.cam_combo.currentIndex())
         s.setValue('resolution_text', self.res_combo.currentText())
         s.setValue('fps_limit_text', self.fps_combo.currentText())
@@ -1577,10 +1431,6 @@ class MainWindow(QMainWindow):
         s.setValue('h2_high', self.h2_high_slider.value())
         s.setValue('s2_min', self.s2_min_slider.value())
         s.setValue('v2_min', self.v2_min_slider.value())
-        s.setValue('h3_low', self.h3_low_slider.value())
-        s.setValue('h3_high', self.h3_high_slider.value())
-        s.setValue('s3_min', self.s3_min_slider.value())
-        s.setValue('v3_min', self.v3_min_slider.value())
         s.setValue('beep_enabled', self.beep_check.isChecked())
         s.setValue('random_save', self.random_save_check.isChecked())
         s.setValue('hsv_target_lock', self.hsv_lock_check.isChecked())
@@ -1617,17 +1467,12 @@ class MainWindow(QMainWindow):
         self.s_min_slider.setValue(s.value('s_min',60,type=int)); self.v_min_slider.setValue(s.value('v_min',120,type=int))
         self.h2_low_slider.setValue(s.value('h2_low',75,type=int)); self.h2_high_slider.setValue(s.value('h2_high',95,type=int))
         self.s2_min_slider.setValue(s.value('s2_min',60,type=int)); self.v2_min_slider.setValue(s.value('v2_min',120,type=int))
-        self.h3_low_slider.setValue(s.value('h3_low',105,type=int)); self.h3_high_slider.setValue(s.value('h3_high',125,type=int))
-        self.s3_min_slider.setValue(s.value('s3_min',60,type=int)); self.v3_min_slider.setValue(s.value('v3_min',120,type=int))
         self.h_low_label.setText(str(self.h_low_slider.value())); self.h_high_label.setText(str(self.h_high_slider.value()))
         self.s_min_label.setText(str(self.s_min_slider.value())); self.v_min_label.setText(str(self.v_min_slider.value()))
         self.h2_low_label.setText(str(self.h2_low_slider.value())); self.h2_high_label.setText(str(self.h2_high_slider.value()))
         self.s2_min_label.setText(str(self.s2_min_slider.value())); self.v2_min_label.setText(str(self.v2_min_slider.value()))
-        self.h3_low_label.setText(str(self.h3_low_slider.value())); self.h3_high_label.setText(str(self.h3_high_slider.value()))
-        self.s3_min_label.setText(str(self.s3_min_slider.value())); self.v3_min_label.setText(str(self.v3_min_slider.value()))
         self.detector.set_hsv_thresholds(self.h_low_slider.value(), self.h_high_slider.value(), self.s_min_slider.value(), self.v_min_slider.value())
         self.detector.set_hsv_secondary(self.h2_low_slider.value(), self.h2_high_slider.value(), self.s2_min_slider.value(), self.v2_min_slider.value())
-        self.detector.set_hsv_tertiary(self.h3_low_slider.value(), self.h3_high_slider.value(), self.s3_min_slider.value(), self.v3_min_slider.value())
         self._enable_hsv_controls(self.mode_combo.currentIndex() in (1,2))
         self._update_hsv_summary()
         self.beep_check.setChecked(s.value('beep_enabled', False, type=bool))
@@ -1649,12 +1494,6 @@ class MainWindow(QMainWindow):
             self.hue2_enable_check.setChecked(hue2_enabled)
             self.hue2_enable_check.blockSignals(False)
             self.detector.set_secondary_hue_enabled(hue2_enabled)
-        if hasattr(self, 'hue3_enable_check'):
-            hue3_enabled = s.value('hue3_enabled', True, type=bool)
-            self.hue3_enable_check.blockSignals(True)
-            self.hue3_enable_check.setChecked(hue3_enabled)
-            self.hue3_enable_check.blockSignals(False)
-            self.detector.set_tertiary_hue_enabled(hue3_enabled)
         self._update_hsv_summary()
         lock_hsv = s.value('hsv_target_lock', False, type=bool)
         self.hsv_lock_check.setChecked(lock_hsv)
