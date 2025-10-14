@@ -14,7 +14,7 @@ import threading
 from PyQt6.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QLineEdit, QSlider, QCheckBox,
-    QStatusBar, QComboBox, QSizePolicy, QMessageBox
+    QStatusBar, QComboBox, QSizePolicy, QMessageBox, QGroupBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QObject, pyqtSlot, QPoint
 from PyQt6.QtGui import QImage, QPixmap, QColor
@@ -573,7 +573,7 @@ class MainWindow(QMainWindow):
         self.central_widget = QWidget(); self.main_layout = QVBoxLayout(self.central_widget); self.setCentralWidget(self.central_widget)
         self.main_layout.setContentsMargins(12, 8, 12, 12)
         self.main_layout.setSpacing(8)
-        self._create_top_bar(); self._create_video_display(); self._create_controls(); self._create_status_bar(); self._setup_detection_thread()
+        self._create_video_display(); self._create_controls(); self._create_status_bar(); self._setup_detection_thread()
         self.setStyleSheet(DARK_THEME_STYLESHEET)
         self._load_settings()
 
@@ -596,7 +596,7 @@ class MainWindow(QMainWindow):
         top.addWidget(QLabel('Model Path:'))
         self.model_path_edit = QLineEdit(); self.model_path_edit.setReadOnly(True); top.addWidget(self.model_path_edit)
         self.browse_btn = QPushButton('Browse...'); self.browse_btn.clicked.connect(self._browse_model); top.addWidget(self.browse_btn)
-        self.main_layout.addLayout(top)
+        return top
 
     def _create_video_display(self):
         self.video_window.show()
@@ -610,7 +610,7 @@ class MainWindow(QMainWindow):
 
         left = QVBoxLayout()
         left.setContentsMargins(0, 0, 0, 0)
-        left.setSpacing(4)
+        left.setSpacing(8)
 
         right = QVBoxLayout()
         right.setContentsMargins(0, 0, 0, 0)
@@ -619,19 +619,36 @@ class MainWindow(QMainWindow):
         buttons = QHBoxLayout()
         buttons.setContentsMargins(0, 6, 0, 0)
         buttons.setSpacing(8)
+        top_bar_layout = self._create_top_bar()
+
         # thresholds
         thr = QHBoxLayout(); thr.addWidget(QLabel('MSE Threshold:'))
         self.thresh_slider = QSlider(Qt.Orientation.Horizontal); self.thresh_slider.setRange(1,1000); self.thresh_slider.setValue(10); self.thresh_slider.valueChanged.connect(self._update_mse_threshold)
         self.thresh_label = QLabel(f"{self.thresh_slider.value()/1000:.3f}")
-        thr.addWidget(self.thresh_slider); thr.addWidget(self.thresh_label); left.addLayout(thr)
+        thr.addWidget(self.thresh_slider); thr.addWidget(self.thresh_label)
         cvthr = QHBoxLayout(); cvthr.addWidget(QLabel('CV Threshold:'))
         self.cv_thresh_slider = QSlider(Qt.Orientation.Horizontal); self.cv_thresh_slider.setRange(5,200); self.cv_thresh_slider.setValue(40); self.cv_thresh_slider.valueChanged.connect(self._update_cv_threshold)
         self.cv_thresh_label = QLabel(str(self.cv_thresh_slider.value()))
-        cvthr.addWidget(self.cv_thresh_slider); cvthr.addWidget(self.cv_thresh_label); left.addLayout(cvthr)
+        cvthr.addWidget(self.cv_thresh_slider); cvthr.addWidget(self.cv_thresh_label)
         cont = QHBoxLayout(); cont.addWidget(QLabel('Contour Area:'))
         self.contour_slider = QSlider(Qt.Orientation.Horizontal); self.contour_slider.setRange(1,200); self.contour_slider.setValue(10); self.contour_slider.valueChanged.connect(self._update_contour_threshold)
         self.contour_label = QLabel(str(self.contour_slider.value()))
-        cont.addWidget(self.contour_slider); cont.addWidget(self.contour_label); left.addLayout(cont)
+        cont.addWidget(self.contour_slider); cont.addWidget(self.contour_label)
+
+        thresholds_group = QGroupBox('Model & Detection Thresholds')
+        thresholds_group.setStyleSheet(
+            'QGroupBox { font-weight: bold; border: 1px solid #555; border-radius: 6px; margin-top: 4px; }'
+            'QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; }'
+        )
+        thresholds_layout = QVBoxLayout()
+        thresholds_layout.setSpacing(8)
+        thresholds_layout.setContentsMargins(10, 10, 10, 10)
+        thresholds_layout.addLayout(top_bar_layout)
+        thresholds_layout.addLayout(thr)
+        thresholds_layout.addLayout(cvthr)
+        thresholds_layout.addLayout(cont)
+        thresholds_group.setLayout(thresholds_layout)
+        left.addWidget(thresholds_group)
         # camera & fps
         cr = QHBoxLayout(); cr.addWidget(QLabel('Source:'))
         self.cam_combo = QComboBox(); cr.addWidget(self.cam_combo)
@@ -650,6 +667,7 @@ class MainWindow(QMainWindow):
         cr.addWidget(QLabel('Resolution:'))
         self.res_combo = QComboBox(); self.resolution_options = ['Source/Native','2592x1944','2592x1440','2560x1440','2048x1536','2304x1296','1920x1080','1600x1200','1600x900','1280X960','1280x720','1024x768','960X720','1024x576','960x540','800x600','848x480','800x450','640x480','640x360']; self.res_combo.addItems(self.resolution_options); cr.addWidget(self.res_combo)
         left.addLayout(cr)
+        left.addStretch()
 
         # right panel
         auto_row = QHBoxLayout()
@@ -689,89 +707,104 @@ class MainWindow(QMainWindow):
         training_row.addStretch()
         right.addLayout(training_row)
 
-        hue_toggle_row = QHBoxLayout()
-        self.hue1_enable_check = QCheckBox('Enable Hue1 (Yellow)')
-        self.hue1_enable_check.setChecked(True)
-        self.hue1_enable_check.toggled.connect(self._toggle_primary_hue_enabled)
-        hue_toggle_row.addWidget(self.hue1_enable_check)
-        self.hue2_enable_check = QCheckBox('Enable Hue2 (Green)')
-        self.hue2_enable_check.setChecked(True)
-        self.hue2_enable_check.toggled.connect(self._toggle_secondary_hue_enabled)
-        hue_toggle_row.addWidget(self.hue2_enable_check)
-        self.hue3_enable_check = QCheckBox('Enable Hue3 (Blue)')
-        self.hue3_enable_check.setChecked(True)
-        self.hue3_enable_check.toggled.connect(self._toggle_tertiary_hue_enabled)
-        hue_toggle_row.addWidget(self.hue3_enable_check)
-        hue_toggle_row.addStretch()
-        right.addLayout(hue_toggle_row)
-
         mode_row = QHBoxLayout(); mode_row.addWidget(QLabel('Mode:'))
         self.mode_combo = QComboBox(); self.mode_combo.addItems(['Reconstruction/Model','Color (HSV)','Hybrid (OR)'])
         self.mode_combo.currentIndexChanged.connect(self._mode_changed)
         mode_row.addWidget(self.mode_combo); right.addLayout(mode_row)
-        # HSV sliders
-        h_low_l = QHBoxLayout(); h_low_l.addWidget(QLabel('Hue Low:'))
-        self.h_low_slider = QSlider(Qt.Orientation.Horizontal); self.h_low_slider.setRange(0,179); self.h_low_slider.setValue(15); self.h_low_slider.valueChanged.connect(self._update_hsv)
-        self.h_low_label = QLabel('15'); h_low_l.addWidget(self.h_low_slider); h_low_l.addWidget(self.h_low_label); right.addLayout(h_low_l)
-        h_high_l = QHBoxLayout(); h_high_l.addWidget(QLabel('Hue High:'))
-        self.h_high_slider = QSlider(Qt.Orientation.Horizontal); self.h_high_slider.setRange(0,179); self.h_high_slider.setValue(35); self.h_high_slider.valueChanged.connect(self._update_hsv)
-        self.h_high_label = QLabel('35'); h_high_l.addWidget(self.h_high_slider); h_high_l.addWidget(self.h_high_label); right.addLayout(h_high_l)
-        s_min_l = QHBoxLayout(); s_min_l.addWidget(QLabel('Saturation Min:'))
-        self.s_min_slider = QSlider(Qt.Orientation.Horizontal); self.s_min_slider.setRange(0,255); self.s_min_slider.setValue(60); self.s_min_slider.valueChanged.connect(self._update_hsv)
-        self.s_min_label = QLabel('60'); s_min_l.addWidget(self.s_min_slider); s_min_l.addWidget(self.s_min_label); right.addLayout(s_min_l)
-        v_min_l = QHBoxLayout(); v_min_l.addWidget(QLabel('Value Min:'))
-        self.v_min_slider = QSlider(Qt.Orientation.Horizontal); self.v_min_slider.setRange(0,255); self.v_min_slider.setValue(120); self.v_min_slider.valueChanged.connect(self._update_hsv)
-        self.v_min_label = QLabel('120'); v_min_l.addWidget(self.v_min_slider); v_min_l.addWidget(self.v_min_label); right.addLayout(v_min_l)
+        right.addSpacing(6)
 
-        h2_low_l = QHBoxLayout(); h2_low_l.addWidget(QLabel('Hue2 Low:'))
-        self.h2_low_slider = QSlider(Qt.Orientation.Horizontal); self.h2_low_slider.setRange(0,179); self.h2_low_slider.setValue(75); self.h2_low_slider.valueChanged.connect(self._update_hsv_secondary)
-        self.h2_low_label = QLabel('75'); h2_low_l.addWidget(self.h2_low_slider); h2_low_l.addWidget(self.h2_low_label); right.addLayout(h2_low_l)
-        h2_high_l = QHBoxLayout(); h2_high_l.addWidget(QLabel('Hue2 High:'))
-        self.h2_high_slider = QSlider(Qt.Orientation.Horizontal); self.h2_high_slider.setRange(0,179); self.h2_high_slider.setValue(95); self.h2_high_slider.valueChanged.connect(self._update_hsv_secondary)
-        self.h2_high_label = QLabel('95'); h2_high_l.addWidget(self.h2_high_slider); h2_high_l.addWidget(self.h2_high_label); right.addLayout(h2_high_l)
-        s2_min_l = QHBoxLayout(); s2_min_l.addWidget(QLabel('Saturation2 Min:'))
-        self.s2_min_slider = QSlider(Qt.Orientation.Horizontal); self.s2_min_slider.setRange(0,255); self.s2_min_slider.setValue(60); self.s2_min_slider.valueChanged.connect(self._update_hsv_secondary)
-        self.s2_min_label = QLabel('60'); s2_min_l.addWidget(self.s2_min_slider); s2_min_l.addWidget(self.s2_min_label); right.addLayout(s2_min_l)
-        v2_min_l = QHBoxLayout(); v2_min_l.addWidget(QLabel('Value2 Min:'))
-        self.v2_min_slider = QSlider(Qt.Orientation.Horizontal); self.v2_min_slider.setRange(0,255); self.v2_min_slider.setValue(120); self.v2_min_slider.valueChanged.connect(self._update_hsv_secondary)
-        self.v2_min_label = QLabel('120'); v2_min_l.addWidget(self.v2_min_slider); v2_min_l.addWidget(self.v2_min_label); right.addLayout(v2_min_l)
+        def build_hue_group(title, enable_attr, enable_slot, slider_specs, summary_attr):
+            group = QGroupBox(title)
+            group.setStyleSheet(
+                'QGroupBox { font-weight: bold; border: 1px solid #555; border-radius: 6px; margin-top: 8px; }'
+                'QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; }'
+            )
+            group_layout = QVBoxLayout()
+            group_layout.setSpacing(10)
+            group_layout.setContentsMargins(12, 12, 12, 12)
 
-        h3_low_l = QHBoxLayout(); h3_low_l.addWidget(QLabel('Hue3 Low:'))
-        self.h3_low_slider = QSlider(Qt.Orientation.Horizontal); self.h3_low_slider.setRange(0,179); self.h3_low_slider.setValue(105); self.h3_low_slider.valueChanged.connect(self._update_hsv_tertiary)
-        self.h3_low_label = QLabel('105'); h3_low_l.addWidget(self.h3_low_slider); h3_low_l.addWidget(self.h3_low_label); right.addLayout(h3_low_l)
-        h3_high_l = QHBoxLayout(); h3_high_l.addWidget(QLabel('Hue3 High:'))
-        self.h3_high_slider = QSlider(Qt.Orientation.Horizontal); self.h3_high_slider.setRange(0,179); self.h3_high_slider.setValue(125); self.h3_high_slider.valueChanged.connect(self._update_hsv_tertiary)
-        self.h3_high_label = QLabel('125'); h3_high_l.addWidget(self.h3_high_slider); h3_high_l.addWidget(self.h3_high_label); right.addLayout(h3_high_l)
-        s3_min_l = QHBoxLayout(); s3_min_l.addWidget(QLabel('Saturation3 Min:'))
-        self.s3_min_slider = QSlider(Qt.Orientation.Horizontal); self.s3_min_slider.setRange(0,255); self.s3_min_slider.setValue(60); self.s3_min_slider.valueChanged.connect(self._update_hsv_tertiary)
-        self.s3_min_label = QLabel('60'); s3_min_l.addWidget(self.s3_min_slider); s3_min_l.addWidget(self.s3_min_label); right.addLayout(s3_min_l)
-        v3_min_l = QHBoxLayout(); v3_min_l.addWidget(QLabel('Value3 Min:'))
-        self.v3_min_slider = QSlider(Qt.Orientation.Horizontal); self.v3_min_slider.setRange(0,255); self.v3_min_slider.setValue(120); self.v3_min_slider.valueChanged.connect(self._update_hsv_tertiary)
-        self.v3_min_label = QLabel('120'); v3_min_l.addWidget(self.v3_min_slider); v3_min_l.addWidget(self.v3_min_label); right.addLayout(v3_min_l)
+            toggle_row = QHBoxLayout()
+            toggle = QCheckBox('Enable detection')
+            toggle.setChecked(True)
+            toggle.toggled.connect(enable_slot)
+            setattr(self, enable_attr, toggle)
+            toggle_row.addWidget(toggle)
+            toggle_row.addStretch()
+            group_layout.addLayout(toggle_row)
 
-        hsv_summary_row = QHBoxLayout()
-        hsv_summary_row.addWidget(QLabel('HSV Range Yellow:'))
-        self.hsv_summary_label = QLabel()
-        self.hsv_summary_label.setStyleSheet('padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #222; font-weight: bold;')
-        hsv_summary_row.addWidget(self.hsv_summary_label)
-        hsv_summary_row.addStretch()
-        right.addLayout(hsv_summary_row)
+            for label_text, slider_attr, value_attr, minimum, maximum, default, handler in slider_specs:
+                row = QHBoxLayout()
+                row.setContentsMargins(0, 0, 0, 0)
+                row.setSpacing(10)
+                row.addWidget(QLabel(label_text))
+                slider = QSlider(Qt.Orientation.Horizontal)
+                slider.setRange(minimum, maximum)
+                slider.setValue(default)
+                setattr(self, slider_attr, slider)
+                slider.valueChanged.connect(handler)
+                value_label = QLabel(str(default))
+                value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                setattr(self, value_attr, value_label)
+                row.addWidget(slider, 1)
+                row.addWidget(value_label)
+                group_layout.addLayout(row)
 
-        hsv2_summary_row = QHBoxLayout()
-        hsv2_summary_row.addWidget(QLabel('HSV Range Green:'))
-        self.hsv2_summary_label = QLabel()
-        self.hsv2_summary_label.setStyleSheet('padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #222; font-weight: bold;')
-        hsv2_summary_row.addWidget(self.hsv2_summary_label)
-        hsv2_summary_row.addStretch()
-        right.addLayout(hsv2_summary_row)
+            summary_label = QLabel()
+            summary_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            summary_label.setStyleSheet(
+                'padding: 10px 12px; border: 1px solid #555; border-radius: 6px; '
+                'background-color: #222; font-weight: bold; font-size: 11pt; min-height: 36px; color: #f0f0f0;'
+            )
+            setattr(self, summary_attr, summary_label)
+            group_layout.addWidget(summary_label)
+            group_layout.addStretch()
 
-        hsv3_summary_row = QHBoxLayout()
-        hsv3_summary_row.addWidget(QLabel('HSV Range Blue:'))
-        self.hsv3_summary_label = QLabel()
-        self.hsv3_summary_label.setStyleSheet('padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #222; font-weight: bold;')
-        hsv3_summary_row.addWidget(self.hsv3_summary_label)
-        hsv3_summary_row.addStretch()
-        right.addLayout(hsv3_summary_row)
+            group.setLayout(group_layout)
+            return group
+
+        hue1_group = build_hue_group(
+            'Hue1 (Yellow)',
+            'hue1_enable_check',
+            self._toggle_primary_hue_enabled,
+            [
+                ('Hue Low:', 'h_low_slider', 'h_low_label', 0, 179, 15, self._update_hsv),
+                ('Hue High:', 'h_high_slider', 'h_high_label', 0, 179, 35, self._update_hsv),
+                ('Saturation Min:', 's_min_slider', 's_min_label', 0, 255, 60, self._update_hsv),
+                ('Value Min:', 'v_min_slider', 'v_min_label', 0, 255, 120, self._update_hsv),
+            ],
+            'hsv_summary_label'
+        )
+        right.addWidget(hue1_group)
+
+        hue2_group = build_hue_group(
+            'Hue2 (Green)',
+            'hue2_enable_check',
+            self._toggle_secondary_hue_enabled,
+            [
+                ('Hue2 Low:', 'h2_low_slider', 'h2_low_label', 0, 179, 75, self._update_hsv_secondary),
+                ('Hue2 High:', 'h2_high_slider', 'h2_high_label', 0, 179, 95, self._update_hsv_secondary),
+                ('Saturation2 Min:', 's2_min_slider', 's2_min_label', 0, 255, 60, self._update_hsv_secondary),
+                ('Value2 Min:', 'v2_min_slider', 'v2_min_label', 0, 255, 120, self._update_hsv_secondary),
+            ],
+            'hsv2_summary_label'
+        )
+        right.addWidget(hue2_group)
+
+        hue3_group = build_hue_group(
+            'Hue3 (Blue)',
+            'hue3_enable_check',
+            self._toggle_tertiary_hue_enabled,
+            [
+                ('Hue3 Low:', 'h3_low_slider', 'h3_low_label', 0, 179, 105, self._update_hsv_tertiary),
+                ('Hue3 High:', 'h3_high_slider', 'h3_high_label', 0, 179, 125, self._update_hsv_tertiary),
+                ('Saturation3 Min:', 's3_min_slider', 's3_min_label', 0, 255, 60, self._update_hsv_tertiary),
+                ('Value3 Min:', 'v3_min_slider', 'v3_min_label', 0, 255, 120, self._update_hsv_tertiary),
+            ],
+            'hsv3_summary_label'
+        )
+        right.addWidget(hue3_group)
+
+        right.addSpacing(6)
 
         target_row = QHBoxLayout()
         target_row.addWidget(QLabel('Sample Target:'))
@@ -1033,7 +1066,8 @@ class MainWindow(QMainWindow):
         if not self.detector.primary_hue_enabled:
             self.hsv_summary_label.setText('Hue1 Disabled')
             self.hsv_summary_label.setStyleSheet(
-                'padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #333; color: #888; font-weight: bold;'
+                'padding: 10px 12px; border: 1px solid #555; border-radius: 6px; '
+                'background-color: #333; color: #888; font-weight: bold; font-size: 11pt; min-height: 36px;'
             )
         else:
             h_low = self.h_low_slider.value(); h_high = self.h_high_slider.value()
@@ -1045,8 +1079,8 @@ class MainWindow(QMainWindow):
             preview_color = QColor.fromHsv(hue_mid * 2, sat_preview, val_preview)
             text_color = '#000' if preview_color.value() > 160 else '#fff'
             self.hsv_summary_label.setStyleSheet(
-                f'padding: 4px 8px; border: 1px solid #555; border-radius: 4px;'
-                f'background-color: {preview_color.name()}; color: {text_color}; font-weight: bold;'
+                f'padding: 10px 12px; border: 1px solid #555; border-radius: 6px;'
+                f'background-color: {preview_color.name()}; color: {text_color}; font-weight: bold; font-size: 11pt; min-height: 36px;'
             )
         self._update_hsv2_summary()
         self._update_hsv3_summary()
@@ -1057,7 +1091,8 @@ class MainWindow(QMainWindow):
         if not self.detector.secondary_hue_enabled:
             self.hsv2_summary_label.setText('Hue2 Disabled')
             self.hsv2_summary_label.setStyleSheet(
-                'padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #333; color: #888; font-weight: bold;'
+                'padding: 10px 12px; border: 1px solid #555; border-radius: 6px; '
+                'background-color: #333; color: #888; font-weight: bold; font-size: 11pt; min-height: 36px;'
             )
             return
         h_low = self.h2_low_slider.value(); h_high = self.h2_high_slider.value()
@@ -1069,8 +1104,8 @@ class MainWindow(QMainWindow):
         preview_color = QColor.fromHsv(hue_mid * 2, sat_preview, val_preview)
         text_color = '#000' if preview_color.value() > 160 else '#fff'
         self.hsv2_summary_label.setStyleSheet(
-            f'padding: 4px 8px; border: 1px solid #555; border-radius: 4px;'
-            f'background-color: {preview_color.name()}; color: {text_color}; font-weight: bold;'
+            f'padding: 10px 12px; border: 1px solid #555; border-radius: 6px;'
+            f'background-color: {preview_color.name()}; color: {text_color}; font-weight: bold; font-size: 11pt; min-height: 36px;'
         )
 
     def _update_hsv3_summary(self):
@@ -1079,7 +1114,8 @@ class MainWindow(QMainWindow):
         if not self.detector.tertiary_hue_enabled:
             self.hsv3_summary_label.setText('Hue3 Disabled')
             self.hsv3_summary_label.setStyleSheet(
-                'padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #333; color: #888; font-weight: bold;'
+                'padding: 10px 12px; border: 1px solid #555; border-radius: 6px; '
+                'background-color: #333; color: #888; font-weight: bold; font-size: 11pt; min-height: 36px;'
             )
             return
         h_low = self.h3_low_slider.value(); h_high = self.h3_high_slider.value()
@@ -1091,8 +1127,8 @@ class MainWindow(QMainWindow):
         preview_color = QColor.fromHsv(hue_mid * 2, sat_preview, val_preview)
         text_color = '#000' if preview_color.value() > 160 else '#fff'
         self.hsv3_summary_label.setStyleSheet(
-            f'padding: 4px 8px; border: 1px solid #555; border-radius: 4px;'
-            f'background-color: {preview_color.name()}; color: {text_color}; font-weight: bold;'
+            f'padding: 10px 12px; border: 1px solid #555; border-radius: 6px;'
+            f'background-color: {preview_color.name()}; color: {text_color}; font-weight: bold; font-size: 11pt; min-height: 36px;'
         )
 
     def _set_sample_label(self, label, title, sample):
