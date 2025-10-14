@@ -521,8 +521,6 @@ class MainWindow(QMainWindow):
         self.video_window = VideoWindow()
         self.video_window.video_label.clicked.connect(self._handle_video_click)
         self.central_widget = QWidget(); self.main_layout = QVBoxLayout(self.central_widget); self.setCentralWidget(self.central_widget)
-        self.main_layout.setContentsMargins(12, 8, 12, 12)
-        self.main_layout.setSpacing(8)
         self._create_top_bar(); self._create_video_display(); self._create_controls(); self._create_status_bar(); self._setup_detection_thread()
         self.setStyleSheet(DARK_THEME_STYLESHEET)
         self._load_settings()
@@ -541,8 +539,6 @@ class MainWindow(QMainWindow):
 
     def _create_top_bar(self):
         top = QHBoxLayout()
-        top.setContentsMargins(0, 0, 0, 0)
-        top.setSpacing(6)
         top.addWidget(QLabel('Model Path:'))
         self.model_path_edit = QLineEdit(); self.model_path_edit.setReadOnly(True); top.addWidget(self.model_path_edit)
         self.browse_btn = QPushButton('Browse...'); self.browse_btn.clicked.connect(self._browse_model); top.addWidget(self.browse_btn)
@@ -554,21 +550,7 @@ class MainWindow(QMainWindow):
         self.video_window.activateWindow()
 
     def _create_controls(self):
-        controls = QHBoxLayout()
-        controls.setContentsMargins(0, 0, 0, 0)
-        controls.setSpacing(16)
-
-        left = QVBoxLayout()
-        left.setContentsMargins(0, 0, 0, 0)
-        left.setSpacing(4)
-
-        right = QVBoxLayout()
-        right.setContentsMargins(0, 0, 0, 0)
-        right.setSpacing(4)
-
-        buttons = QHBoxLayout()
-        buttons.setContentsMargins(0, 6, 0, 0)
-        buttons.setSpacing(8)
+        controls = QHBoxLayout(); left = QVBoxLayout(); right = QVBoxLayout(); buttons = QHBoxLayout()
         # thresholds
         thr = QHBoxLayout(); thr.addWidget(QLabel('MSE Threshold:'))
         self.thresh_slider = QSlider(Qt.Orientation.Horizontal); self.thresh_slider.setRange(1,1000); self.thresh_slider.setValue(10); self.thresh_slider.valueChanged.connect(self._update_mse_threshold)
@@ -595,10 +577,11 @@ class MainWindow(QMainWindow):
         self.fourcc_options = ['Auto', 'YUY2', 'MJPG', 'NV12', 'I420', 'H264']
         self.fourcc_combo.addItems(self.fourcc_options)
         cr.addWidget(self.fourcc_combo)
-        cr.addWidget(QLabel('Frame Rate:'))
-        self.fps_combo = QComboBox(); self.fps_options = ['Uncapped','60','30','15']; self.fps_combo.addItems(self.fps_options); cr.addWidget(self.fps_combo)
         cr.addWidget(QLabel('Resolution:'))
+
+        self.fps_combo = QComboBox(); self.fps_options = ['Uncapped','60','30','15']; self.fps_combo.addItems(self.fps_options); cr.addWidget(self.fps_combo)
         self.res_combo = QComboBox(); self.resolution_options = ['Source/Native','2592x1944','2592x1440','2560x1440','2048x1536','2304x1296','1920x1080','1600x1200','1600x900','1280X960','1280x720','1024x768','960X720','1024x576','960x540','800x600','848x480','800x450','640x480','640x360']; self.res_combo.addItems(self.resolution_options); cr.addWidget(self.res_combo)
+        cr.addWidget(QLabel('Frame Rate:'))
         left.addLayout(cr)
 
         # right panel
@@ -671,7 +654,7 @@ class MainWindow(QMainWindow):
         self.v2_min_label = QLabel('120'); v2_min_l.addWidget(self.v2_min_slider); v2_min_l.addWidget(self.v2_min_label); right.addLayout(v2_min_l)
 
         hsv_summary_row = QHBoxLayout()
-        hsv_summary_row.addWidget(QLabel('HSV Range Yellow:'))
+        hsv_summary_row.addWidget(QLabel('HSV Range:'))
         self.hsv_summary_label = QLabel()
         self.hsv_summary_label.setStyleSheet('padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #222; font-weight: bold;')
         hsv_summary_row.addWidget(self.hsv_summary_label)
@@ -679,7 +662,7 @@ class MainWindow(QMainWindow):
         right.addLayout(hsv_summary_row)
 
         hsv2_summary_row = QHBoxLayout()
-        hsv2_summary_row.addWidget(QLabel('HSV Range Green:'))
+        hsv2_summary_row.addWidget(QLabel('HSV Range (Secondary):'))
         self.hsv2_summary_label = QLabel()
         self.hsv2_summary_label.setStyleSheet('padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #222; font-weight: bold;')
         hsv2_summary_row.addWidget(self.hsv2_summary_label)
@@ -727,9 +710,7 @@ class MainWindow(QMainWindow):
         buttons.addStretch()
 
         controls.addLayout(left,3); controls.addLayout(right,2)
-        self.main_layout.addLayout(controls)
-        self.main_layout.setAlignment(controls, Qt.AlignmentFlag.AlignTop)
-        self.main_layout.addLayout(buttons)
+        self.main_layout.addLayout(controls); self.main_layout.addLayout(buttons)
         self._update_hsv_summary()
         self._update_hsv_sample_labels()
 

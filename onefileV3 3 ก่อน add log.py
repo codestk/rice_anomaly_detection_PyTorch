@@ -37,20 +37,7 @@ QCheckBox::indicator:checked { background-color: #0078d7; border: 1px solid #007
 QStatusBar { background-color: #3c3c3c; font-size: 11pt; }
 """
 
-def _fourcc_to_string(fourcc_value):
-    """Convert numeric FOURCC to readable string."""
-    try:
-        fourcc_int = int(fourcc_value) & 0xFFFFFFFF
-        if fourcc_int == 0:
-            return "UNKNOWN (0x00000000)"
-        chars = fourcc_int.to_bytes(4, byteorder="little")
-        printable = "".join(chr(c) if 32 <= c <= 126 else "." for c in chars)
-        return f"{printable} (0x{fourcc_int:08X})"
-    except Exception:
-        return f"UNKNOWN ({fourcc_value})"
-
-
-def open_camera_by_index(index, resolution=None, prefer_backend="DSHOW", fps=None, preferred_fourcc=None, warmup_frames=10):
+def open_camera_by_index(index, resolution=None, prefer_backend="DSHOW", fps=None, preferred_fourcc="YUY2", warmup_frames=10):
     pref = (prefer_backend or "AUTO").upper()
     if pref == "MSMF":
         backends = [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]
@@ -67,21 +54,11 @@ def open_camera_by_index(index, resolution=None, prefer_backend="DSHOW", fps=Non
         else:
             tmp.release()
     if cap is None:
-        return None, None
+        return None
     if resolution:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, resolution[0])
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resolution[1])
-    if preferred_fourcc and preferred_fourcc.upper() != "AUTO":
-        try:
-            code = cv2.VideoWriter_fourcc(*preferred_fourcc[:4])
-            if code:
-                cap.set(cv2.CAP_PROP_FOURCC, code)
-                print(f"[LOG {time.time():.2f}] Requested FOURCC {preferred_fourcc} for camera {index}.")
-        except Exception as err:
-            print(f"[WARN {time.time():.2f}] Unable to apply FOURCC {preferred_fourcc} on camera {index}: {err}")
-    fourcc_value = cap.get(cv2.CAP_PROP_FOURCC)
-    fourcc_mode = _fourcc_to_string(fourcc_value)
-    return cap, fourcc_mode
+    return cap
 
 
 # def open_camera_by_index(index, resolution=None, prefer_backend="MSMF", fps=None, preferred_fourcc=None, warmup_frames=10):
@@ -314,8 +291,7 @@ class AnomalyDetector:
 
 class VideoThread(QThread):
     change_pixmap_signal = pyqtSignal(np.ndarray)
-    fourcc_signal = pyqtSignal(str)
-    def __init__(self, camera_index=0, resolution=None, fps_limit=None, prefer_backend="AUTO", preferred_fourcc=None):
+    def __init__(self, camera_index=0, resolution=None, fps_limit=None, prefer_backend="AUTO"):
         super().__init__()
         self.camera_index = camera_index
         self.resolution = resolution
@@ -323,31 +299,22 @@ class VideoThread(QThread):
         self.target_fps = fps_limit
         self.sleep_duration_ms = int(1000 / fps_limit) if fps_limit else 0
         self.prefer_backend = prefer_backend
-        self.preferred_fourcc = preferred_fourcc
         self._paused = False
-        self.active_fourcc = None
     def run(self):
         print(f"[LOG {time.time():.2f}] VideoThread entered run() method.")
         print(f"[LOG {time.time():.2f}] Starting to open camera index {self.camera_index} using backend {self.prefer_backend}...")
         start_cam_time = time.time()
-        requested_fourcc = self.preferred_fourcc or "Auto"
-        print(f"[LOG {time.time():.2f}] Preferred FOURCC request: {requested_fourcc}")
-        cap, fourcc_mode = open_camera_by_index(
+        cap = open_camera_by_index(
             self.camera_index,
             self.resolution,
             prefer_backend=self.prefer_backend,
-            fps=self.target_fps,
-            preferred_fourcc=self.preferred_fourcc
+            fps=self.target_fps
         )
         end_cam_time = time.time()
         print(f"[LOG {end_cam_time:.2f}] Camera opened. Took {end_cam_time - start_cam_time:.4f} seconds.")
         if cap is None:
             print(f"Error: Cannot open camera {self.camera_index} with any backend")
-            self.fourcc_signal.emit("Unavailable")
             return
-        self.active_fourcc = fourcc_mode
-        self.fourcc_signal.emit(fourcc_mode)
-        print(f"[LOG {time.time():.2f}] Active FOURCC mode: {fourcc_mode}")
         print(f"[LOG {time.time():.2f}] Entering main capture loop...")
         while self._run_flag:
             if self._paused:
@@ -521,8 +488,6 @@ class MainWindow(QMainWindow):
         self.video_window = VideoWindow()
         self.video_window.video_label.clicked.connect(self._handle_video_click)
         self.central_widget = QWidget(); self.main_layout = QVBoxLayout(self.central_widget); self.setCentralWidget(self.central_widget)
-        self.main_layout.setContentsMargins(12, 8, 12, 12)
-        self.main_layout.setSpacing(8)
         self._create_top_bar(); self._create_video_display(); self._create_controls(); self._create_status_bar(); self._setup_detection_thread()
         self.setStyleSheet(DARK_THEME_STYLESHEET)
         self._load_settings()
@@ -541,8 +506,6 @@ class MainWindow(QMainWindow):
 
     def _create_top_bar(self):
         top = QHBoxLayout()
-        top.setContentsMargins(0, 0, 0, 0)
-        top.setSpacing(6)
         top.addWidget(QLabel('Model Path:'))
         self.model_path_edit = QLineEdit(); self.model_path_edit.setReadOnly(True); top.addWidget(self.model_path_edit)
         self.browse_btn = QPushButton('Browse...'); self.browse_btn.clicked.connect(self._browse_model); top.addWidget(self.browse_btn)
@@ -554,21 +517,7 @@ class MainWindow(QMainWindow):
         self.video_window.activateWindow()
 
     def _create_controls(self):
-        controls = QHBoxLayout()
-        controls.setContentsMargins(0, 0, 0, 0)
-        controls.setSpacing(16)
-
-        left = QVBoxLayout()
-        left.setContentsMargins(0, 0, 0, 0)
-        left.setSpacing(4)
-
-        right = QVBoxLayout()
-        right.setContentsMargins(0, 0, 0, 0)
-        right.setSpacing(4)
-
-        buttons = QHBoxLayout()
-        buttons.setContentsMargins(0, 6, 0, 0)
-        buttons.setSpacing(8)
+        controls = QHBoxLayout(); left = QVBoxLayout(); right = QVBoxLayout(); buttons = QHBoxLayout()
         # thresholds
         thr = QHBoxLayout(); thr.addWidget(QLabel('MSE Threshold:'))
         self.thresh_slider = QSlider(Qt.Orientation.Horizontal); self.thresh_slider.setRange(1,1000); self.thresh_slider.setValue(10); self.thresh_slider.valueChanged.connect(self._update_mse_threshold)
@@ -590,15 +539,11 @@ class MainWindow(QMainWindow):
         self.backend_combo = QComboBox(); self.backend_options = ['Auto','MSMF','DSHOW']; self.backend_combo.addItems(self.backend_options)
         self.backend_combo.currentIndexChanged.connect(lambda _: self._list_cameras())
         cr.addWidget(self.backend_combo)
-        cr.addWidget(QLabel('FourCC:'))
-        self.fourcc_combo = QComboBox()
-        self.fourcc_options = ['Auto', 'YUY2', 'MJPG', 'NV12', 'I420', 'H264']
-        self.fourcc_combo.addItems(self.fourcc_options)
-        cr.addWidget(self.fourcc_combo)
-        cr.addWidget(QLabel('Frame Rate:'))
-        self.fps_combo = QComboBox(); self.fps_options = ['Uncapped','60','30','15']; self.fps_combo.addItems(self.fps_options); cr.addWidget(self.fps_combo)
         cr.addWidget(QLabel('Resolution:'))
+
+        self.fps_combo = QComboBox(); self.fps_options = ['Uncapped','60','30','15']; self.fps_combo.addItems(self.fps_options); cr.addWidget(self.fps_combo)
         self.res_combo = QComboBox(); self.resolution_options = ['Source/Native','2592x1944','2592x1440','2560x1440','2048x1536','2304x1296','1920x1080','1600x1200','1600x900','1280X960','1280x720','1024x768','960X720','1024x576','960x540','800x600','848x480','800x450','640x480','640x360']; self.res_combo.addItems(self.resolution_options); cr.addWidget(self.res_combo)
+        cr.addWidget(QLabel('Frame Rate:'))
         left.addLayout(cr)
 
         # right panel
@@ -671,7 +616,7 @@ class MainWindow(QMainWindow):
         self.v2_min_label = QLabel('120'); v2_min_l.addWidget(self.v2_min_slider); v2_min_l.addWidget(self.v2_min_label); right.addLayout(v2_min_l)
 
         hsv_summary_row = QHBoxLayout()
-        hsv_summary_row.addWidget(QLabel('HSV Range Yellow:'))
+        hsv_summary_row.addWidget(QLabel('HSV Range:'))
         self.hsv_summary_label = QLabel()
         self.hsv_summary_label.setStyleSheet('padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #222; font-weight: bold;')
         hsv_summary_row.addWidget(self.hsv_summary_label)
@@ -679,7 +624,7 @@ class MainWindow(QMainWindow):
         right.addLayout(hsv_summary_row)
 
         hsv2_summary_row = QHBoxLayout()
-        hsv2_summary_row.addWidget(QLabel('HSV Range Green:'))
+        hsv2_summary_row.addWidget(QLabel('HSV Range (Secondary):'))
         self.hsv2_summary_label = QLabel()
         self.hsv2_summary_label.setStyleSheet('padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #222; font-weight: bold;')
         hsv2_summary_row.addWidget(self.hsv2_summary_label)
@@ -727,9 +672,7 @@ class MainWindow(QMainWindow):
         buttons.addStretch()
 
         controls.addLayout(left,3); controls.addLayout(right,2)
-        self.main_layout.addLayout(controls)
-        self.main_layout.setAlignment(controls, Qt.AlignmentFlag.AlignTop)
-        self.main_layout.addLayout(buttons)
+        self.main_layout.addLayout(controls); self.main_layout.addLayout(buttons)
         self._update_hsv_summary()
         self._update_hsv_sample_labels()
 
@@ -738,8 +681,6 @@ class MainWindow(QMainWindow):
     def _create_status_bar(self):
         self.status_bar = QStatusBar(); self.setStatusBar(self.status_bar)
         self.status_bar.showMessage('Ready. Load a model or choose Color/Hybrid mode.')
-        self.fourcc_status_label = QLabel('Active FourCC: -')
-        self.status_bar.addPermanentWidget(self.fourcc_status_label, 0)
 
     def _browse_model(self):
         file_name, _ = QFileDialog.getOpenFileName(self, 'Open Model', '', 'PyTorch Model Files (*.pth)')
@@ -1120,22 +1061,15 @@ class MainWindow(QMainWindow):
         resolution = tuple(map(int, res_text.lower().split('x'))) if res_text != 'Source/Native' else None
         fps_text = self.fps_combo.currentText(); fps_limit = int(fps_text) if fps_text != 'Uncapped' else None
         backend_choice = self.backend_combo.currentText() if hasattr(self, 'backend_combo') else 'Auto'
-        fourcc_choice = self.fourcc_combo.currentText() if hasattr(self, 'fourcc_combo') else 'Auto'
-        preferred_fourcc = None if not fourcc_choice or fourcc_choice == 'Auto' else fourcc_choice
 
         print(f"[LOG {time.time():.2f}] Creating VideoThread with backend {backend_choice}...")
-        print(f"[LOG {time.time():.2f}] Preferred FOURCC selection: {fourcc_choice}")
-        if hasattr(self, 'fourcc_status_label'):
-            self.fourcc_status_label.setText('Active FourCC: Connecting...')
         self.video_thread = VideoThread(
             camera_index=self.cam_combo.currentIndex(),
             resolution=resolution,
             fps_limit=fps_limit,
-            prefer_backend=backend_choice,
-            preferred_fourcc=preferred_fourcc
+            prefer_backend=backend_choice
         )
         self.video_thread.change_pixmap_signal.connect(self.update_image)
-        self.video_thread.fourcc_signal.connect(self._update_fourcc_label)
         
         print(f"[LOG {time.time():.2f}] Starting VideoThread...")
         self.video_thread.start()
@@ -1175,8 +1109,6 @@ class MainWindow(QMainWindow):
         self.is_paused = False
         if self.last_tested_image is None and (self.video_window.video_label.pixmap() is None or self.video_window.video_label.pixmap().isNull()):
             self.video_window.video_label.setText("Press 'Start Detection' or 'Test Image' to begin")
-        if hasattr(self, 'fourcc_status_label'):
-            self.fourcc_status_label.setText('Active FourCC: -')
         self.status_bar.showMessage('Detection stopped.'); self._toggle_controls(True)
 
     # ... (ส่วนที่เหลือของ MainWindow เหมือนเดิม) ...
@@ -1194,15 +1126,8 @@ class MainWindow(QMainWindow):
         self.res_combo.setDisabled(not allow_config); self.list_cam_btn.setDisabled(not allow_config); self.test_image_btn.setDisabled(not allow_config)
         if hasattr(self, 'backend_combo'):
             self.backend_combo.setDisabled(not allow_config)
-        if hasattr(self, 'fourcc_combo'):
-            self.fourcc_combo.setDisabled(not allow_config)
         self.capture_btn.setDisabled((not running) or paused)
         self.fps_combo.setDisabled(not allow_config)
-
-    @pyqtSlot(str)
-    def _update_fourcc_label(self, mode_text):
-        if hasattr(self, 'fourcc_status_label'):
-            self.fourcc_status_label.setText(f'Active FourCC: {mode_text}')
 
     def _capture_image(self):
         if not self.is_detection_running or self.is_paused or self.current_frame is None:
@@ -1352,8 +1277,6 @@ class MainWindow(QMainWindow):
         s.setValue('contour_area', self.contour_slider.value())
         if hasattr(self, 'backend_combo'):
             s.setValue('backend_index', self.backend_combo.currentIndex())
-        if hasattr(self, 'fourcc_combo'):
-            s.setValue('fourcc_text', self.fourcc_combo.currentText())
         s.setValue('camera_index', self.cam_combo.currentIndex())
         s.setValue('resolution_text', self.res_combo.currentText())
         s.setValue('fps_limit_text', self.fps_combo.currentText())
@@ -1386,10 +1309,6 @@ class MainWindow(QMainWindow):
                 self.backend_combo.setCurrentIndex(backend_idx)
             else:
                 self.backend_combo.setCurrentIndex(0)
-        if hasattr(self, 'fourcc_combo'):
-            fourcc_text = s.value('fourcc_text', 'Auto')
-            if fourcc_text in self.fourcc_options:
-                self.fourcc_combo.setCurrentText(fourcc_text)
         if self.cam_combo.count()>0:
             idx = s.value('camera_index',0,type=int)
             if idx < self.cam_combo.count(): self.cam_combo.setCurrentIndex(idx)
