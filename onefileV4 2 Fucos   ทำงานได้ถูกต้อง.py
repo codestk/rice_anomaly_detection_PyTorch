@@ -560,7 +560,6 @@ class MainWindow(QMainWindow):
         self.fps = 0.0
         self._last_pixmap_size = (0, 0)
         self.focus_measure = 0.0
-        self.show_video_labels = True
         self._sample_state = {
             'primary': {'pending': None, 'timestamp': 0.0, 'first': None, 'second': None, 'combined': None},
             'secondary': {'pending': None, 'timestamp': 0.0, 'first': None, 'second': None, 'combined': None},
@@ -665,7 +664,7 @@ class MainWindow(QMainWindow):
         self.fourcc_combo.addItems(self.fourcc_options)
         cr.addWidget(self.fourcc_combo)
         cr.addWidget(QLabel('Frame Rate:'))
-        self.fps_combo = QComboBox(); self.fps_options = ['Uncapped','60','30','15','5','2']; self.fps_combo.addItems(self.fps_options); cr.addWidget(self.fps_combo)
+        self.fps_combo = QComboBox(); self.fps_options = ['Uncapped','60','30','15']; self.fps_combo.addItems(self.fps_options); cr.addWidget(self.fps_combo)
         cr.addWidget(QLabel('Resolution:'))
         self.res_combo = QComboBox(); self.resolution_options = ['Source/Native','2592x1944','2592x1440','2560x1440','2048x1536','2304x1296','1920x1080','1600x1200','1600x900','1280X960','1280x720','1024x768','960X720','1024x576','960x540','800x600','848x480','800x450','640x480','640x360']; self.res_combo.addItems(self.resolution_options); cr.addWidget(self.res_combo)
         left.addLayout(cr)
@@ -717,14 +716,6 @@ class MainWindow(QMainWindow):
         training_row.addWidget(self.random_save_check)
         training_row.addStretch()
         general_layout.addLayout(training_row)
-
-        labels_row = QHBoxLayout()
-        self.video_labels_check = QCheckBox('Show Video Labels')
-        self.video_labels_check.setChecked(True)
-        self.video_labels_check.toggled.connect(self._toggle_video_labels)
-        labels_row.addWidget(self.video_labels_check)
-        labels_row.addStretch()
-        general_layout.addLayout(labels_row)
 
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel('Mode:'))
@@ -1083,14 +1074,6 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(msg, 2000)
         self._update_hsv3_summary()
         self._reprocess_image()
-
-    def _toggle_video_labels(self, checked: bool):
-        self.show_video_labels = bool(checked)
-        if hasattr(self, 'status_bar'):
-            msg = 'Video labels shown.' if checked else 'Video labels hidden.'
-            self.status_bar.showMessage(msg, 2000)
-        if not self.is_detection_running and self.last_tested_image is not None:
-            self._reprocess_image()
 
     def _update_hsv_summary(self):
         if not hasattr(self, 'hsv_summary_label'):
@@ -1548,8 +1531,6 @@ class MainWindow(QMainWindow):
     def _draw_focus_overlay(self, frame, focus_value: float, roi_rect):
         if frame is None or frame.size == 0:
             return
-        if not getattr(self, 'show_video_labels', True):
-            return
         h, w = frame.shape[:2]
         margin = 12
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -1622,8 +1603,7 @@ class MainWindow(QMainWindow):
         if self.last_tested_image is None or self.is_detection_running: return
         self.current_frame = self.last_tested_image.copy()
         processed_frame, mse, is_anomaly = self.detector.process_frame(self.last_tested_image.copy())
-        show_labels = getattr(self, 'show_video_labels', True)
-        if is_anomaly and show_labels:
+        if is_anomaly:
             h,w,_ = processed_frame.shape; text='Detections: 1'; (tw,_),_ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)
             cv2.putText(processed_frame, text, (w-tw-10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
         mode_map = {'recon':'Recon','color':'HSV','hybrid':'Hybrid'}; mode = mode_map[self.detector.mode]
@@ -1631,8 +1611,7 @@ class MainWindow(QMainWindow):
         focus_value, roi_rect = self._compute_focus_measure(self.current_frame)
         self.focus_measure = focus_value
         self._apply_visual_guides(processed_frame)
-        if show_labels:
-            self._draw_focus_overlay(processed_frame, focus_value, None)
+        self._draw_focus_overlay(processed_frame, focus_value, None)
         pixmap = self.convert_cv_qt(processed_frame)
         self.video_window.video_label.setPixmap(pixmap)
         self._last_pixmap_size = (pixmap.width(), pixmap.height())
@@ -1649,19 +1628,16 @@ class MainWindow(QMainWindow):
         self.frame_count += 1; elapsed = time.time() - self.start_time
         if elapsed > 1.0:
             self.fps = self.frame_count/elapsed; self.frame_count = 0; self.start_time = time.time()
-        show_labels = getattr(self, 'show_video_labels', True)
-        if show_labels:
-            h,w,_ = processed_frame.shape; margin = 10
-            cv2.putText(processed_frame, f'FPS: {self.fps:.2f}', (margin, h-margin), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
-            res_text = f'{w}x{h}'; (rw,_),_ = cv2.getTextSize(res_text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
-            cv2.putText(processed_frame, res_text, (w-rw-margin, h-margin), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
-            det_text = f'Detections: {anomaly_count}'; (dw,_),_ = cv2.getTextSize(det_text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)
-            cv2.putText(processed_frame, det_text, (w-dw-margin, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
+        h,w,_ = processed_frame.shape; margin = 10
+        cv2.putText(processed_frame, f'FPS: {self.fps:.2f}', (margin, h-margin), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
+        res_text = f'{w}x{h}'; (rw,_),_ = cv2.getTextSize(res_text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
+        cv2.putText(processed_frame, res_text, (w-rw-margin, h-margin), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
+        det_text = f'Detections: {anomaly_count}'; (dw,_),_ = cv2.getTextSize(det_text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)
+        cv2.putText(processed_frame, det_text, (w-dw-margin, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
         focus_value, roi_rect = self._compute_focus_measure(original_frame)
         self.focus_measure = focus_value
         self._apply_visual_guides(processed_frame)
-        if show_labels:
-            self._draw_focus_overlay(processed_frame, focus_value, None)
+        self._draw_focus_overlay(processed_frame, focus_value, None)
         pixmap = self.convert_cv_qt(processed_frame)
         self.video_window.video_label.setPixmap(pixmap)
         self._last_pixmap_size = (pixmap.width(), pixmap.height())
@@ -1695,8 +1671,6 @@ class MainWindow(QMainWindow):
         s.setValue('resolution_text', self.res_combo.currentText())
         s.setValue('fps_limit_text', self.fps_combo.currentText())
         s.setValue('auto_save', self.auto_save_check.isChecked())
-        if hasattr(self, 'video_labels_check'):
-            s.setValue('video_labels_enabled', self.video_labels_check.isChecked())
         s.setValue('mode_index', self.mode_combo.currentIndex())
         s.setValue('h_low', self.h_low_slider.value())
         s.setValue('h_high', self.h_high_slider.value())
@@ -1766,12 +1740,6 @@ class MainWindow(QMainWindow):
         random_save = s.value('random_save', False, type=bool)
         self.random_save_check.setChecked(random_save)
         self.detection_worker.set_random_save_enabled(random_save)
-        if hasattr(self, 'video_labels_check'):
-            labels_enabled = s.value('video_labels_enabled', True, type=bool)
-            self.video_labels_check.blockSignals(True)
-            self.video_labels_check.setChecked(labels_enabled)
-            self.video_labels_check.blockSignals(False)
-            self.show_video_labels = labels_enabled
         if hasattr(self, 'hue1_enable_check'):
             hue1_enabled = s.value('hue1_enabled', True, type=bool)
             self.hue1_enable_check.blockSignals(True)
