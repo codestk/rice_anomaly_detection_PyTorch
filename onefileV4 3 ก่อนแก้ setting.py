@@ -1676,7 +1676,7 @@ class MainWindow(QMainWindow):
         return QPixmap.fromImage(qimg).scaled(target_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
 
     def _save_settings(self):
-        s = QSettings('config.ini', QSettings.Format.IniFormat)
+        s = QSettings('MyCompany','AnomalyApp')
         s.setValue('model_path', self.model_path_edit.text())
         s.setValue('mse_threshold', self.thresh_slider.value())
         s.setValue('cv_threshold', self.cv_thresh_slider.value())
@@ -1717,7 +1717,7 @@ class MainWindow(QMainWindow):
         s.setValue('center_marker', self.center_marker_check.isChecked())
 
     def _load_settings(self):
-        s = QSettings('config.ini', QSettings.Format.IniFormat)
+        s = QSettings('MyCompany','AnomalyApp')
         model_path = s.value('model_path','')
         if model_path and os.path.exists(model_path): self._load_model_action(model_path)
         self.thresh_slider.setValue(s.value('mse_threshold',10,type=int))
