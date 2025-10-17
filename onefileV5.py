@@ -308,12 +308,13 @@ class AnomalyDetector:
             for c in contours_tertiary:
                 x,y,w,h = cv2.boundingRect(c)
                 cv2.rectangle(out, (x,y), (x+w,y+h), (255,0,0), 2)
-            is_anom = (len(contours_primary) + len(contours_secondary) + len(contours_tertiary)) > 0
+            all_contours = contours_primary + contours_secondary + contours_tertiary
+            is_anom = len(all_contours) > 0
             if is_anom:
                 cv2.putText(out, 'Color Anomaly (Hue1/Hue2/Hue3)', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,255,0), 3)
             mask_means = [mask_primary.mean(), mask_secondary.mean(), mask_tertiary.mean()]
             mse = float(sum(mask_means)/(len(mask_means)*255.0))
-            return out, mse, is_anom
+            return out, mse, is_anom, all_contours
 
         if self.mode == 'recon':
             mask, mse = self._mask_recon_or_dummy(frame, is_first_frame)
@@ -325,7 +326,7 @@ class AnomalyDetector:
             is_anom = len(contours) > 0
             if is_anom:
                 cv2.putText(out, 'Anomaly (Recon)', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
-            return out, mse, is_anom
+            return out, mse, is_anom, contours
 
         # HYBRID OR
         mask_recon, mse = self._mask_recon_or_dummy(frame, is_first_frame)
@@ -349,17 +350,13 @@ class AnomalyDetector:
         for c in contours_color_tertiary:
             x,y,w,h = cv2.boundingRect(c)
             cv2.rectangle(out, (x,y), (x+w,y+h), (255,0,0), 2)
-        is_anom = (
-            len(contours_recon)
-            + len(contours_color_primary)
-            + len(contours_color_secondary)
-            + len(contours_color_tertiary)
-        ) > 0
+        all_contours = contours_recon + contours_color_primary + contours_color_secondary + contours_color_tertiary
+        is_anom = len(all_contours) > 0
         if is_anom:
             cv2.putText(out, 'HYBRID: Color OR Recon', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255,255,255), 3)
         mask_mean_component = (mask_color_primary.mean() + mask_color_secondary.mean() + mask_color_tertiary.mean())/(3*255.0)
         mse_hybrid = 0.5*mse + 0.5*mask_mean_component
-        return out, float(mse_hybrid), is_anom
+        return out, float(mse_hybrid), is_anom, all_contours
 
 class VideoThread(QThread):
     change_pixmap_signal = pyqtSignal(np.ndarray)
@@ -438,6 +435,8 @@ class DetectionWorker(QObject):
         self.last_random_save_time = 0
         self.anomaly_count = 0
         self.beep_enabled = False
+        self.tripwire_enabled = False
+        self.recently_detected_centroids = []
         self.first_frame_processed = False # <--- LOGGING FLAG
 
     def _beep_thread_target(self):
@@ -462,18 +461,61 @@ class DetectionWorker(QObject):
             start_process_time = time.time()
 
         original_frame = cv_img.copy()
-        processed_frame, mse, is_anomaly = self.detector.process_frame(cv_img, is_first_frame)
+        processed_frame, mse, is_anomaly_present, contours = self.detector.process_frame(cv_img, is_first_frame)
+
+        now_ts = time.time()
+        is_new_anomaly_found = False
+
+        if self.tripwire_enabled and is_anomaly_present:
+            # 1. Clean up old centroids
+            expiry_time = 2.0 # seconds
+            self.recently_detected_centroids = [
+                (c, t) for (c, t) in self.recently_detected_centroids if now_ts - t < expiry_time
+            ]
+
+            newly_detected_centroids = []
+            distance_threshold = 50 # pixels
+
+            for contour in contours:
+                M = cv2.moments(contour)
+                if M["m00"] == 0: continue
+                cX = int(M["m10"] / M["m00"])
+                cY = int(M["m01"] / M["m00"])
+                centroid = (cX, cY)
+
+                # 2. Check if this is a new object
+                is_new = True
+                for existing_centroid, _ in self.recently_detected_centroids:
+                    dist = np.sqrt((centroid[0] - existing_centroid[0])**2 + (centroid[1] - existing_centroid[1])**2)
+                    if dist < distance_threshold:
+                        is_new = False
+                        break
+                
+                # 3. If it's new, mark it and add to our lists
+                if is_new:
+                    is_new_anomaly_found = True
+                    newly_detected_centroids.append((centroid, now_ts))
+
+            # 4. Add the truly new objects to the main list
+            self.recently_detected_centroids.extend(newly_detected_centroids)
+            is_anomaly = is_new_anomaly_found
+        else:
+            # Original behavior when tripwire is off
+            is_anomaly = is_anomaly_present
+            if is_anomaly:
+                is_new_anomaly_found = True
+
 
         if is_first_frame:
             end_process_time = time.time()
             print(f"[LOG {end_process_time:.2f}] FIRST frame processed. Took {end_process_time - start_process_time:.4f} seconds.")
             self.first_frame_processed = True
 
-        if is_anomaly:
+        if is_new_anomaly_found:
             self.anomaly_count += 1
             self._play_beep_async()
-        now_ts = time.time()
-        if is_anomaly and self.auto_save and now_ts - self.last_save_time > 2:
+
+        if is_new_anomaly_found and self.auto_save and now_ts - self.last_save_time > 2:
             ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
             fname = f"anomaly_{ts}.png"
             det_dir = os.path.join('output','detections')
@@ -513,6 +555,12 @@ class DetectionWorker(QObject):
         self.random_save_enabled = status
         if not status:
             self.last_random_save_time = 0
+    @pyqtSlot(bool)
+    def set_tripwire_enabled(self, status):
+        self.tripwire_enabled = status
+        if not status:
+            self.recently_detected_centroids.clear()
+
     def reset_counter(self):
         self.anomaly_count = 0
         self.first_frame_processed = False
@@ -520,16 +568,54 @@ class DetectionWorker(QObject):
 
 class ClickableLabel(QLabel):
     clicked = pyqtSignal(int, int)
+    wheel = pyqtSignal(int)
+    pan = pyqtSignal(int, int)
+
+    def __init__(self, main_window, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.main_window = main_window
+        self._panning = False
+        self._pan_start_pos = QPoint()
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            pos = event.position() if hasattr(event, "position") else event.pos()
-            point = pos.toPoint() if hasattr(pos, "toPoint") else QPoint(int(pos.x()), int(pos.y()))
-            self.clicked.emit(point.x(), point.y())
-        super().mousePressEvent(event)
+            if self.main_window.zoom_level > 1.0:
+                self._panning = True
+                self._pan_start_pos = event.pos()
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+            else:
+                pos = event.position() if hasattr(event, "position") else event.pos()
+                point = pos.toPoint() if hasattr(pos, "toPoint") else QPoint(int(pos.x()), int(pos.y()))
+                self.clicked.emit(point.x(), point.y())
+                super().mousePressEvent(event)
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._panning:
+            delta = event.pos() - self._pan_start_pos
+            self.pan.emit(delta.x(), delta.y())
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._panning:
+            self._panning = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        self.wheel.emit(delta)
+        event.accept()
 
 
 class VideoWindow(QWidget):
-    def __init__(self):
+    def __init__(self, main_window):
         super().__init__()
         self.setWindowTitle('Live Feed')
         self.resize(960, 720)
@@ -537,7 +623,7 @@ class VideoWindow(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        self.video_label = ClickableLabel("Press 'Start Detection' or 'Test Image' to begin")
+        self.video_label = ClickableLabel(main_window, "Press 'Start Detection' or 'Test Image' to begin")
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         layout.addWidget(self.video_label)
@@ -561,6 +647,8 @@ class MainWindow(QMainWindow):
         self._last_pixmap_size = (0, 0)
         self.focus_measure = 0.0
         self.show_video_labels = True
+        self.zoom_level = 1.0
+        self.pan_offset = QPoint(0, 0)
         self._sample_state = {
             'primary': {'pending': None, 'timestamp': 0.0, 'first': None, 'second': None, 'combined': None},
             'secondary': {'pending': None, 'timestamp': 0.0, 'first': None, 'second': None, 'combined': None},
@@ -570,8 +658,10 @@ class MainWindow(QMainWindow):
         self.hsv_target_locked = False
         self.machine_guide_enabled = True
         self.center_marker_enabled = True
-        self.video_window = VideoWindow()
+        self.video_window = VideoWindow(self)
         self.video_window.video_label.clicked.connect(self._handle_video_click)
+        self.video_window.video_label.wheel.connect(self._handle_zoom)
+        self.video_window.video_label.pan.connect(self._handle_pan)
         self.central_widget = QWidget(); self.main_layout = QVBoxLayout(self.central_widget); self.setCentralWidget(self.central_widget)
         self.main_layout.setContentsMargins(12, 8, 12, 12)
         self.main_layout.setSpacing(8)
@@ -587,6 +677,7 @@ class MainWindow(QMainWindow):
         self.detection_worker.result_ready.connect(self.display_processed_frame)
         self.detection_worker.status_update.connect(lambda msg: self.status_bar.showMessage(msg, 3000))
         self.auto_save_check.toggled.connect(self.detection_worker.set_auto_save)
+        self.tripwire_check.toggled.connect(self.detection_worker.set_tripwire_enabled)
         self.detection_thread.start()
         self.detection_worker.set_beep_enabled(self.beep_check.isChecked())
         self._update_random_save_status(self.random_save_check.isChecked())
@@ -718,6 +809,13 @@ class MainWindow(QMainWindow):
         training_row.addStretch()
         general_layout.addLayout(training_row)
 
+        tripwire_row = QHBoxLayout()
+        self.tripwire_check = QCheckBox('Tripwire/Once per object')
+        self.tripwire_check.toggled.connect(self._update_tripwire_status)
+        tripwire_row.addWidget(self.tripwire_check)
+        tripwire_row.addStretch()
+        general_layout.addLayout(tripwire_row)
+ 
         labels_row = QHBoxLayout()
         self.video_labels_check = QCheckBox('Show Video Labels')
         self.video_labels_check.setChecked(True)
@@ -953,6 +1051,14 @@ class MainWindow(QMainWindow):
             self.detection_worker.set_random_save_enabled(checked)
         self.status_bar.showMessage(
             'Random training capture enabled.' if checked else 'Random training capture disabled.',
+            2000
+        )
+
+    def _update_tripwire_status(self, checked):
+        if hasattr(self, 'detection_worker'):
+            self.detection_worker.set_tripwire_enabled(checked)
+        self.status_bar.showMessage(
+            'Tripwire enabled.' if checked else 'Tripwire disabled.',
             2000
         )
 
@@ -1639,6 +1745,26 @@ class MainWindow(QMainWindow):
         self.video_window.video_label.setPixmap(pixmap)
         self._last_pixmap_size = (pixmap.width(), pixmap.height())
 
+    def _handle_zoom(self, delta):
+        if delta > 0:
+            self.zoom_level *= 1.1
+        else:
+            self.zoom_level /= 1.1
+        self.zoom_level = max(1.0, min(self.zoom_level, 10.0)) # Clamp zoom level
+        if self.zoom_level == 1.0:
+            self.pan_offset = QPoint(0,0) # Reset pan on zoom out
+        if not self.is_detection_running:
+            self._reprocess_image()
+
+    def _handle_pan(self, dx, dy):
+        # Introduce a sensitivity factor for smoother panning
+        sensitivity = 0.5
+        self.pan_offset.setX(self.pan_offset.x() + int(dx * sensitivity))
+        self.pan_offset.setY(self.pan_offset.y() + int(dy * sensitivity))
+        if not self.is_detection_running:
+            self._reprocess_image()
+
+
     @pyqtSlot(np.ndarray)
     def update_image(self, cv_img):
         if self.is_paused:
@@ -1675,7 +1801,30 @@ class MainWindow(QMainWindow):
         target_size = self.video_window.video_label.size()
         if target_size.width() <= 1 or target_size.height() <= 1:
             target_size = self.video_window.size()
-        return QPixmap.fromImage(qimg).scaled(target_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        pixmap = QPixmap.fromImage(qimg)
+        if self.zoom_level > 1.0:
+            w, h = pixmap.width(), pixmap.height()
+            zoom_w, zoom_h = int(w / self.zoom_level), int(h / self.zoom_level)
+
+            # Apply panning
+            center_x = w // 2 - self.pan_offset.x()
+            center_y = h // 2 - self.pan_offset.y()
+
+            # Calculate crop coordinates
+            crop_x = center_x - zoom_w // 2
+            crop_y = center_y - zoom_h // 2
+
+            # Clamp crop coordinates to be within image bounds
+            crop_x = max(0, min(crop_x, w - zoom_w))
+            crop_y = max(0, min(crop_y, h - zoom_h))
+
+            # Update pan offset to reflect clamping
+            self.pan_offset.setX(w // 2 - (crop_x + zoom_w // 2))
+            self.pan_offset.setY(h // 2 - (crop_y + zoom_h // 2))
+
+
+            pixmap = pixmap.copy(crop_x, crop_y, zoom_w, zoom_h)
+        return pixmap.scaled(target_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
 
     def _save_settings(self):
         s = QSettings('config.ini', QSettings.Format.IniFormat)
@@ -1717,6 +1866,8 @@ class MainWindow(QMainWindow):
         s.setValue('hsv_target_lock', self.hsv_lock_check.isChecked())
         s.setValue('machine_guide', self.machine_guide_check.isChecked())
         s.setValue('center_marker', self.center_marker_check.isChecked())
+        if hasattr(self, 'tripwire_check'):
+            s.setValue('tripwire_enabled', self.tripwire_check.isChecked())
 
     def _load_settings(self):
         s = QSettings('config.ini', QSettings.Format.IniFormat)
@@ -1796,6 +1947,12 @@ class MainWindow(QMainWindow):
         lock_hsv = s.value('hsv_target_lock', False, type=bool)
         self.hsv_lock_check.setChecked(lock_hsv)
         self.hsv_target_locked = lock_hsv
+
+        if hasattr(self, 'tripwire_check'):
+            tripwire_enabled = s.value('tripwire_enabled', False, type=bool)
+            self.tripwire_check.setChecked(tripwire_enabled)
+            self.detection_worker.set_tripwire_enabled(tripwire_enabled)
+
         if mode_idx in (1,2) and not model_path:
             self.start_btn.setDisabled(False); self.test_image_btn.setDisabled(False)
 
