@@ -656,6 +656,7 @@ class MainWindow(QMainWindow):
         }
         self._current_sample_target = 'primary'
         self.hsv_target_locked = False
+        self.machine_guide_enabled = True
         self.center_marker_enabled = True
         self.video_window = VideoWindow(self)
         self.video_window.video_label.clicked.connect(self._handle_video_click)
@@ -790,6 +791,10 @@ class MainWindow(QMainWindow):
         general_layout.addLayout(beep_row)
 
         guide_row = QHBoxLayout()
+        self.machine_guide_check = QCheckBox('Show Machine Guide')
+        self.machine_guide_check.setChecked(self.machine_guide_enabled)
+        self.machine_guide_check.toggled.connect(self._toggle_machine_guide)
+        guide_row.addWidget(self.machine_guide_check)
         self.center_marker_check = QCheckBox('Show Center Marker')
         self.center_marker_check.setChecked(self.center_marker_enabled)
         self.center_marker_check.toggled.connect(self._toggle_center_marker)
@@ -1056,6 +1061,14 @@ class MainWindow(QMainWindow):
             'Tripwire enabled.' if checked else 'Tripwire disabled.',
             2000
         )
+
+    def _toggle_machine_guide(self, checked):
+        self.machine_guide_enabled = checked
+        if hasattr(self, 'status_bar'):
+            msg = 'Machine guide overlay enabled.' if checked else 'Machine guide overlay hidden.'
+            self.status_bar.showMessage(msg, 2000)
+        if not self.is_detection_running and self.last_tested_image is not None:
+            self._reprocess_image()
 
     def _toggle_center_marker(self, checked):
         self.center_marker_enabled = checked
@@ -1677,7 +1690,7 @@ class MainWindow(QMainWindow):
     def _apply_visual_guides(self, frame):
         if frame is None or frame.size == 0:
             return
-        if not self.center_marker_enabled:
+        if not (self.machine_guide_enabled or self.center_marker_enabled):
             return
         h, w = frame.shape[:2]
         if h == 0 or w == 0:
@@ -1685,6 +1698,26 @@ class MainWindow(QMainWindow):
         thickness = max(1, min(w, h) // 200)
         guide_color = (0, 165, 255)
         marker_color = (0, 255, 255)
+
+        if self.machine_guide_enabled:
+            margin_x = int(w * 0.1)
+            margin_y = int(h * 0.1)
+            top_left = (margin_x, margin_y)
+            bottom_right = (w - margin_x, h - margin_y)
+            cv2.rectangle(frame, top_left, bottom_right, guide_color, thickness)
+
+            tick = max(thickness * 4, int(min(w, h) * 0.04))
+            corner_points = [
+                top_left,
+                (bottom_right[0], top_left[1]),
+                (top_left[0], bottom_right[1]),
+                bottom_right
+            ]
+            offsets = [(tick, 0), (-tick, 0), (tick, 0), (-tick, 0)]
+            vertical_offsets = [(0, tick), (0, tick), (0, -tick), (0, -tick)]
+            for (x, y), (dx, dy), (vx, vy) in zip(corner_points, offsets, vertical_offsets):
+                cv2.line(frame, (x, y), (x + dx, y + dy), guide_color, thickness)
+                cv2.line(frame, (x, y), (x + vx, y + vy), guide_color, thickness)
 
         if self.center_marker_enabled:
             cx, cy = w // 2, h // 2
@@ -1831,6 +1864,7 @@ class MainWindow(QMainWindow):
         s.setValue('beep_enabled', self.beep_check.isChecked())
         s.setValue('random_save', self.random_save_check.isChecked())
         s.setValue('hsv_target_lock', self.hsv_lock_check.isChecked())
+        s.setValue('machine_guide', self.machine_guide_check.isChecked())
         s.setValue('center_marker', self.center_marker_check.isChecked())
         if hasattr(self, 'tripwire_check'):
             s.setValue('tripwire_enabled', self.tripwire_check.isChecked())
@@ -1879,6 +1913,7 @@ class MainWindow(QMainWindow):
         self._enable_hsv_controls(self.mode_combo.currentIndex() in (1,2))
         self._update_hsv_summary()
         self.beep_check.setChecked(s.value('beep_enabled', False, type=bool))
+        self.machine_guide_check.setChecked(s.value('machine_guide', True, type=bool))
         self.center_marker_check.setChecked(s.value('center_marker', True, type=bool))
         self.detection_worker.set_beep_enabled(self.beep_check.isChecked())
         random_save = s.value('random_save', False, type=bool)
