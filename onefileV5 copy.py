@@ -11,18 +11,10 @@ from torchvision.transforms import functional as F
 import winsound # Import for beep sound
 import threading
 
-try:
-    import serial
-    from serial.tools import list_ports
-except ImportError:
-    serial = None
-    list_ports = None
-
 from PyQt6.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QLineEdit, QSlider, QCheckBox,
-    QStatusBar, QComboBox, QSizePolicy, QMessageBox, QGroupBox, QDoubleSpinBox,
-    QAbstractSpinBox
+    QStatusBar, QComboBox, QSizePolicy, QMessageBox, QGroupBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QObject, pyqtSlot, QPoint
 from PyQt6.QtGui import QImage, QPixmap, QColor
@@ -90,89 +82,6 @@ def open_camera_by_index(index, resolution=None, prefer_backend="DSHOW", fps=Non
     fourcc_value = cap.get(cv2.CAP_PROP_FOURCC)
     fourcc_mode = _fourcc_to_string(fourcc_value)
     return cap, fourcc_mode
-
-
-class ArduinoManager:
-    """Thread-safe helper for communicating with an Arduino via serial."""
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._serial = None
-        self._port = None
-        self._baudrate = 9600
-
-    def available_ports(self):
-        if list_ports is None:
-            return []
-        ports = []
-        for info in list_ports.comports():
-            description = info.description or ""
-            label = f"{info.device} ({description})" if description else info.device
-            ports.append((info.device, label))
-        return ports
-
-    def is_connected(self):
-        with self._lock:
-            return bool(self._serial and self._serial.is_open)
-
-    def current_port(self):
-        with self._lock:
-            return self._port
-
-    def current_baudrate(self):
-        with self._lock:
-            return self._baudrate
-
-    def connect(self, port, baudrate=9600):
-        if serial is None:
-            raise RuntimeError("pyserial is not installed.")
-        if not port:
-            raise RuntimeError("No serial port specified.")
-        with self._lock:
-            if self._serial:
-                try:
-                    if self._serial.is_open:
-                        self._serial.close()
-                except Exception:
-                    pass
-                finally:
-                    self._serial = None
-            try:
-                self._serial = serial.Serial(port=port, baudrate=baudrate, timeout=1)
-            except Exception:
-                self._serial = None
-                self._port = None
-                self._baudrate = 9600
-                raise
-            else:
-                self._port = port
-                self._baudrate = baudrate
-
-    def disconnect(self):
-        with self._lock:
-            if self._serial:
-                try:
-                    if self._serial.is_open:
-                        self._serial.close()
-                finally:
-                    self._serial = None
-                    self._port = None
-                    self._baudrate = 9600
-
-    def send_command(self, command):
-        if not command:
-            return
-        with self._lock:
-            if not self._serial or not self._serial.is_open:
-                raise RuntimeError("Arduino is not connected.")
-            if isinstance(command, str):
-                data = command.encode("utf-8")
-            else:
-                data = bytes(command)
-            if not data.endswith(b"\n"):
-                data += b"\n"
-            self._serial.write(data)
-            self._serial.flush()
 
 
 # def open_camera_by_index(index, resolution=None, prefer_backend="MSMF", fps=None, preferred_fourcc=None, warmup_frames=10):
@@ -529,19 +438,6 @@ class DetectionWorker(QObject):
         self.tripwire_enabled = False
         self.recently_detected_centroids = []
         self.first_frame_processed = False # <--- LOGGING FLAG
-        self.arduino_manager = None
-        self.arduino_enabled = False
-        self.arduino_trigger_command = "1"
-        self.arduino_clear_command = "0"
-        self.arduino_clear_enabled = False
-        self.arduino_clear_delay = 1.0
-        self.arduino_trigger_delay = 0.0
-        self.arduino_trigger_angle = None
-        self.arduino_clear_angle = None
-        self._arduino_last_signal = "clear"
-        self._arduino_last_trigger_time = 0.0
-        self._last_anomaly_seen_time = 0.0
-        self._arduino_trigger_timer = None
 
     def _beep_thread_target(self):
         try:
@@ -553,89 +449,6 @@ class DetectionWorker(QObject):
         if not self.beep_enabled:
             return
         threading.Thread(target=self._beep_thread_target, daemon=True).start()
-
-    def _format_arduino_command(self, command, angle):
-        if not command:
-            return ""
-        original_cmd = str(command)
-        cmd = original_cmd.strip()
-        if angle is None:
-            return cmd
-        try:
-            angle_value = int(round(float(angle)))
-        except (TypeError, ValueError):
-            return cmd
-        if "{angle}" in original_cmd:
-            return cmd.replace("{angle}", str(angle_value))
-        if "{ANGLE}" in original_cmd:
-            return cmd.replace("{ANGLE}", str(angle_value))
-        return cmd
-
-    def _send_arduino_command(self, command, state_label=None, require_enabled=True, angle=None):
-        if not command or self.arduino_manager is None:
-            return False
-        if require_enabled and not self.arduino_enabled:
-            return False
-        formatted_command = self._format_arduino_command(command, angle).strip()
-        if not formatted_command:
-            return False
-        if not self.arduino_manager.is_connected():
-            if require_enabled:
-                self.status_update.emit("Arduino not connected.")
-            return False
-        try:
-            self.arduino_manager.send_command(formatted_command)
-        except Exception as err:
-            self.status_update.emit(f"Arduino error: {err}")
-            return False
-        if state_label:
-            self._arduino_last_signal = state_label
-        return True
-
-    def _send_arduino_trigger(self, require_enabled=True):
-        if self._send_arduino_command(
-            self.arduino_trigger_command,
-            "trigger",
-            require_enabled=require_enabled,
-            angle=self.arduino_trigger_angle,
-        ):
-            if require_enabled and self.arduino_enabled:
-                self._arduino_last_trigger_time = time.time()
-
-    def _send_arduino_clear(self, require_enabled=True):
-        self._cancel_arduino_trigger_timer()
-        self._send_arduino_command(
-            self.arduino_clear_command,
-            "clear",
-            require_enabled=require_enabled,
-            angle=self.arduino_clear_angle,
-        )
-
-    def _cancel_arduino_trigger_timer(self):
-        timer = self._arduino_trigger_timer
-        if timer is not None:
-            try:
-                if timer.is_alive():
-                    timer.cancel()
-            finally:
-                self._arduino_trigger_timer = None
-
-    def _delayed_arduino_trigger_fire(self):
-        self._arduino_trigger_timer = None
-        self._send_arduino_trigger(require_enabled=True)
-
-    def _schedule_arduino_trigger(self):
-        if not self.arduino_enabled:
-            return
-        delay = max(0.0, float(self.arduino_trigger_delay or 0.0))
-        self._cancel_arduino_trigger_timer()
-        if delay <= 0.0:
-            self._send_arduino_trigger()
-            return
-        timer = threading.Timer(delay, self._delayed_arduino_trigger_fire)
-        timer.daemon = True
-        self._arduino_trigger_timer = timer
-        timer.start()
 
     @pyqtSlot(np.ndarray)
     def process_frame(self, cv_img):
@@ -692,9 +505,6 @@ class DetectionWorker(QObject):
             if is_anomaly:
                 is_new_anomaly_found = True
 
-        if is_anomaly_present:
-            self._last_anomaly_seen_time = now_ts
-
 
         if is_first_frame:
             end_process_time = time.time()
@@ -704,11 +514,6 @@ class DetectionWorker(QObject):
         if is_new_anomaly_found:
             self.anomaly_count += 1
             self._play_beep_async()
-            self._schedule_arduino_trigger()
-        elif self.arduino_enabled and self.arduino_clear_enabled and not is_anomaly_present:
-            if self._arduino_last_signal == "trigger" and self._arduino_last_trigger_time > 0:
-                if now_ts - self._arduino_last_trigger_time >= self.arduino_clear_delay:
-                    self._send_arduino_clear()
 
         if is_new_anomaly_found and self.auto_save and now_ts - self.last_save_time > 2:
             ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
@@ -756,63 +561,10 @@ class DetectionWorker(QObject):
         if not status:
             self.recently_detected_centroids.clear()
 
-    @pyqtSlot(object)
-    def set_arduino_manager(self, manager):
-        self.arduino_manager = manager
-
-    @pyqtSlot(bool, str, str, bool, float, float, object, object)
-    def configure_arduino(
-        self,
-        enabled,
-        trigger_command,
-        clear_command,
-        clear_enabled,
-        clear_delay,
-        trigger_delay,
-        trigger_angle,
-        clear_angle,
-    ):
-        self.arduino_enabled = bool(enabled)
-        self.arduino_trigger_command = (trigger_command or "").strip()
-        self.arduino_clear_command = (clear_command or "").strip()
-        self.arduino_clear_enabled = bool(clear_enabled)
-        try:
-            delay = float(clear_delay)
-        except (TypeError, ValueError):
-            delay = 0.0
-        self.arduino_clear_delay = max(0.0, delay)
-        try:
-            trig_delay = float(trigger_delay)
-        except (TypeError, ValueError):
-            trig_delay = 0.0
-        self.arduino_trigger_delay = max(0.0, trig_delay)
-        def _coerce_angle(value):
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError):
-                return None
-            return max(0, min(180, int(round(numeric))))
-        self.arduino_trigger_angle = _coerce_angle(trigger_angle)
-        self.arduino_clear_angle = _coerce_angle(clear_angle)
-        if not self.arduino_enabled:
-            self._cancel_arduino_trigger_timer()
-
-    @pyqtSlot()
-    def send_arduino_trigger_test(self):
-        self._send_arduino_trigger(require_enabled=False)
-
-    @pyqtSlot()
-    def send_arduino_clear_now(self):
-        self._send_arduino_clear(require_enabled=False)
-
     def reset_counter(self):
         self.anomaly_count = 0
         self.first_frame_processed = False
         self.detector.first_inference = True
-        self._last_anomaly_seen_time = 0.0
-        self._cancel_arduino_trigger_timer()
-        if self.arduino_enabled and self.arduino_clear_enabled:
-            self._send_arduino_clear()
 
 class ClickableLabel(QLabel):
     clicked = pyqtSignal(int, int)
@@ -862,104 +614,6 @@ class ClickableLabel(QLabel):
         event.accept()
 
 
-class DelaySpinBox(QDoubleSpinBox):
-    """Internal spinbox with hidden native buttons."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.setAccelerated(True)
-        self.setKeyboardTracking(False)
-        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-
-
-class DelayControl(QWidget):
-    """Compound control with a numeric entry and explicit +/- buttons."""
-
-    valueChanged = pyqtSignal(float)
-
-    def __init__(self, minimum=0.0, maximum=30.0, step=0.1, value=0.0, decimals=1, parent=None):
-        super().__init__(parent)
-        self._spin = DelaySpinBox(self)
-        self._spin.setRange(minimum, maximum)
-        self._spin.setDecimals(decimals)
-        self._spin.setSingleStep(step)
-        self._spin.setValue(value)
-        self._spin.valueChanged.connect(self._on_value_changed)
-
-        self._minus_btn = QPushButton('-')
-        self._minus_btn.setFixedWidth(26)
-        self._minus_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._minus_btn.clicked.connect(self._spin.stepDown)
-
-        self._plus_btn = QPushButton('+')
-        self._plus_btn.setFixedWidth(26)
-        self._plus_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._plus_btn.clicked.connect(self._spin.stepUp)
-
-        for btn in (self._minus_btn, self._plus_btn):
-            btn.setProperty("class", "delay-button")
-            btn.setAutoDefault(False)
-            btn.setDefault(False)
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        layout.addWidget(self._spin)
-        layout.addWidget(self._minus_btn)
-        layout.addWidget(self._plus_btn)
-
-    def _on_value_changed(self, new_value):
-        self.valueChanged.emit(new_value)
-
-    def value(self):
-        return self._spin.value()
-
-    def setValue(self, value):
-        self._spin.setValue(value)
-
-    def setRange(self, minimum, maximum):
-        self._spin.setRange(minimum, maximum)
-
-    def setDecimals(self, decimals):
-        self._spin.setDecimals(decimals)
-
-    def setSingleStep(self, step):
-        self._spin.setSingleStep(step)
-
-    def blockSignals(self, block):
-        return self._spin.blockSignals(block)
-
-    def setEnabled(self, enabled):
-        self._spin.setEnabled(enabled)
-        self._minus_btn.setEnabled(enabled)
-        self._plus_btn.setEnabled(enabled)
-
-    def setToolTip(self, text):
-        self._spin.setToolTip(text)
-        self._minus_btn.setToolTip(text)
-        self._plus_btn.setToolTip(text)
-
-    def setSuffix(self, suffix):
-        self._spin.setSuffix(suffix)
-
-    def setFocusPolicy(self, policy):
-        self._spin.setFocusPolicy(policy)
-
-    def setMinimum(self, minimum):
-        self._spin.setMinimum(minimum)
-
-    def setMaximum(self, maximum):
-        self._spin.setMaximum(maximum)
-
-    def keyboardTracking(self):
-        return self._spin.keyboardTracking()
-
-    def setKeyboardTracking(self, tracking):
-        self._spin.setKeyboardTracking(tracking)
-
-
-
 class VideoWindow(QWidget):
     def __init__(self, main_window):
         super().__init__()
@@ -983,7 +637,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle('Live Anomaly Detection GUI (Hybrid OR + Folder Clear)')
         self.setGeometry(100,100,1200,800)
         self.detector = AnomalyDetector()
-        self.arduino_manager = ArduinoManager()
         self.is_detection_running = False
         self.is_paused = False
         self.current_frame = None
@@ -1025,10 +678,8 @@ class MainWindow(QMainWindow):
         self.auto_save_check.toggled.connect(self.detection_worker.set_auto_save)
         self.tripwire_check.toggled.connect(self.detection_worker.set_tripwire_enabled)
         self.detection_thread.start()
-        self.detection_worker.set_arduino_manager(self.arduino_manager)
         self.detection_worker.set_beep_enabled(self.beep_check.isChecked())
         self._update_random_save_status(self.random_save_check.isChecked())
-        self._push_arduino_config()
 
     def _create_top_bar(self):
         top = QHBoxLayout()
@@ -1179,10 +830,6 @@ class MainWindow(QMainWindow):
         general_group.setLayout(general_layout)
         left.addWidget(general_group)
 
-        self.arduino_group = self._create_arduino_group()
-        left.addWidget(self.arduino_group)
-        self._refresh_arduino_ports(initial=True)
-
         def build_hue_group(title, enable_attr, enable_slot, slider_specs, summary_attr):
             group = QGroupBox(title)
             group.setStyleSheet(
@@ -1326,239 +973,6 @@ class MainWindow(QMainWindow):
         self._update_hsv_sample_labels()
 
         self._list_cameras(); self._enable_hsv_controls(False)
-
-    def _create_arduino_group(self):
-        group = QGroupBox('Arduino Integration')
-        group.setStyleSheet(
-            'QGroupBox { font-weight: bold; border: 1px solid #555; border-radius: 6px; margin-top: 4px; }'
-            'QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; }'
-        )
-        layout = QVBoxLayout()
-        layout.setSpacing(6)
-        layout.setContentsMargins(12, 12, 12, 12)
-
-        port_row = QHBoxLayout()
-        port_row.addWidget(QLabel('Port:'))
-        self.arduino_port_combo = QComboBox()
-        self.arduino_port_combo.setEditable(True)
-        self.arduino_port_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
-        port_row.addWidget(self.arduino_port_combo, 1)
-        self.arduino_refresh_btn = QPushButton('Refresh')
-        self.arduino_refresh_btn.clicked.connect(self._refresh_arduino_ports)
-        port_row.addWidget(self.arduino_refresh_btn)
-        layout.addLayout(port_row)
-
-        baud_row = QHBoxLayout()
-        baud_row.addWidget(QLabel('Baud:'))
-        self.arduino_baud_combo = QComboBox()
-        self.arduino_baud_combo.addItems(['9600', '19200', '38400', '57600', '115200'])
-        baud_row.addWidget(self.arduino_baud_combo)
-        baud_row.addStretch()
-        layout.addLayout(baud_row)
-
-        control_row = QHBoxLayout()
-        self.arduino_connect_btn = QPushButton('Connect')
-        self.arduino_connect_btn.clicked.connect(self._handle_arduino_connect)
-        control_row.addWidget(self.arduino_connect_btn)
-        self.arduino_status_label = QLabel('Not connected' if serial is not None else 'pyserial not installed')
-        self.arduino_status_label.setStyleSheet('color: #d35400; font-weight: bold;')
-        control_row.addWidget(self.arduino_status_label, 1)
-        control_row.addStretch()
-        layout.addLayout(control_row)
-
-        enable_row = QHBoxLayout()
-        self.arduino_enable_check = QCheckBox('Enable trigger on anomaly')
-        self.arduino_enable_check.toggled.connect(self._arduino_config_changed)
-        enable_row.addWidget(self.arduino_enable_check)
-        enable_row.addWidget(QLabel('Trigger delay (s):'))
-        self.arduino_trigger_delay_spin = DelayControl(minimum=0.0, maximum=30.0, step=0.1, value=0.0, decimals=1)
-        self.arduino_trigger_delay_spin.valueChanged.connect(lambda _: self._arduino_config_changed())
-        enable_row.addWidget(self.arduino_trigger_delay_spin)
-        enable_row.addStretch()
-        layout.addLayout(enable_row)
-
-        clear_row = QHBoxLayout()
-        self.arduino_auto_clear_check = QCheckBox('Auto-clear')
-        self.arduino_auto_clear_check.toggled.connect(self._arduino_config_changed)
-        clear_row.addWidget(self.arduino_auto_clear_check)
-        clear_row.addWidget(QLabel('Delay (s):'))
-        self.arduino_clear_delay_spin = DelayControl(minimum=0.0, maximum=30.0, step=0.1, value=1.0, decimals=1)
-        self.arduino_clear_delay_spin.valueChanged.connect(lambda _: self._arduino_config_changed())
-        clear_row.addWidget(self.arduino_clear_delay_spin)
-        clear_row.addStretch()
-        layout.addLayout(clear_row)
-
-        command_row = QHBoxLayout()
-        command_row.addWidget(QLabel('Trigger cmd:'))
-        self.arduino_trigger_edit = QLineEdit('1')
-        self.arduino_trigger_edit.setMaxLength(64)
-        self.arduino_trigger_edit.editingFinished.connect(self._arduino_config_changed)
-        command_row.addWidget(self.arduino_trigger_edit)
-        command_row.addWidget(QLabel('Clear cmd:'))
-        self.arduino_clear_edit = QLineEdit('0')
-        self.arduino_clear_edit.setMaxLength(64)
-        self.arduino_clear_edit.editingFinished.connect(self._arduino_config_changed)
-        command_row.addWidget(self.arduino_clear_edit)
-        command_row.addStretch()
-        layout.addLayout(command_row)
-
-        test_row = QHBoxLayout()
-        self.arduino_trigger_test_btn = QPushButton('Test Trigger')
-        self.arduino_trigger_test_btn.clicked.connect(self._send_arduino_test_trigger)
-        test_row.addWidget(self.arduino_trigger_test_btn)
-        self.arduino_clear_test_btn = QPushButton('Send Clear')
-        self.arduino_clear_test_btn.clicked.connect(self._send_arduino_test_clear)
-        test_row.addWidget(self.arduino_clear_test_btn)
-        test_row.addStretch()
-        layout.addLayout(test_row)
-
-        group.setLayout(layout)
-
-        if serial is None:
-            for widget in (
-                self.arduino_port_combo,
-                self.arduino_refresh_btn,
-                self.arduino_connect_btn,
-                self.arduino_enable_check,
-                self.arduino_auto_clear_check,
-                self.arduino_trigger_delay_spin,
-                self.arduino_clear_delay_spin,
-                self.arduino_trigger_edit,
-                self.arduino_clear_edit,
-                self.arduino_trigger_test_btn,
-                self.arduino_clear_test_btn,
-                self.arduino_baud_combo,
-            ):
-                widget.setEnabled(False)
-        self._update_arduino_ui_state()
-        self._update_arduino_delay_spin_states()
-        return group
-
-    def _refresh_arduino_ports(self, initial=False):
-        if not hasattr(self, 'arduino_port_combo'):
-            return
-        if serial is None:
-            self.arduino_port_combo.clear()
-            self.arduino_port_combo.addItem('pyserial not installed', None)
-            self.arduino_port_combo.setCurrentIndex(0)
-            return
-        ports = self.arduino_manager.available_ports()
-        previous = self.arduino_manager.current_port() or self.arduino_port_combo.currentData()
-        self.arduino_port_combo.blockSignals(True)
-        self.arduino_port_combo.clear()
-        if ports:
-            for device, label in ports:
-                self.arduino_port_combo.addItem(label, device)
-            if previous:
-                idx = self.arduino_port_combo.findData(previous)
-                if idx != -1:
-                    self.arduino_port_combo.setCurrentIndex(idx)
-        else:
-            self.arduino_port_combo.addItem('No ports found', None)
-            self.arduino_port_combo.setCurrentIndex(0)
-        self.arduino_port_combo.blockSignals(False)
-        if not initial and serial is not None:
-            self.status_bar.showMessage('Arduino ports refreshed.', 2000)
-
-    def _update_arduino_ui_state(self):
-        connected = self.arduino_manager.is_connected() if serial is not None else False
-        if connected:
-            port = self.arduino_manager.current_port()
-            baud = self.arduino_manager.current_baudrate()
-            self.arduino_status_label.setText(f'Connected: {port} @ {baud}')
-            self.arduino_status_label.setStyleSheet('color: #27ae60; font-weight: bold;')
-            self.arduino_connect_btn.setText('Disconnect')
-            self.arduino_trigger_test_btn.setEnabled(True)
-            self.arduino_clear_test_btn.setEnabled(True)
-        else:
-            default_text = 'Not connected' if serial is not None else 'pyserial not installed'
-            self.arduino_status_label.setText(default_text)
-            self.arduino_status_label.setStyleSheet('color: #d35400; font-weight: bold;')
-            self.arduino_connect_btn.setText('Connect')
-            self.arduino_trigger_test_btn.setEnabled(False)
-            self.arduino_clear_test_btn.setEnabled(False)
-        self._update_arduino_delay_spin_states()
-
-    def _handle_arduino_connect(self):
-        if serial is None:
-            QMessageBox.warning(self, 'Arduino', 'pyserial is not installed. Install it to enable Arduino support.')
-            return
-        if self.arduino_manager.is_connected():
-            self.arduino_manager.disconnect()
-            self.status_bar.showMessage('Arduino disconnected.', 2000)
-            self._update_arduino_ui_state()
-            self._push_arduino_config()
-            return
-
-        port = self.arduino_port_combo.currentData()
-        if not port:
-            port = (self.arduino_port_combo.currentText() or "").strip()
-        if not port:
-            QMessageBox.warning(self, 'Arduino', 'Select or enter a serial port.')
-            return
-        try:
-            baudrate = int(self.arduino_baud_combo.currentText())
-        except ValueError:
-            baudrate = 9600
-        try:
-            self.arduino_manager.connect(port, baudrate)
-        except Exception as err:
-            QMessageBox.critical(self, 'Arduino', f'Failed to connect: {err}')
-        else:
-            self.status_bar.showMessage(f'Arduino connected on {port} ({baudrate} baud).', 3000)
-            self._refresh_arduino_ports(initial=True)
-        self._update_arduino_ui_state()
-        self._push_arduino_config()
-
-    def _arduino_config_changed(self, *_):
-        self._update_arduino_delay_spin_states()
-        self._push_arduino_config()
-
-    def _push_arduino_config(self):
-        if not hasattr(self, 'detection_worker'):
-            return
-        enabled = self.arduino_enable_check.isChecked() if hasattr(self, 'arduino_enable_check') else False
-        trigger_cmd = self.arduino_trigger_edit.text() if hasattr(self, 'arduino_trigger_edit') else ''
-        clear_cmd = self.arduino_clear_edit.text() if hasattr(self, 'arduino_clear_edit') else ''
-        auto_clear = self.arduino_auto_clear_check.isChecked() if hasattr(self, 'arduino_auto_clear_check') else False
-        clear_delay = self.arduino_clear_delay_spin.value() if hasattr(self, 'arduino_clear_delay_spin') else 1.0
-        trigger_delay = self.arduino_trigger_delay_spin.value() if hasattr(self, 'arduino_trigger_delay_spin') else 0.0
-        self.detection_worker.configure_arduino(
-            enabled,
-            trigger_cmd,
-            clear_cmd,
-            auto_clear,
-            clear_delay,
-            trigger_delay,
-            None,
-            None,
-        )
-
-    def _send_arduino_test_trigger(self):
-        if serial is None:
-            return
-        if not self.arduino_manager.is_connected():
-            self.status_bar.showMessage('Arduino not connected.', 2000)
-            return
-        self.detection_worker.send_arduino_trigger_test()
-        self.status_bar.showMessage('Trigger command sent to Arduino.', 2000)
-
-    def _send_arduino_test_clear(self):
-        if serial is None:
-            return
-        if not self.arduino_manager.is_connected():
-            self.status_bar.showMessage('Arduino not connected.', 2000)
-            return
-        self.detection_worker.send_arduino_clear_now()
-        self.status_bar.showMessage('Clear command sent to Arduino.', 2000)
-
-    def _update_arduino_delay_spin_states(self):
-        trigger_spin = getattr(self, 'arduino_trigger_delay_spin', None)
-        if trigger_spin is not None:
-            trigger_spin.setEnabled(serial is not None)
-        clear_spin = getattr(self, 'arduino_clear_delay_spin', None)
-        if clear_spin is not None:
-            clear_spin.setEnabled(serial is not None)
 
     def _create_status_bar(self):
         self.status_bar = QStatusBar(); self.setStatusBar(self.status_bar)
@@ -2418,17 +1832,6 @@ class MainWindow(QMainWindow):
         s.setValue('random_save', self.random_save_check.isChecked())
         s.setValue('hsv_target_lock', self.hsv_lock_check.isChecked())
         s.setValue('center_marker', self.center_marker_check.isChecked())
-        if hasattr(self, 'arduino_enable_check'):
-            s.setValue('arduino_enabled', self.arduino_enable_check.isChecked())
-            s.setValue('arduino_auto_clear', self.arduino_auto_clear_check.isChecked())
-            s.setValue('arduino_clear_delay', self.arduino_clear_delay_spin.value())
-            s.setValue('arduino_trigger_delay', self.arduino_trigger_delay_spin.value())
-            s.setValue('arduino_trigger_cmd', self.arduino_trigger_edit.text())
-            s.setValue('arduino_clear_cmd', self.arduino_clear_edit.text())
-            port_data = self.arduino_port_combo.currentData()
-            port_value = port_data if port_data else self.arduino_port_combo.currentText()
-            s.setValue('arduino_port', port_value)
-            s.setValue('arduino_baud', self.arduino_baud_combo.currentText())
         if hasattr(self, 'tripwire_check'):
             s.setValue('tripwire_enabled', self.tripwire_check.isChecked())
 
@@ -2457,49 +1860,6 @@ class MainWindow(QMainWindow):
         fps_text = s.value('fps_limit_text','Uncapped');
         if fps_text in self.fps_options: self.fps_combo.setCurrentText(fps_text)
         auto_save = s.value('auto_save',False,type=bool); self.auto_save_check.setChecked(auto_save); self.detection_worker.set_auto_save(auto_save)
-        if hasattr(self, 'arduino_port_combo'):
-            self._refresh_arduino_ports(initial=True)
-            saved_port = s.value('arduino_port', '')
-            if saved_port:
-                idx = self.arduino_port_combo.findData(saved_port)
-                if idx != -1:
-                    self.arduino_port_combo.setCurrentIndex(idx)
-                else:
-                    self.arduino_port_combo.setEditText(saved_port)
-            saved_baud = str(s.value('arduino_baud', '9600'))
-            idx = self.arduino_baud_combo.findText(saved_baud)
-            if idx != -1:
-                self.arduino_baud_combo.setCurrentIndex(idx)
-            else:
-                self.arduino_baud_combo.setCurrentText(saved_baud)
-            trigger_cmd = s.value('arduino_trigger_cmd', '1')
-            clear_cmd = s.value('arduino_clear_cmd', '0')
-            self.arduino_trigger_edit.setText(trigger_cmd)
-            self.arduino_clear_edit.setText(clear_cmd)
-            self.arduino_enable_check.blockSignals(True)
-            self.arduino_enable_check.setChecked(s.value('arduino_enabled', False, type=bool))
-            self.arduino_enable_check.blockSignals(False)
-            self.arduino_auto_clear_check.blockSignals(True)
-            self.arduino_auto_clear_check.setChecked(s.value('arduino_auto_clear', True, type=bool))
-            self.arduino_auto_clear_check.blockSignals(False)
-            trigger_delay_value = s.value('arduino_trigger_delay', 0.0)
-            try:
-                trigger_delay_value = float(trigger_delay_value)
-            except (TypeError, ValueError):
-                trigger_delay_value = 0.0
-            self.arduino_trigger_delay_spin.blockSignals(True)
-            self.arduino_trigger_delay_spin.setValue(max(0.0, trigger_delay_value))
-            self.arduino_trigger_delay_spin.blockSignals(False)
-            delay_value = s.value('arduino_clear_delay', 1.0)
-            try:
-                delay_value = float(delay_value)
-            except (TypeError, ValueError):
-                delay_value = 1.0
-            self.arduino_clear_delay_spin.blockSignals(True)
-            self.arduino_clear_delay_spin.setValue(delay_value)
-            self.arduino_clear_delay_spin.blockSignals(False)
-            self._update_arduino_ui_state()
-            self._update_arduino_delay_spin_states()
         mode_idx = s.value('mode_index',0,type=int); self.mode_combo.setCurrentIndex(mode_idx)
         self.h_low_slider.setValue(s.value('h_low',15,type=int)); self.h_high_slider.setValue(s.value('h_high',35,type=int))
         self.s_min_slider.setValue(s.value('s_min',60,type=int)); self.v_min_slider.setValue(s.value('v_min',120,type=int))
@@ -2557,8 +1917,6 @@ class MainWindow(QMainWindow):
             tripwire_enabled = s.value('tripwire_enabled', False, type=bool)
             self.tripwire_check.setChecked(tripwire_enabled)
             self.detection_worker.set_tripwire_enabled(tripwire_enabled)
-
-        self._push_arduino_config()
 
         if mode_idx in (1,2) and not model_path:
             self.start_btn.setDisabled(False); self.test_image_btn.setDisabled(False)

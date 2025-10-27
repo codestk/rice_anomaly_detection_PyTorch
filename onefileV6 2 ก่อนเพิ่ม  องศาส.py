@@ -536,8 +536,6 @@ class DetectionWorker(QObject):
         self.arduino_clear_enabled = False
         self.arduino_clear_delay = 1.0
         self.arduino_trigger_delay = 0.0
-        self.arduino_trigger_angle = None
-        self.arduino_clear_angle = None
         self._arduino_last_signal = "clear"
         self._arduino_last_trigger_time = 0.0
         self._last_anomaly_seen_time = 0.0
@@ -554,37 +552,17 @@ class DetectionWorker(QObject):
             return
         threading.Thread(target=self._beep_thread_target, daemon=True).start()
 
-    def _format_arduino_command(self, command, angle):
-        if not command:
-            return ""
-        original_cmd = str(command)
-        cmd = original_cmd.strip()
-        if angle is None:
-            return cmd
-        try:
-            angle_value = int(round(float(angle)))
-        except (TypeError, ValueError):
-            return cmd
-        if "{angle}" in original_cmd:
-            return cmd.replace("{angle}", str(angle_value))
-        if "{ANGLE}" in original_cmd:
-            return cmd.replace("{ANGLE}", str(angle_value))
-        return cmd
-
-    def _send_arduino_command(self, command, state_label=None, require_enabled=True, angle=None):
+    def _send_arduino_command(self, command, state_label=None, require_enabled=True):
         if not command or self.arduino_manager is None:
             return False
         if require_enabled and not self.arduino_enabled:
-            return False
-        formatted_command = self._format_arduino_command(command, angle).strip()
-        if not formatted_command:
             return False
         if not self.arduino_manager.is_connected():
             if require_enabled:
                 self.status_update.emit("Arduino not connected.")
             return False
         try:
-            self.arduino_manager.send_command(formatted_command)
+            self.arduino_manager.send_command(command)
         except Exception as err:
             self.status_update.emit(f"Arduino error: {err}")
             return False
@@ -593,23 +571,13 @@ class DetectionWorker(QObject):
         return True
 
     def _send_arduino_trigger(self, require_enabled=True):
-        if self._send_arduino_command(
-            self.arduino_trigger_command,
-            "trigger",
-            require_enabled=require_enabled,
-            angle=self.arduino_trigger_angle,
-        ):
+        if self._send_arduino_command(self.arduino_trigger_command, "trigger", require_enabled=require_enabled):
             if require_enabled and self.arduino_enabled:
                 self._arduino_last_trigger_time = time.time()
 
     def _send_arduino_clear(self, require_enabled=True):
         self._cancel_arduino_trigger_timer()
-        self._send_arduino_command(
-            self.arduino_clear_command,
-            "clear",
-            require_enabled=require_enabled,
-            angle=self.arduino_clear_angle,
-        )
+        self._send_arduino_command(self.arduino_clear_command, "clear", require_enabled=require_enabled)
 
     def _cancel_arduino_trigger_timer(self):
         timer = self._arduino_trigger_timer
@@ -760,18 +728,8 @@ class DetectionWorker(QObject):
     def set_arduino_manager(self, manager):
         self.arduino_manager = manager
 
-    @pyqtSlot(bool, str, str, bool, float, float, object, object)
-    def configure_arduino(
-        self,
-        enabled,
-        trigger_command,
-        clear_command,
-        clear_enabled,
-        clear_delay,
-        trigger_delay,
-        trigger_angle,
-        clear_angle,
-    ):
+    @pyqtSlot(bool, str, str, bool, float, float)
+    def configure_arduino(self, enabled, trigger_command, clear_command, clear_enabled, clear_delay, trigger_delay):
         self.arduino_enabled = bool(enabled)
         self.arduino_trigger_command = (trigger_command or "").strip()
         self.arduino_clear_command = (clear_command or "").strip()
@@ -786,14 +744,6 @@ class DetectionWorker(QObject):
         except (TypeError, ValueError):
             trig_delay = 0.0
         self.arduino_trigger_delay = max(0.0, trig_delay)
-        def _coerce_angle(value):
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError):
-                return None
-            return max(0, min(180, int(round(numeric))))
-        self.arduino_trigger_angle = _coerce_angle(trigger_angle)
-        self.arduino_clear_angle = _coerce_angle(clear_angle)
         if not self.arduino_enabled:
             self._cancel_arduino_trigger_timer()
 
@@ -1523,16 +1473,7 @@ class MainWindow(QMainWindow):
         auto_clear = self.arduino_auto_clear_check.isChecked() if hasattr(self, 'arduino_auto_clear_check') else False
         clear_delay = self.arduino_clear_delay_spin.value() if hasattr(self, 'arduino_clear_delay_spin') else 1.0
         trigger_delay = self.arduino_trigger_delay_spin.value() if hasattr(self, 'arduino_trigger_delay_spin') else 0.0
-        self.detection_worker.configure_arduino(
-            enabled,
-            trigger_cmd,
-            clear_cmd,
-            auto_clear,
-            clear_delay,
-            trigger_delay,
-            None,
-            None,
-        )
+        self.detection_worker.configure_arduino(enabled, trigger_cmd, clear_cmd, auto_clear, clear_delay, trigger_delay)
 
     def _send_arduino_test_trigger(self):
         if serial is None:
