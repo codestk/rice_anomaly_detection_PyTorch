@@ -2395,22 +2395,16 @@ class MainWindow(QMainWindow):
             cv2.circle(frame, (cx, cy), max(2, thickness * 2), marker_color, -1)
 
         if zone_enabled:
-            zone_color = (0, 255, 0)
+            zone_color = (255, 140, 0)
             top = int(min(self.detection_zone_top, self.detection_zone_bottom))
             bottom = int(max(self.detection_zone_top, self.detection_zone_bottom))
             top = max(0, min(top, h - 1))
             bottom = max(0, min(bottom, h - 1))
             line_thickness = max(1, thickness)
-            dash_length = max(6, line_thickness * 6)
-            gap_length = max(4, line_thickness * 3)
-            def _draw_dashed_horizontal(y_pos):
-                x = 0
-                while x < w:
-                    x_end = min(x + dash_length, w - 1)
-                    cv2.line(frame, (x, y_pos), (x_end, y_pos), zone_color, line_thickness)
-                    x += dash_length + gap_length
-            _draw_dashed_horizontal(top)
-            _draw_dashed_horizontal(bottom)
+            cv2.line(frame, (0, top), (w - 1, top), zone_color, line_thickness)
+            cv2.line(frame, (0, bottom), (w - 1, bottom), zone_color, line_thickness)
+            if bottom > top:
+                cv2.rectangle(frame, (0, top), (w - 1, bottom), zone_color, max(1, line_thickness // 2))
 
     def _reprocess_image(self):
         if self.last_tested_image is None or self.is_detection_running: return
