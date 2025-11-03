@@ -249,23 +249,6 @@ class AnomalyDetector:
         self.primary_hue_enabled = True
         self.secondary_hue_enabled = True
         self.tertiary_hue_enabled = True
-        self._kernel5 = np.ones((5,5), np.uint8)
-        self._kernel11 = np.ones((11,11), np.uint8)
-        self.use_cuda = False
-        self._cuda_open_filter = None
-        self._cuda_close_filter = None
-        self._cuda_close11_filter = None
-        try:
-            if hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0:
-                self._cuda_open_filter = cv2.cuda.createMorphologyFilter(cv2.MORPH_OPEN, cv2.CV_8UC1, self._kernel5)
-                self._cuda_close_filter = cv2.cuda.createMorphologyFilter(cv2.MORPH_CLOSE, cv2.CV_8UC1, self._kernel5)
-                self._cuda_close11_filter = cv2.cuda.createMorphologyFilter(cv2.MORPH_CLOSE, cv2.CV_8UC1, self._kernel11)
-                self.use_cuda = True
-        except (AttributeError, cv2.error):
-            self.use_cuda = False
-            self._cuda_open_filter = None
-            self._cuda_close_filter = None
-            self._cuda_close11_filter = None
 
     def set_mode(self, mode: str):
         self.mode = mode
@@ -291,37 +274,6 @@ class AnomalyDetector:
             self.h3_low, self.h3_high = self.h3_high, self.h3_low
         if s_min is not None:  self.s3_min  = int(max(0, min(255, s_min)))
         if v_min is not None:  self.v3_min  = int(max(0, min(255, v_min)))
-
-    def _prepare_cuda_context(self, frame):
-        if not self.use_cuda:
-            return None
-        try:
-            gpu_frame = cv2.cuda_GpuMat()
-            gpu_frame.upload(frame)
-            hsv_gpu = cv2.cuda.cvtColor(gpu_frame, cv2.COLOR_BGR2HSV)
-        except cv2.error:
-            return None
-        return {"frame": gpu_frame, "hsv": hsv_gpu}
-
-    def _ensure_cuda_gray(self, cuda_ctx):
-        if "gray" not in cuda_ctx:
-            try:
-                cuda_ctx["gray"] = cv2.cuda.cvtColor(cuda_ctx["frame"], cv2.COLOR_BGR2GRAY)
-            except cv2.error:
-                raise
-        return cuda_ctx["gray"]
-
-    def _mask_from_hsv_cuda(self, hsv_gpu, h_low, h_high, s_min, v_min):
-        lower1 = np.array([h_low, s_min, v_min], dtype=np.uint8)
-        upper1 = np.array([h_high, 255, 255], dtype=np.uint8)
-        lower2 = np.array([max(h_low-5,0), s_min, v_min], dtype=np.uint8)
-        upper2 = np.array([min(h_high+5,179), 255, 255], dtype=np.uint8)
-        mask1 = cv2.cuda.inRange(hsv_gpu, lower1, upper1)
-        mask2 = cv2.cuda.inRange(hsv_gpu, lower2, upper2)
-        mask_gpu = cv2.cuda.bitwise_or(mask1, mask2)
-        result = mask_gpu.download()
-        del mask1, mask2, mask_gpu
-        return result
     def set_cv_threshold(self, value):
         self.cv_threshold = int(value)
     def set_contour_threshold(self, value):
@@ -358,32 +310,15 @@ class AnomalyDetector:
         return False
 
     def _contours_from_mask(self, mask):
-        if self.use_cuda and self._cuda_open_filter is not None and self._cuda_close_filter is not None:
-            try:
-                gpu_mask = cv2.cuda_GpuMat()
-                gpu_mask.upload(mask)
-                gpu_mask = self._cuda_open_filter.apply(gpu_mask)
-                gpu_mask = self._cuda_close_filter.apply(gpu_mask)
-                gpu_mask = self._cuda_close_filter.apply(gpu_mask)
-                mask = gpu_mask.download()
-                del gpu_mask
-            except cv2.error:
-                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel5, iterations=1)
-                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel5, iterations=2)
-        else:
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel5, iterations=1)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel5, iterations=2)
+        kernel = np.ones((5,5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         return [c for c in contours if cv2.contourArea(c) > self.contour_area_threshold]
 
-    def _mask_color(self, frame, cuda_ctx=None):
+    def _mask_color(self, frame):
         if not self.primary_hue_enabled:
             return np.zeros(frame.shape[:2], dtype=np.uint8)
-        if self.use_cuda and cuda_ctx is not None and "hsv" in cuda_ctx:
-            try:
-                return self._mask_from_hsv_cuda(cuda_ctx["hsv"], self.h_low, self.h_high, self.s_min, self.v_min)
-            except cv2.error:
-                pass
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         lower1 = np.array([self.h_low, self.s_min, self.v_min], dtype=np.uint8)
         upper1 = np.array([self.h_high, 255, 255], dtype=np.uint8)
@@ -391,14 +326,9 @@ class AnomalyDetector:
         upper2 = np.array([min(self.h_high+5,179), 255, 255], dtype=np.uint8)
         return cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
 
-    def _mask_color_secondary(self, frame, cuda_ctx=None):
+    def _mask_color_secondary(self, frame):
         if not self.secondary_hue_enabled:
             return np.zeros(frame.shape[:2], dtype=np.uint8)
-        if self.use_cuda and cuda_ctx is not None and "hsv" in cuda_ctx:
-            try:
-                return self._mask_from_hsv_cuda(cuda_ctx["hsv"], self.h2_low, self.h2_high, self.s2_min, self.v2_min)
-            except cv2.error:
-                pass
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         lower1 = np.array([self.h2_low, self.s2_min, self.v2_min], dtype=np.uint8)
         upper1 = np.array([self.h2_high, 255, 255], dtype=np.uint8)
@@ -406,14 +336,9 @@ class AnomalyDetector:
         upper2 = np.array([min(self.h2_high+5,179), 255, 255], dtype=np.uint8)
         return cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
 
-    def _mask_color_tertiary(self, frame, cuda_ctx=None):
+    def _mask_color_tertiary(self, frame):
         if not self.tertiary_hue_enabled:
             return np.zeros(frame.shape[:2], dtype=np.uint8)
-        if self.use_cuda and cuda_ctx is not None and "hsv" in cuda_ctx:
-            try:
-                return self._mask_from_hsv_cuda(cuda_ctx["hsv"], self.h3_low, self.h3_high, self.s3_min, self.v3_min)
-            except cv2.error:
-                pass
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         lower1 = np.array([self.h3_low, self.s3_min, self.v3_min], dtype=np.uint8)
         upper1 = np.array([self.h3_high, 255, 255], dtype=np.uint8)
@@ -421,7 +346,7 @@ class AnomalyDetector:
         upper2 = np.array([min(self.h3_high+5,179), 255, 255], dtype=np.uint8)
         return cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
 
-    def _mask_recon_or_dummy(self, frame, is_first_frame=False, cuda_ctx=None):
+    def _mask_recon_or_dummy(self, frame, is_first_frame=False):
         try:
             if self.model is not None and self.model != "loaded" and callable(self.model):
                 with torch.no_grad():
@@ -450,40 +375,19 @@ class AnomalyDetector:
             print(f"Inference error: {e} -> fallback to dummy")
             reconstructed = cv2.GaussianBlur(frame, (7,7), 0)
 
-        diff = None
-        mask = None
-        if self.use_cuda and cuda_ctx is not None:
-            try:
-                gray_gpu = self._ensure_cuda_gray(cuda_ctx)
-                recon_gpu = cv2.cuda_GpuMat()
-                recon_gpu.upload(reconstructed)
-                gray_rec_gpu = cv2.cuda.cvtColor(recon_gpu, cv2.COLOR_BGR2GRAY)
-                diff_gpu = cv2.cuda.absdiff(gray_gpu, gray_rec_gpu)
-                diff = diff_gpu.download()
-                _, mask_gpu = cv2.cuda.threshold(diff_gpu, self.cv_threshold, 255, cv2.THRESH_BINARY)
-                if self._cuda_close11_filter is not None:
-                    mask_gpu = self._cuda_close11_filter.apply(mask_gpu)
-                    mask = mask_gpu.download()
-                else:
-                    mask = cv2.morphologyEx(diff, cv2.MORPH_CLOSE, self._kernel11, iterations=1)
-                del recon_gpu, gray_rec_gpu, diff_gpu, mask_gpu
-            except cv2.error:
-                diff = None
-                mask = None
-        if diff is None or mask is None:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray_rec = cv2.cvtColor(reconstructed, cv2.COLOR_BGR2GRAY)
-            diff = cv2.absdiff(gray, gray_rec)
-            _, mask = cv2.threshold(diff, self.cv_threshold, 255, cv2.THRESH_BINARY)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel11, iterations=1)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray_rec = cv2.cvtColor(reconstructed, cv2.COLOR_BGR2GRAY)
+        diff = cv2.absdiff(gray, gray_rec)
+        _, mask = cv2.threshold(diff, self.cv_threshold, 255, cv2.THRESH_BINARY)
+        kernel = np.ones((11,11), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
         return mask, float((np.square(diff)).mean())
 
     def process_frame(self, frame, is_first_frame=False):
-        cuda_ctx = self._prepare_cuda_context(frame)
         if self.mode == 'color':
-            mask_primary = self._mask_color(frame, cuda_ctx)
-            mask_secondary = self._mask_color_secondary(frame, cuda_ctx)
-            mask_tertiary = self._mask_color_tertiary(frame, cuda_ctx)
+            mask_primary = self._mask_color(frame)
+            mask_secondary = self._mask_color_secondary(frame)
+            mask_tertiary = self._mask_color_tertiary(frame)
             contours_primary = self._contours_from_mask(mask_primary)
             contours_secondary = self._contours_from_mask(mask_secondary)
             contours_tertiary = self._contours_from_mask(mask_tertiary)
@@ -506,7 +410,7 @@ class AnomalyDetector:
             return out, mse, is_anom, all_contours
 
         if self.mode == 'recon':
-            mask, mse = self._mask_recon_or_dummy(frame, is_first_frame, cuda_ctx)
+            mask, mse = self._mask_recon_or_dummy(frame, is_first_frame)
             contours = self._contours_from_mask(mask)
             out = frame.copy()
             for c in contours:
@@ -518,10 +422,10 @@ class AnomalyDetector:
             return out, mse, is_anom, contours
 
         # HYBRID OR
-        mask_recon, mse = self._mask_recon_or_dummy(frame, is_first_frame, cuda_ctx)
-        mask_color_primary = self._mask_color(frame, cuda_ctx)
-        mask_color_secondary = self._mask_color_secondary(frame, cuda_ctx)
-        mask_color_tertiary = self._mask_color_tertiary(frame, cuda_ctx)
+        mask_recon, mse = self._mask_recon_or_dummy(frame, is_first_frame)
+        mask_color_primary = self._mask_color(frame)
+        mask_color_secondary = self._mask_color_secondary(frame)
+        mask_color_tertiary = self._mask_color_tertiary(frame)
         contours_recon = self._contours_from_mask(mask_recon)
         contours_color_primary = self._contours_from_mask(mask_color_primary)
         contours_color_secondary = self._contours_from_mask(mask_color_secondary)
@@ -612,6 +516,7 @@ class VideoThread(QThread):
 class DetectionWorker(QObject):
     result_ready = pyqtSignal(np.ndarray, np.ndarray, float, bool, int)
     status_update = pyqtSignal(str)
+    arduino_state_changed = pyqtSignal(str)
     def __init__(self, detector):
         super().__init__()
         self.detector = detector
@@ -688,6 +593,7 @@ class DetectionWorker(QObject):
             return False
         if state_label:
             self._arduino_last_signal = state_label
+            self.arduino_state_changed.emit(state_label)
         return True
 
     def _send_arduino_trigger(self, require_enabled=True):
@@ -1206,6 +1112,7 @@ class MainWindow(QMainWindow):
         self.detection_worker.moveToThread(self.detection_thread)
         self.detection_worker.result_ready.connect(self.display_processed_frame)
         self.detection_worker.status_update.connect(lambda msg: self.status_bar.showMessage(msg, 3000))
+        self.detection_worker.arduino_state_changed.connect(self._handle_servo_state_changed)
         self.auto_save_check.toggled.connect(self.detection_worker.set_auto_save)
         self.tripwire_check.toggled.connect(self.detection_worker.set_tripwire_enabled)
         self.detection_thread.start()
@@ -1213,6 +1120,31 @@ class MainWindow(QMainWindow):
         self.detection_worker.set_beep_enabled(self.beep_check.isChecked())
         self._update_random_save_status(self.random_save_check.isChecked())
         self._push_arduino_config()
+        self._handle_servo_state_changed(self.detection_worker._arduino_last_signal)
+
+    @pyqtSlot(str)
+    def _handle_servo_state_changed(self, state):
+        self._apply_servo_state_to_indicator(state)
+
+    def _apply_servo_state_to_indicator(self, state):
+        light = getattr(self, "arduino_servo_light", None)
+        label = getattr(self, "arduino_servo_status_label", None)
+        if light is None or label is None:
+            return
+        normalized = (state or "").strip().lower()
+        if normalized == "trigger":
+            color = "#2ecc71"
+            text = "Open"
+        elif normalized == "clear":
+            color = "#e74c3c"
+            text = "Closed"
+        else:
+            color = "#7f8c8d"
+            text = "Unknown"
+        light.setStyleSheet(
+            f"background-color: {color}; border-radius: 9px; border: 1px solid #111;"
+        )
+        label.setText(text)
 
     def _create_top_bar(self):
         top = QHBoxLayout()
@@ -1553,6 +1485,17 @@ class MainWindow(QMainWindow):
         control_row.addStretch()
         layout.addLayout(control_row)
 
+        servo_row = QHBoxLayout()
+        servo_row.addWidget(QLabel('Servo Status:'))
+        self.arduino_servo_light = QLabel()
+        self.arduino_servo_light.setFixedSize(18, 18)
+        self.arduino_servo_light.setStyleSheet('background-color: #7f8c8d; border-radius: 9px; border: 1px solid #111;')
+        servo_row.addWidget(self.arduino_servo_light)
+        self.arduino_servo_status_label = QLabel('Unknown')
+        servo_row.addWidget(self.arduino_servo_status_label)
+        servo_row.addStretch()
+        layout.addLayout(servo_row)
+
         enable_row = QHBoxLayout()
         self.arduino_enable_check = QCheckBox('Enable trigger on anomaly')
         self.arduino_enable_check.toggled.connect(self._arduino_config_changed)
@@ -1657,6 +1600,8 @@ class MainWindow(QMainWindow):
             self.arduino_connect_btn.setText('Disconnect')
             self.arduino_trigger_test_btn.setEnabled(True)
             self.arduino_clear_test_btn.setEnabled(True)
+            if hasattr(self, 'detection_worker') and hasattr(self.detection_worker, '_arduino_last_signal'):
+                self._handle_servo_state_changed(self.detection_worker._arduino_last_signal)
         else:
             default_text = 'Not connected' if serial is not None else 'pyserial not installed'
             self.arduino_status_label.setText(default_text)
@@ -1664,6 +1609,7 @@ class MainWindow(QMainWindow):
             self.arduino_connect_btn.setText('Connect')
             self.arduino_trigger_test_btn.setEnabled(False)
             self.arduino_clear_test_btn.setEnabled(False)
+            self._apply_servo_state_to_indicator('unknown')
         self._update_arduino_delay_spin_states()
 
     def _handle_arduino_connect(self):

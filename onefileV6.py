@@ -516,6 +516,7 @@ class VideoThread(QThread):
 class DetectionWorker(QObject):
     result_ready = pyqtSignal(np.ndarray, np.ndarray, float, bool, int)
     status_update = pyqtSignal(str)
+    arduino_state_changed = pyqtSignal(str)
     def __init__(self, detector):
         super().__init__()
         self.detector = detector
@@ -592,6 +593,7 @@ class DetectionWorker(QObject):
             return False
         if state_label:
             self._arduino_last_signal = state_label
+            self.arduino_state_changed.emit(state_label)
         return True
 
     def _send_arduino_trigger(self, require_enabled=True):
@@ -1110,6 +1112,7 @@ class MainWindow(QMainWindow):
         self.detection_worker.moveToThread(self.detection_thread)
         self.detection_worker.result_ready.connect(self.display_processed_frame)
         self.detection_worker.status_update.connect(lambda msg: self.status_bar.showMessage(msg, 3000))
+        self.detection_worker.arduino_state_changed.connect(self._handle_servo_state_changed)
         self.auto_save_check.toggled.connect(self.detection_worker.set_auto_save)
         self.tripwire_check.toggled.connect(self.detection_worker.set_tripwire_enabled)
         self.detection_thread.start()
@@ -1117,6 +1120,31 @@ class MainWindow(QMainWindow):
         self.detection_worker.set_beep_enabled(self.beep_check.isChecked())
         self._update_random_save_status(self.random_save_check.isChecked())
         self._push_arduino_config()
+        self._handle_servo_state_changed(self.detection_worker._arduino_last_signal)
+
+    @pyqtSlot(str)
+    def _handle_servo_state_changed(self, state):
+        self._apply_servo_state_to_indicator(state)
+
+    def _apply_servo_state_to_indicator(self, state):
+        light = getattr(self, "arduino_servo_light", None)
+        label = getattr(self, "arduino_servo_status_label", None)
+        if light is None or label is None:
+            return
+        normalized = (state or "").strip().lower()
+        if normalized == "trigger":
+            color = "#2ecc71"
+            text = "Open"
+        elif normalized == "clear":
+            color = "#e74c3c"
+            text = "Closed"
+        else:
+            color = "#7f8c8d"
+            text = "Unknown"
+        light.setStyleSheet(
+            f"background-color: {color}; border-radius: 9px; border: 1px solid #111;"
+        )
+        label.setText(text)
 
     def _create_top_bar(self):
         top = QHBoxLayout()
@@ -1457,6 +1485,17 @@ class MainWindow(QMainWindow):
         control_row.addStretch()
         layout.addLayout(control_row)
 
+        servo_row = QHBoxLayout()
+        servo_row.addWidget(QLabel('Servo Status:'))
+        self.arduino_servo_light = QLabel()
+        self.arduino_servo_light.setFixedSize(18, 18)
+        self.arduino_servo_light.setStyleSheet('background-color: #7f8c8d; border-radius: 9px; border: 1px solid #111;')
+        servo_row.addWidget(self.arduino_servo_light)
+        self.arduino_servo_status_label = QLabel('Unknown')
+        servo_row.addWidget(self.arduino_servo_status_label)
+        servo_row.addStretch()
+        layout.addLayout(servo_row)
+
         enable_row = QHBoxLayout()
         self.arduino_enable_check = QCheckBox('Enable trigger on anomaly')
         self.arduino_enable_check.toggled.connect(self._arduino_config_changed)
@@ -1561,6 +1600,8 @@ class MainWindow(QMainWindow):
             self.arduino_connect_btn.setText('Disconnect')
             self.arduino_trigger_test_btn.setEnabled(True)
             self.arduino_clear_test_btn.setEnabled(True)
+            if hasattr(self, 'detection_worker') and hasattr(self.detection_worker, '_arduino_last_signal'):
+                self._handle_servo_state_changed(self.detection_worker._arduino_last_signal)
         else:
             default_text = 'Not connected' if serial is not None else 'pyserial not installed'
             self.arduino_status_label.setText(default_text)
@@ -1568,6 +1609,7 @@ class MainWindow(QMainWindow):
             self.arduino_connect_btn.setText('Connect')
             self.arduino_trigger_test_btn.setEnabled(False)
             self.arduino_clear_test_btn.setEnabled(False)
+            self._apply_servo_state_to_indicator('unknown')
         self._update_arduino_delay_spin_states()
 
     def _handle_arduino_connect(self):
