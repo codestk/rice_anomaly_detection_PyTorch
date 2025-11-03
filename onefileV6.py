@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QLineEdit, QSlider, QCheckBox,
     QStatusBar, QComboBox, QSizePolicy, QMessageBox, QGroupBox, QDoubleSpinBox,
-    QAbstractSpinBox, QProgressBar
+    QAbstractSpinBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QObject, pyqtSlot, QPoint
 from PyQt6.QtGui import QImage, QPixmap, QColor
@@ -712,9 +712,10 @@ class DetectionWorker(QObject):
                 if now_ts - self._arduino_last_trigger_time >= self.arduino_clear_delay:
                     self._send_arduino_clear()
 
-        if is_new_anomaly_found and self.auto_save and now_ts - self.last_save_time > 2:
+        if is_new_anomaly_found and self.auto_save:
             ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-            fname = f"anomaly_{ts}.png"
+            idx = self.anomaly_count
+            fname = f"anomaly_{idx:05d}_{ts}.png"
             det_dir = os.path.join('output','detections')
             ori_dir = os.path.join('output','original')
             os.makedirs(det_dir, exist_ok=True)
@@ -1240,16 +1241,6 @@ class MainWindow(QMainWindow):
         training_row.addStretch()
         general_layout.addLayout(training_row)
 
-        self.training_progress_label = QLabel('Training progress: idle')
-        self.training_progress_label.setStyleSheet('color: #3498db;')
-        self.training_progress_bar = QProgressBar()
-        self.training_progress_bar.setRange(0, 100)
-        self.training_progress_bar.setValue(0)
-        self.training_progress_bar.setFormat('%p%')
-        self.training_progress_bar.setTextVisible(True)
-        general_layout.addWidget(self.training_progress_label)
-        general_layout.addWidget(self.training_progress_bar)
-
         tripwire_row = QHBoxLayout()
         self.tripwire_check = QCheckBox('Tripwire/Once per object')
         self.tripwire_check.toggled.connect(self._update_tripwire_status)
@@ -1661,7 +1652,8 @@ class MainWindow(QMainWindow):
             clear_spin.setEnabled(serial is not None)
 
     def _create_status_bar(self):
-        self.status_bar = QStatusBar(); self.setStatusBar(self.status_bar)
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
         self.status_bar.showMessage('Ready. Load a model or choose Color/Hybrid mode.')
         self.fourcc_status_label = QLabel('Active FourCC: -')
         self.status_bar.addPermanentWidget(self.fourcc_status_label, 0)
@@ -1688,14 +1680,11 @@ class MainWindow(QMainWindow):
 
         self.train_btn.setDisabled(True)
         self.status_bar.showMessage('Starting training pipeline...', 3000)
-        self.training_progress_bar.setValue(0)
-        self.training_progress_label.setText('Training progress: starting...')
         self.training_thread = QThread()
         self.training_worker = TrainingWorker(scripts, self.project_root)
         self.training_worker.moveToThread(self.training_thread)
         self.training_thread.started.connect(self.training_worker.run)
         self.training_worker.progress.connect(self._on_training_progress)
-        self.training_worker.progress_percent.connect(self._on_training_progress_percent)
         self.training_worker.error.connect(self._on_training_error)
         self.training_worker.finished.connect(self._on_training_finished)
         self.training_worker.finished.connect(self.training_thread.quit)
@@ -1708,21 +1697,14 @@ class MainWindow(QMainWindow):
 
     def _on_training_progress(self, message):
         self.status_bar.showMessage(message, 4000)
-        self.training_progress_label.setText(message)
-
-    def _on_training_progress_percent(self, value):
-        self.training_progress_bar.setValue(max(0, min(100, int(value))))
 
     def _on_training_error(self, message):
         self.status_bar.showMessage(message, 5000)
         QMessageBox.critical(self, 'Training Pipeline', message)
-        self.training_progress_label.setText(message)
-        self.training_progress_bar.setValue(0)
 
     def _on_training_finished(self):
         self.status_bar.showMessage('Training pipeline completed.', 5000)
         QMessageBox.information(self, 'Training Pipeline', 'Training pipeline completed successfully.')
-        self.training_progress_label.setText('Training pipeline completed successfully.')
 
     def _on_training_thread_finished(self):
         self.train_btn.setDisabled(False)

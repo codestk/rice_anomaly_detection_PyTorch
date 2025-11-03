@@ -4,12 +4,14 @@ import os
 import time
 import shutil
 import random
+import re
 from datetime import datetime
 import numpy as np
 import torch
 from torchvision.transforms import functional as F
 import winsound # Import for beep sound
 import threading
+import subprocess
 
 try:
     import serial
@@ -542,9 +544,6 @@ class DetectionWorker(QObject):
         self._arduino_last_trigger_time = 0.0
         self._last_anomaly_seen_time = 0.0
         self._arduino_trigger_timer = None
-        self.detection_zone_enabled = False
-        self.detection_zone_top = 300
-        self.detection_zone_bottom = 340
 
     def _beep_thread_target(self):
         try:
@@ -640,25 +639,6 @@ class DetectionWorker(QObject):
         self._arduino_trigger_timer = timer
         timer.start()
 
-    def _normalized_zone_bounds(self, frame_height: int):
-        """Return sanitized zone bounds within the current frame."""
-        if not self.detection_zone_enabled or frame_height <= 0:
-            return 0, max(frame_height - 1, 0)
-        top = int(min(self.detection_zone_top, self.detection_zone_bottom))
-        bottom = int(max(self.detection_zone_top, self.detection_zone_bottom))
-        top = max(0, top)
-        bottom = max(top, bottom)
-        if frame_height > 0:
-            top = min(top, frame_height - 1)
-            bottom = min(bottom, frame_height - 1)
-        return top, bottom
-
-    def _centroid_in_zone(self, y: int, frame_height: int) -> bool:
-        if not self.detection_zone_enabled:
-            return True
-        top, bottom = self._normalized_zone_bounds(frame_height)
-        return top <= y <= bottom
-
     @pyqtSlot(np.ndarray)
     def process_frame(self, cv_img):
         if self.is_busy: return
@@ -674,56 +654,47 @@ class DetectionWorker(QObject):
 
         now_ts = time.time()
         is_new_anomaly_found = False
-        frame_height = original_frame.shape[0] if original_frame is not None else 0
-        valid_centroids = []
 
-        for contour in contours:
-            M = cv2.moments(contour)
-            if M["m00"] == 0:
-                continue
-            cX = int(M["m10"] / M["m00"])
-            cY = int(M["m01"] / M["m00"])
-            if not self._centroid_in_zone(cY, frame_height):
-                continue
-            valid_centroids.append((cX, cY))
-
-        has_zone_detection = bool(valid_centroids)
-
-        if self.tripwire_enabled:
+        if self.tripwire_enabled and is_anomaly_present:
+            # 1. Clean up old centroids
             expiry_time = 2.0 # seconds
             self.recently_detected_centroids = [
                 (c, t) for (c, t) in self.recently_detected_centroids if now_ts - t < expiry_time
             ]
 
-            if has_zone_detection:
-                newly_detected_centroids = []
-                distance_threshold = 50 # pixels
+            newly_detected_centroids = []
+            distance_threshold = 50 # pixels
 
-                for centroid in valid_centroids:
-                    is_new = True
-                    for existing_centroid, _ in self.recently_detected_centroids:
-                        dist = np.sqrt(
-                            (centroid[0] - existing_centroid[0])**2 +
-                            (centroid[1] - existing_centroid[1])**2
-                        )
-                        if dist < distance_threshold:
-                            is_new = False
-                            break
+            for contour in contours:
+                M = cv2.moments(contour)
+                if M["m00"] == 0: continue
+                cX = int(M["m10"] / M["m00"])
+                cY = int(M["m01"] / M["m00"])
+                centroid = (cX, cY)
 
-                    if is_new:
-                        is_new_anomaly_found = True
-                        newly_detected_centroids.append((centroid, now_ts))
+                # 2. Check if this is a new object
+                is_new = True
+                for existing_centroid, _ in self.recently_detected_centroids:
+                    dist = np.sqrt((centroid[0] - existing_centroid[0])**2 + (centroid[1] - existing_centroid[1])**2)
+                    if dist < distance_threshold:
+                        is_new = False
+                        break
+                
+                # 3. If it's new, mark it and add to our lists
+                if is_new:
+                    is_new_anomaly_found = True
+                    newly_detected_centroids.append((centroid, now_ts))
 
-                if newly_detected_centroids:
-                    self.recently_detected_centroids.extend(newly_detected_centroids)
-
+            # 4. Add the truly new objects to the main list
+            self.recently_detected_centroids.extend(newly_detected_centroids)
             is_anomaly = is_new_anomaly_found
         else:
-            is_anomaly = has_zone_detection
+            # Original behavior when tripwire is off
+            is_anomaly = is_anomaly_present
             if is_anomaly:
                 is_new_anomaly_found = True
 
-        if has_zone_detection:
+        if is_anomaly_present:
             self._last_anomaly_seen_time = now_ts
 
 
@@ -736,7 +707,7 @@ class DetectionWorker(QObject):
             self.anomaly_count += 1
             self._play_beep_async()
             self._schedule_arduino_trigger()
-        elif self.arduino_enabled and self.arduino_clear_enabled and not has_zone_detection:
+        elif self.arduino_enabled and self.arduino_clear_enabled and not is_anomaly_present:
             if self._arduino_last_signal == "trigger" and self._arduino_last_trigger_time > 0:
                 if now_ts - self._arduino_last_trigger_time >= self.arduino_clear_delay:
                     self._send_arduino_clear()
@@ -773,13 +744,6 @@ class DetectionWorker(QObject):
     @pyqtSlot(bool)
     def set_beep_enabled(self, status):
         self.beep_enabled = status
-    @pyqtSlot(bool)
-    def set_detection_zone_enabled(self, status):
-        self.detection_zone_enabled = bool(status)
-    @pyqtSlot(int, int)
-    def set_detection_zone_bounds(self, top, bottom):
-        self.detection_zone_top = int(top)
-        self.detection_zone_bottom = int(bottom)
     @pyqtSlot(bool)
     def set_auto_save(self, status):
         self.auto_save = status
@@ -924,18 +888,14 @@ class DelayControl(QWidget):
         self._spin.setSingleStep(step)
         self._spin.setValue(value)
         self._spin.valueChanged.connect(self._on_value_changed)
-        self._spin.setFixedHeight(28)
-        self._spin.setFixedWidth(80)
 
         self._minus_btn = QPushButton('-')
-        self._minus_btn.setFixedWidth(32)
-        self._minus_btn.setFixedHeight(28)
+        self._minus_btn.setFixedWidth(26)
         self._minus_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._minus_btn.clicked.connect(self._spin.stepDown)
 
         self._plus_btn = QPushButton('+')
-        self._plus_btn.setFixedWidth(32)
-        self._plus_btn.setFixedHeight(28)
+        self._plus_btn.setFixedWidth(26)
         self._plus_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._plus_btn.clicked.connect(self._spin.stepUp)
 
@@ -962,10 +922,6 @@ class DelayControl(QWidget):
 
     def setRange(self, minimum, maximum):
         self._spin.setRange(minimum, maximum)
-
-    def setFieldWidth(self, width):
-        width = max(40, int(width))
-        self._spin.setFixedWidth(width)
 
     def setDecimals(self, decimals):
         self._spin.setDecimals(decimals)
@@ -1005,6 +961,90 @@ class DelayControl(QWidget):
         self._spin.setKeyboardTracking(tracking)
 
 
+class TrainingWorker(QObject):
+    progress = pyqtSignal(str)
+    progress_percent = pyqtSignal(int)
+    error = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, scripts, working_dir):
+        super().__init__()
+        self.scripts = scripts
+        self.working_dir = working_dir
+        self._epoch_pattern = re.compile(r"Epoch\s*\[\s*(\d+)\s*/\s*(\d+)\s*\]")
+
+    def _emit_progress_line(self, line):
+        self.progress.emit(line)
+        print(line)
+        match = self._epoch_pattern.search(line)
+        if match:
+            current = int(match.group(1))
+            total = int(match.group(2)) if match.group(2) != '0' else 0
+            if total > 0:
+                percent = int(max(0, min(100, round(current * 100 / total))))
+                self.progress_percent.emit(percent)
+
+    def _run_training_script(self, script_path):
+        env = os.environ.copy()
+        env.setdefault('PYTHONUNBUFFERED', '1')
+        process = subprocess.Popen(
+            [sys.executable, script_path],
+            cwd=self.working_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+            env=env,
+        )
+        try:
+            if process.stdout is not None:
+                for raw_line in process.stdout:
+                    line = raw_line.rstrip()
+                    if line:
+                        self._emit_progress_line(line)
+            return_code = process.wait()
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, [sys.executable, script_path])
+
+    @pyqtSlot()
+    def run(self):
+        current_script = ''
+        try:
+            for description, script_path in self.scripts:
+                if not os.path.isabs(script_path):
+                    script_path = os.path.join(self.working_dir, script_path)
+                current_script = script_path
+                if not os.path.exists(script_path):
+                    raise FileNotFoundError(f'Script not found: {script_path}')
+                display_name = os.path.basename(script_path)
+                message = f'Running {description} ({display_name})...'
+                self.progress.emit(message)
+                print(message)
+                if display_name == 'train.py':
+                    self.progress_percent.emit(0)
+                    self._run_training_script(script_path)
+                    self.progress_percent.emit(100)
+                else:
+                    subprocess.run([sys.executable, script_path], cwd=self.working_dir, check=True)
+                done_message = f'Finished {description}.'
+                self.progress.emit(done_message)
+                print(done_message)
+        except subprocess.CalledProcessError as err:
+            script_name = os.path.basename(current_script) if current_script else 'script'
+            error_message = f'Error while running {script_name} (exit code {err.returncode}).'
+            self.error.emit(error_message)
+            print(error_message)
+        except Exception as exc:
+            error_message = f'Training pipeline failed: {exc}'
+            self.error.emit(error_message)
+            print(error_message)
+        else:
+            self.finished.emit()
+
 
 class VideoWindow(QWidget):
     def __init__(self, main_window):
@@ -1029,6 +1069,9 @@ class MainWindow(QMainWindow):
         self.setGeometry(100,100,1200,800)
         self.detector = AnomalyDetector()
         self.arduino_manager = ArduinoManager()
+        self.project_root = os.path.abspath(os.path.dirname(__file__))
+        self.training_thread = None
+        self.training_worker = None
         self.is_detection_running = False
         self.is_paused = False
         self.current_frame = None
@@ -1049,9 +1092,6 @@ class MainWindow(QMainWindow):
         self._current_sample_target = 'primary'
         self.hsv_target_locked = False
         self.center_marker_enabled = True
-        self.detection_zone_enabled = False
-        self.detection_zone_top = 0
-        self.detection_zone_bottom = 0
         self.video_window = VideoWindow(self)
         self.video_window.video_label.clicked.connect(self._handle_video_click)
         self.video_window.video_label.wheel.connect(self._handle_zoom)
@@ -1076,7 +1116,6 @@ class MainWindow(QMainWindow):
         self.detection_worker.set_beep_enabled(self.beep_check.isChecked())
         self._update_random_save_status(self.random_save_check.isChecked())
         self._push_arduino_config()
-        self._push_detection_zone_config()
 
     def _create_top_bar(self):
         top = QHBoxLayout()
@@ -1207,26 +1246,7 @@ class MainWindow(QMainWindow):
         tripwire_row.addWidget(self.tripwire_check)
         tripwire_row.addStretch()
         general_layout.addLayout(tripwire_row)
-
-        zone_row = QHBoxLayout()
-        self.detection_zone_check = QCheckBox('Detection Zone (Y range)')
-        self.detection_zone_check.toggled.connect(self._toggle_detection_zone)
-        zone_row.addWidget(self.detection_zone_check)
-        zone_row.addWidget(QLabel('Min:'))
-        self.detection_zone_min_control = DelayControl(minimum=0.0, maximum=4096.0, step=1.0, value=float(self.detection_zone_top), decimals=0)
-        self.detection_zone_min_control.setFieldWidth(72)
-        self.detection_zone_min_control.valueChanged.connect(lambda value: self._update_detection_zone_bounds(source='min', value=value))
-        zone_row.addWidget(self.detection_zone_min_control)
-        zone_row.addWidget(QLabel('Max:'))
-        self.detection_zone_max_control = DelayControl(minimum=0.0, maximum=4096.0, step=1.0, value=float(self.detection_zone_bottom), decimals=0)
-        self.detection_zone_max_control.setFieldWidth(72)
-        self.detection_zone_max_control.valueChanged.connect(lambda value: self._update_detection_zone_bounds(source='max', value=value))
-        zone_row.addWidget(self.detection_zone_max_control)
-        zone_row.addStretch()
-        general_layout.addLayout(zone_row)
-        self.detection_zone_top = int(round(self.detection_zone_min_control.value()))
-        self.detection_zone_bottom = int(round(self.detection_zone_max_control.value()))
-
+ 
         labels_row = QHBoxLayout()
         self.video_labels_check = QCheckBox('Show Video Labels')
         self.video_labels_check.setChecked(True)
@@ -1245,7 +1265,6 @@ class MainWindow(QMainWindow):
 
         general_group.setLayout(general_layout)
         left.addWidget(general_group)
-        self._update_detection_zone_controls()
 
         self.arduino_group = self._create_arduino_group()
         left.addWidget(self.arduino_group)
@@ -1376,6 +1395,8 @@ class MainWindow(QMainWindow):
         self.capture_btn = QPushButton('Capture Image'); self.capture_btn.clicked.connect(self._capture_image); self.capture_btn.setDisabled(True)
         self.clear_all_btn = QPushButton('Clear ALL output')
         self.clear_all_btn.clicked.connect(self._clear_output_folder)
+        self.train_btn = QPushButton('Train Model')
+        self.train_btn.clicked.connect(self._start_training_pipeline)
 
         buttons.addWidget(self.start_btn)
         buttons.addWidget(self.pause_btn)
@@ -1383,6 +1404,7 @@ class MainWindow(QMainWindow):
         buttons.addWidget(self.stop_btn)
         buttons.addWidget(self.test_image_btn)
         buttons.addWidget(self.capture_btn)
+        buttons.addWidget(self.train_btn)
         buttons.addWidget(self.clear_all_btn)
         buttons.addStretch()
 
@@ -1441,7 +1463,6 @@ class MainWindow(QMainWindow):
         enable_row.addWidget(QLabel('Trigger delay (s):'))
         self.arduino_trigger_delay_spin = DelayControl(minimum=0.0, maximum=30.0, step=0.1, value=0.0, decimals=1)
         self.arduino_trigger_delay_spin.valueChanged.connect(lambda _: self._arduino_config_changed())
-        self.arduino_trigger_delay_spin.setFieldWidth(72)
         enable_row.addWidget(self.arduino_trigger_delay_spin)
         enable_row.addStretch()
         layout.addLayout(enable_row)
@@ -1453,7 +1474,6 @@ class MainWindow(QMainWindow):
         clear_row.addWidget(QLabel('Delay (s):'))
         self.arduino_clear_delay_spin = DelayControl(minimum=0.0, maximum=30.0, step=0.1, value=1.0, decimals=1)
         self.arduino_clear_delay_spin.valueChanged.connect(lambda _: self._arduino_config_changed())
-        self.arduino_clear_delay_spin.setFieldWidth(72)
         clear_row.addWidget(self.arduino_clear_delay_spin)
         clear_row.addStretch()
         layout.addLayout(clear_row)
@@ -1631,10 +1651,64 @@ class MainWindow(QMainWindow):
             clear_spin.setEnabled(serial is not None)
 
     def _create_status_bar(self):
-        self.status_bar = QStatusBar(); self.setStatusBar(self.status_bar)
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
         self.status_bar.showMessage('Ready. Load a model or choose Color/Hybrid mode.')
         self.fourcc_status_label = QLabel('Active FourCC: -')
         self.status_bar.addPermanentWidget(self.fourcc_status_label, 0)
+
+    def _start_training_pipeline(self):
+        if self.is_detection_running:
+            QMessageBox.warning(self, 'Training Pipeline', 'Stop detection before starting training.')
+            return
+        if self.training_thread is not None and self.training_thread.isRunning():
+            QMessageBox.information(self, 'Training Pipeline', 'Training pipeline is already running.')
+            return
+        scripts = [
+            ('Data preprocessing', os.path.join('src', 'data_preprocessing.py')),
+            ('Model training', os.path.join('src', 'train.py')),
+        ]
+        missing = [
+            os.path.join(self.project_root, rel_path)
+            for _, rel_path in scripts
+            if not os.path.exists(os.path.join(self.project_root, rel_path))
+        ]
+        if missing:
+            QMessageBox.critical(self, 'Training Pipeline', f'Script not found: {missing[0]}')
+            return
+
+        self.train_btn.setDisabled(True)
+        self.status_bar.showMessage('Starting training pipeline...', 3000)
+        self.training_thread = QThread()
+        self.training_worker = TrainingWorker(scripts, self.project_root)
+        self.training_worker.moveToThread(self.training_thread)
+        self.training_thread.started.connect(self.training_worker.run)
+        self.training_worker.progress.connect(self._on_training_progress)
+        self.training_worker.error.connect(self._on_training_error)
+        self.training_worker.finished.connect(self._on_training_finished)
+        self.training_worker.finished.connect(self.training_thread.quit)
+        self.training_worker.error.connect(self.training_thread.quit)
+        self.training_worker.finished.connect(self.training_worker.deleteLater)
+        self.training_worker.error.connect(self.training_worker.deleteLater)
+        self.training_thread.finished.connect(self.training_thread.deleteLater)
+        self.training_thread.finished.connect(self._on_training_thread_finished)
+        self.training_thread.start()
+
+    def _on_training_progress(self, message):
+        self.status_bar.showMessage(message, 4000)
+
+    def _on_training_error(self, message):
+        self.status_bar.showMessage(message, 5000)
+        QMessageBox.critical(self, 'Training Pipeline', message)
+
+    def _on_training_finished(self):
+        self.status_bar.showMessage('Training pipeline completed.', 5000)
+        QMessageBox.information(self, 'Training Pipeline', 'Training pipeline completed successfully.')
+
+    def _on_training_thread_finished(self):
+        self.train_btn.setDisabled(False)
+        self.training_thread = None
+        self.training_worker = None
 
     def _browse_model(self):
         file_name, _ = QFileDialog.getOpenFileName(self, 'Open Model', '', 'PyTorch Model Files (*.pth)')
@@ -1712,49 +1786,6 @@ class MainWindow(QMainWindow):
             'Tripwire enabled.' if checked else 'Tripwire disabled.',
             2000
         )
-
-    def _toggle_detection_zone(self, checked):
-        self.detection_zone_enabled = bool(checked)
-        self._update_detection_zone_controls()
-        self._push_detection_zone_config()
-        message = 'Detection zone enabled.' if checked else 'Detection zone disabled.'
-        self.status_bar.showMessage(message, 2000)
-
-    def _update_detection_zone_bounds(self, source=None, value=None):
-        if not hasattr(self, 'detection_zone_min_control'):
-            return
-        min_val = int(round(self.detection_zone_min_control.value()))
-        max_val = int(round(self.detection_zone_max_control.value()))
-        if min_val > max_val:
-            if source == 'min':
-                self.detection_zone_max_control.blockSignals(True)
-                self.detection_zone_max_control.setValue(min_val)
-                self.detection_zone_max_control.blockSignals(False)
-                max_val = min_val
-            else:
-                self.detection_zone_min_control.blockSignals(True)
-                self.detection_zone_min_control.setValue(max_val)
-                self.detection_zone_min_control.blockSignals(False)
-                min_val = max_val
-        self.detection_zone_top = min_val
-        self.detection_zone_bottom = max_val
-        self._push_detection_zone_config()
-
-    def _update_detection_zone_controls(self):
-        if hasattr(self, 'detection_zone_min_control'):
-            self.detection_zone_min_control.setEnabled(True)
-        if hasattr(self, 'detection_zone_max_control'):
-            self.detection_zone_max_control.setEnabled(True)
-
-    def _push_detection_zone_config(self):
-        if not hasattr(self, 'detection_worker'):
-            return
-        if hasattr(self, 'detection_zone_check'):
-            self.detection_zone_enabled = self.detection_zone_check.isChecked()
-        self.detection_worker.set_detection_zone_enabled(self.detection_zone_enabled)
-        self.detection_worker.set_detection_zone_bounds(self.detection_zone_top, self.detection_zone_bottom)
-        if not self.is_detection_running and self.last_tested_image is not None:
-            self._reprocess_image()
 
     def _toggle_center_marker(self, checked):
         self.center_marker_enabled = checked
@@ -2376,9 +2407,7 @@ class MainWindow(QMainWindow):
     def _apply_visual_guides(self, frame):
         if frame is None or frame.size == 0:
             return
-        center_marker = getattr(self, 'center_marker_enabled', True)
-        zone_enabled = getattr(self, 'detection_zone_enabled', False)
-        if not center_marker and not zone_enabled:
+        if not self.center_marker_enabled:
             return
         h, w = frame.shape[:2]
         if h == 0 or w == 0:
@@ -2387,24 +2416,12 @@ class MainWindow(QMainWindow):
         guide_color = (0, 165, 255)
         marker_color = (0, 255, 255)
 
-        if center_marker:
+        if self.center_marker_enabled:
             cx, cy = w // 2, h // 2
             arm = max(thickness * 8, int(min(w, h) * 0.06))
             cv2.line(frame, (cx - arm, cy), (cx + arm, cy), marker_color, thickness)
             cv2.line(frame, (cx, cy - arm), (cx, cy + arm), marker_color, thickness)
             cv2.circle(frame, (cx, cy), max(2, thickness * 2), marker_color, -1)
-
-        if zone_enabled:
-            zone_color = (255, 140, 0)
-            top = int(min(self.detection_zone_top, self.detection_zone_bottom))
-            bottom = int(max(self.detection_zone_top, self.detection_zone_bottom))
-            top = max(0, min(top, h - 1))
-            bottom = max(0, min(bottom, h - 1))
-            line_thickness = max(1, thickness)
-            cv2.line(frame, (0, top), (w - 1, top), zone_color, line_thickness)
-            cv2.line(frame, (0, bottom), (w - 1, bottom), zone_color, line_thickness)
-            if bottom > top:
-                cv2.rectangle(frame, (0, top), (w - 1, bottom), zone_color, max(1, line_thickness // 2))
 
     def _reprocess_image(self):
         if self.last_tested_image is None or self.is_detection_running: return
@@ -2552,12 +2569,6 @@ class MainWindow(QMainWindow):
             s.setValue('arduino_baud', self.arduino_baud_combo.currentText())
         if hasattr(self, 'tripwire_check'):
             s.setValue('tripwire_enabled', self.tripwire_check.isChecked())
-        if hasattr(self, 'detection_zone_check'):
-            s.setValue('detection_zone_enabled', self.detection_zone_check.isChecked())
-            min_val = int(round(self.detection_zone_min_control.value())) if hasattr(self, 'detection_zone_min_control') else 0
-            max_val = int(round(self.detection_zone_max_control.value())) if hasattr(self, 'detection_zone_max_control') else 0
-            s.setValue('detection_zone_min', min_val)
-            s.setValue('detection_zone_max', max_val)
 
     def _load_settings(self):
         s = QSettings('config.ini', QSettings.Format.IniFormat)
@@ -2684,31 +2695,6 @@ class MainWindow(QMainWindow):
             tripwire_enabled = s.value('tripwire_enabled', False, type=bool)
             self.tripwire_check.setChecked(tripwire_enabled)
             self.detection_worker.set_tripwire_enabled(tripwire_enabled)
-
-        if hasattr(self, 'detection_zone_check'):
-            zone_enabled = s.value('detection_zone_enabled', False, type=bool)
-            current_min = int(round(self.detection_zone_min_control.value())) if hasattr(self, 'detection_zone_min_control') else self.detection_zone_top
-            current_max = int(round(self.detection_zone_max_control.value())) if hasattr(self, 'detection_zone_max_control') else self.detection_zone_bottom
-            zone_min = s.value('detection_zone_min', current_min, type=int)
-            zone_max = s.value('detection_zone_max', current_max, type=int)
-            if zone_min > zone_max:
-                zone_max = zone_min
-            self.detection_zone_check.blockSignals(True)
-            self.detection_zone_check.setChecked(zone_enabled)
-            self.detection_zone_check.blockSignals(False)
-            if hasattr(self, 'detection_zone_min_control'):
-                self.detection_zone_min_control.blockSignals(True)
-                self.detection_zone_min_control.setValue(zone_min)
-                self.detection_zone_min_control.blockSignals(False)
-            if hasattr(self, 'detection_zone_max_control'):
-                self.detection_zone_max_control.blockSignals(True)
-                self.detection_zone_max_control.setValue(zone_max)
-                self.detection_zone_max_control.blockSignals(False)
-            self.detection_zone_enabled = zone_enabled
-            self.detection_zone_top = zone_min
-            self.detection_zone_bottom = zone_max
-            self._update_detection_zone_controls()
-            self._push_detection_zone_config()
 
         self._push_arduino_config()
 
