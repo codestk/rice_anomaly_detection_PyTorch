@@ -8,6 +8,7 @@ import re
 from datetime import datetime
 import numpy as np
 import torch
+import torch.nn.functional as F_torch
 from torchvision.transforms import functional as F
 import winsound # Import for beep sound
 import threading
@@ -235,6 +236,7 @@ class AnomalyDetector:
     def __init__(self):
         self.model = None
         self.device = "cpu"
+        self._torch_device = torch.device("cpu")
         self.cv_threshold = 40
         self.contour_area_threshold = 10
         self.mse_threshold = 0.01
@@ -290,8 +292,9 @@ class AnomalyDetector:
     def load_model(self, model_path):
         if model_path and model_path.endswith('.pth'):
             self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+            self._torch_device = torch.device(self.device)
             try:
-                device = torch.device(self.device)
+                device = self._torch_device
                 try:
                     self.model = torch.load(model_path, map_location=device, weights_only=True)
                 except TypeError:
@@ -346,33 +349,82 @@ class AnomalyDetector:
         upper2 = np.array([min(self.h3_high+5,179), 255, 255], dtype=np.uint8)
         return cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
 
+    def _tensor_to_bgr(self, tensor):
+        tensor = tensor.detach()
+        if tensor.dim() == 3:
+            tensor = tensor.unsqueeze(0)
+        tensor = tensor.squeeze(0).clamp(0.0, 1.0).cpu()
+        array = tensor.mul(255.0).clamp(0.0, 255.0).to(torch.uint8).permute(1, 2, 0).numpy()
+        return cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+
+    def _prepare_model_output_tensor(self, output):
+        tensor = None
+        if isinstance(output, torch.Tensor):
+            tensor = output
+        elif isinstance(output, (list, tuple)) and len(output) > 0:
+            tensor = output[0]
+        elif isinstance(output, dict) and len(output) > 0:
+            for key in ('output', 'out', 'reconstruction', 'recon', 'x_hat', 'result'):
+                if key in output:
+                    tensor = output[key]
+                    break
+            if tensor is None:
+                tensor = next(iter(output.values()))
+        else:
+            tensor = torch.as_tensor(output)
+        if tensor.dim() == 3:
+            tensor = tensor.unsqueeze(0)
+        return tensor.to(self._torch_device).float()
+
+    def _gpu_mask_from_tensors(self, original_tensor, recon_tensor):
+        orig_gray = F.rgb_to_grayscale(original_tensor)
+        recon_gray = F.rgb_to_grayscale(recon_tensor)
+        diff_scaled = torch.abs(orig_gray - recon_gray) * 255.0
+        mask = (diff_scaled >= float(self.cv_threshold)).float()
+        diff_uint8 = diff_scaled.clamp(0.0, 255.0).to(torch.uint8)
+        diff_sq = torch.mul(diff_uint8, diff_uint8)
+        mse = float(diff_sq.float().mean().item())
+        kernel = 11
+        pad = kernel // 2
+        dilated = F_torch.max_pool2d(mask, kernel_size=kernel, stride=1, padding=pad)
+        eroded = -F_torch.max_pool2d(-dilated, kernel_size=kernel, stride=1, padding=pad)
+        mask_uint8 = eroded.squeeze(0).squeeze(0).clamp(0.0, 1.0).mul(255.0).to(torch.uint8).cpu().numpy()
+        return mask_uint8, mse
+
     def _mask_recon_or_dummy(self, frame, is_first_frame=False):
+        use_gpu_post = self._torch_device.type == 'cuda' and torch.cuda.is_available()
+        reconstructed = None
         try:
             if self.model is not None and self.model != "loaded" and callable(self.model):
                 with torch.no_grad():
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    inp = F.to_tensor(rgb).unsqueeze(0).to(torch.device(self.device))
-                    if hasattr(self.model, 'eval'): self.model.eval()
+                    inp = F.to_tensor(rgb).unsqueeze(0).to(self._torch_device, non_blocking=use_gpu_post)
+                    if hasattr(self.model, 'eval'):
+                        self.model.eval()
 
-                    if self.first_inference: # <--- LOGGING
-                         print(f"[LOG {time.time():.2f}]   - Performing FIRST model inference (model warm-up)...")
-                         start_infer_time = time.time()
+                    if self.first_inference:  # <--- LOGGING
+                        print(f"[LOG {time.time():.2f}]   - Performing FIRST model inference (model warm-up)...")
+                        start_infer_time = time.time()
 
                     rec = self.model(inp)
+                    rec_tensor = self._prepare_model_output_tensor(rec).clamp(0.0, 1.0)
 
-                    if self.first_inference: # <--- LOGGING
+                    if self.first_inference:  # <--- LOGGING
                         end_infer_time = time.time()
                         print(f"[LOG {end_infer_time:.2f}]   - FIRST model inference took {end_infer_time - start_infer_time:.4f} seconds.")
                         self.first_inference = False
 
-                    rec = rec.squeeze(0).detach().cpu().numpy()
-                    rec = np.transpose(rec, (1,2,0))
-                    rec = np.clip(rec*255, 0, 255).astype(np.uint8)
-                    reconstructed = cv2.cvtColor(rec, cv2.COLOR_RGB2BGR)
+                    if use_gpu_post and inp.is_cuda:
+                        return self._gpu_mask_from_tensors(inp, rec_tensor)
+
+                    reconstructed = self._tensor_to_bgr(rec_tensor)
             else:
                 reconstructed = cv2.GaussianBlur(frame, (7,7), 0)
         except Exception as e:
             print(f"Inference error: {e} -> fallback to dummy")
+            reconstructed = cv2.GaussianBlur(frame, (7,7), 0)
+
+        if reconstructed is None:
             reconstructed = cv2.GaussianBlur(frame, (7,7), 0)
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -530,6 +582,9 @@ class DetectionWorker(QObject):
         self.anomaly_count = 0
         self.beep_enabled = False
         self.tripwire_enabled = False
+        self.stop_feeder_on_detect = False
+        self._stop_feed_beep_active = False
+        self._stop_feed_beep_thread = None
         self.recently_detected_centroids = []
         self.first_frame_processed = False # <--- LOGGING FLAG
         self.arduino_manager = None
@@ -556,6 +611,34 @@ class DetectionWorker(QObject):
         if not self.beep_enabled:
             return
         threading.Thread(target=self._beep_thread_target, daemon=True).start()
+
+    def _continuous_beep_loop(self):
+        while self._stop_feed_beep_active:
+            try:
+                winsound.Beep(1200, 600)
+            except Exception as e:
+                print(f"Error playing continuous beep: {e}")
+                break
+
+    def _start_stop_feed_beep(self):
+        if self._stop_feed_beep_active:
+            return
+        self._stop_feed_beep_active = True
+        thread = threading.Thread(target=self._continuous_beep_loop, daemon=True)
+        self._stop_feed_beep_thread = thread
+        thread.start()
+
+    def _stop_stop_feed_beep(self):
+        if not self._stop_feed_beep_active:
+            return
+        self._stop_feed_beep_active = False
+        thread = self._stop_feed_beep_thread
+        self._stop_feed_beep_thread = None
+        if thread is not None and thread.is_alive():
+            try:
+                thread.join(timeout=0.1)
+            except Exception:
+                pass
 
     def _format_arduino_command(self, command, angle):
         if not command:
@@ -709,6 +792,9 @@ class DetectionWorker(QObject):
             self.anomaly_count += 1
             self._play_beep_async()
             self._schedule_arduino_trigger()
+            if self.stop_feeder_on_detect:
+                self.send_arduino_feed_off()
+                self._start_stop_feed_beep()
         elif self.arduino_enabled and self.arduino_clear_enabled and not is_anomaly_present:
             if self._arduino_last_signal == "trigger" and self._arduino_last_trigger_time > 0:
                 if now_ts - self._arduino_last_trigger_time >= self.arduino_clear_delay:
@@ -810,6 +896,20 @@ class DetectionWorker(QObject):
     def send_arduino_clear_now(self):
         self._send_arduino_clear(require_enabled=False)
 
+    @pyqtSlot()
+    def send_arduino_feed_on(self):
+        if self._send_arduino_command("FEEDON", require_enabled=False):
+            self._stop_stop_feed_beep()
+
+    @pyqtSlot()
+    def send_arduino_feed_off(self):
+        self._send_arduino_command("FEEDOFF", require_enabled=False)
+    @pyqtSlot(bool)
+    def set_stop_feeder_on_detect(self, status):
+        self.stop_feeder_on_detect = bool(status)
+        if not self.stop_feeder_on_detect:
+            self._stop_stop_feed_beep()
+
     def reset_counter(self):
         self.anomaly_count = 0
         self.first_frame_processed = False
@@ -818,6 +918,7 @@ class DetectionWorker(QObject):
         self._cancel_arduino_trigger_timer()
         if self.arduino_enabled and self.arduino_clear_enabled:
             self._send_arduino_clear()
+        self._stop_stop_feed_beep()
 
 class ClickableLabel(QLabel):
     clicked = pyqtSignal(int, int)
@@ -1115,9 +1216,13 @@ class MainWindow(QMainWindow):
         self.detection_worker.arduino_state_changed.connect(self._handle_servo_state_changed)
         self.auto_save_check.toggled.connect(self.detection_worker.set_auto_save)
         self.tripwire_check.toggled.connect(self.detection_worker.set_tripwire_enabled)
+        if hasattr(self, 'stop_feed_on_detect_check'):
+            self.stop_feed_on_detect_check.toggled.connect(self.detection_worker.set_stop_feeder_on_detect)
         self.detection_thread.start()
         self.detection_worker.set_arduino_manager(self.arduino_manager)
         self.detection_worker.set_beep_enabled(self.beep_check.isChecked())
+        if hasattr(self, 'stop_feed_on_detect_check'):
+            self.detection_worker.set_stop_feeder_on_detect(self.stop_feed_on_detect_check.isChecked())
         self._update_random_save_status(self.random_save_check.isChecked())
         self._push_arduino_config()
         self._handle_servo_state_changed(self.detection_worker._arduino_last_signal)
@@ -1245,6 +1350,9 @@ class MainWindow(QMainWindow):
         auto_row.addWidget(self.auto_save_check)
         auto_row.addWidget(self.auto_save_status_label)
         auto_row.addStretch()
+        self.stop_feed_on_detect_check = QCheckBox('Stop feeder on detection')
+        self.stop_feed_on_detect_check.setToolTip('Automatically send FEEDOFF when a new anomaly is detected.')
+        auto_row.addWidget(self.stop_feed_on_detect_check)
         general_layout.addLayout(auto_row)
 
         beep_row = QHBoxLayout()
@@ -1542,6 +1650,16 @@ class MainWindow(QMainWindow):
         test_row.addStretch()
         layout.addLayout(test_row)
 
+        feed_row = QHBoxLayout()
+        self.arduino_feed_on_btn = QPushButton('Feeder ON')
+        self.arduino_feed_on_btn.clicked.connect(self._send_arduino_feed_on)
+        feed_row.addWidget(self.arduino_feed_on_btn)
+        self.arduino_feed_off_btn = QPushButton('Feeder OFF')
+        self.arduino_feed_off_btn.clicked.connect(self._send_arduino_feed_off)
+        feed_row.addWidget(self.arduino_feed_off_btn)
+        feed_row.addStretch()
+        layout.addLayout(feed_row)
+
         group.setLayout(layout)
 
         if serial is None:
@@ -1557,6 +1675,8 @@ class MainWindow(QMainWindow):
                 self.arduino_clear_edit,
                 self.arduino_trigger_test_btn,
                 self.arduino_clear_test_btn,
+                self.arduino_feed_on_btn,
+                self.arduino_feed_off_btn,
                 self.arduino_baud_combo,
             ):
                 widget.setEnabled(False)
@@ -1600,6 +1720,10 @@ class MainWindow(QMainWindow):
             self.arduino_connect_btn.setText('Disconnect')
             self.arduino_trigger_test_btn.setEnabled(True)
             self.arduino_clear_test_btn.setEnabled(True)
+            if hasattr(self, 'arduino_feed_on_btn'):
+                self.arduino_feed_on_btn.setEnabled(True)
+            if hasattr(self, 'arduino_feed_off_btn'):
+                self.arduino_feed_off_btn.setEnabled(True)
             if hasattr(self, 'detection_worker') and hasattr(self.detection_worker, '_arduino_last_signal'):
                 self._handle_servo_state_changed(self.detection_worker._arduino_last_signal)
         else:
@@ -1609,6 +1733,10 @@ class MainWindow(QMainWindow):
             self.arduino_connect_btn.setText('Connect')
             self.arduino_trigger_test_btn.setEnabled(False)
             self.arduino_clear_test_btn.setEnabled(False)
+            if hasattr(self, 'arduino_feed_on_btn'):
+                self.arduino_feed_on_btn.setEnabled(False)
+            if hasattr(self, 'arduino_feed_off_btn'):
+                self.arduino_feed_off_btn.setEnabled(False)
             self._apply_servo_state_to_indicator('unknown')
         self._update_arduino_delay_spin_states()
 
@@ -1684,6 +1812,24 @@ class MainWindow(QMainWindow):
             return
         self.detection_worker.send_arduino_clear_now()
         self.status_bar.showMessage('Clear command sent to Arduino.', 2000)
+
+    def _send_arduino_feed_on(self):
+        if serial is None:
+            return
+        if not self.arduino_manager.is_connected():
+            self.status_bar.showMessage('Arduino not connected.', 2000)
+            return
+        self.detection_worker.send_arduino_feed_on()
+        self.status_bar.showMessage('Feeder ON command sent to Arduino.', 2000)
+
+    def _send_arduino_feed_off(self):
+        if serial is None:
+            return
+        if not self.arduino_manager.is_connected():
+            self.status_bar.showMessage('Arduino not connected.', 2000)
+            return
+        self.detection_worker.send_arduino_feed_off()
+        self.status_bar.showMessage('Feeder OFF command sent to Arduino.', 2000)
 
     def _update_arduino_delay_spin_states(self):
         trigger_spin = getattr(self, 'arduino_trigger_delay_spin', None)
@@ -2610,6 +2756,8 @@ class MainWindow(QMainWindow):
             port_value = port_data if port_data else self.arduino_port_combo.currentText()
             s.setValue('arduino_port', port_value)
             s.setValue('arduino_baud', self.arduino_baud_combo.currentText())
+            if hasattr(self, 'stop_feed_on_detect_check'):
+                s.setValue('stop_feed_on_detect', self.stop_feed_on_detect_check.isChecked())
         if hasattr(self, 'tripwire_check'):
             s.setValue('tripwire_enabled', self.tripwire_check.isChecked())
 
@@ -2679,6 +2827,12 @@ class MainWindow(QMainWindow):
             self.arduino_clear_delay_spin.blockSignals(True)
             self.arduino_clear_delay_spin.setValue(delay_value)
             self.arduino_clear_delay_spin.blockSignals(False)
+            if hasattr(self, 'stop_feed_on_detect_check'):
+                stop_feed = s.value('stop_feed_on_detect', False, type=bool)
+                self.stop_feed_on_detect_check.blockSignals(True)
+                self.stop_feed_on_detect_check.setChecked(stop_feed)
+                self.stop_feed_on_detect_check.blockSignals(False)
+                self.detection_worker.set_stop_feeder_on_detect(stop_feed)
             self._update_arduino_ui_state()
             self._update_arduino_delay_spin_states()
         mode_idx = s.value('mode_index',0,type=int); self.mode_combo.setCurrentIndex(mode_idx)

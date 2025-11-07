@@ -1,0 +1,25 @@
+#define FEEDER_PIN 7 // ใช้ขา 7 ในการควบคุม Feeder
+
+void setup() {
+  pinMode(FEEDER_PIN, OUTPUT);
+  Serial.begin(9600);
+  Serial.println("Arduino Ready.");
+
+  // สั่งให้ Feeder "หยุด" ทำงานไว้ก่อนเป็นค่าเริ่มต้น
+  digitalWrite(FEEDER_PIN, HIGH); // HIGH = STOP (ตามคู่มือ)
+  Serial.println("Feeder is STOPPED (HIGH)");
+}
+
+void loop() {
+  // --- ทดสอบ: ให้ Feeder ทำงาน 5 วินาที แล้วหยุด 5 วินาที ---
+
+  // สั่งให้ Feeder "ทำงาน"
+  digitalWrite(FEEDER_PIN, LOW); // LOW = RUN (ตามคู่มือ)
+  Serial.println("Feeder is RUNNING (LOW)");
+  delay(5000); // รอ 5 วินาที
+
+  // สั่งให้ Feeder "หยุด"
+  digitalWrite(FEEDER_PIN, HIGH); // HIGH = STOP (ตามคู่มือ)
+  Serial.println("Feeder is STOPPED (HIGH)");
+  delay(5000); // รอ 5 วินาที
+}
