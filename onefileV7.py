@@ -15,6 +15,11 @@ import threading
 import subprocess
 
 try:
+    from ultralytics import YOLO as UltralyticsYOLO
+except ImportError:
+    UltralyticsYOLO = None
+
+try:
     import serial
     from serial.tools import list_ports
 except ImportError:
@@ -25,7 +30,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QLineEdit, QSlider, QCheckBox,
     QStatusBar, QComboBox, QSizePolicy, QMessageBox, QGroupBox, QDoubleSpinBox,
-    QAbstractSpinBox
+    QAbstractSpinBox, QDialog
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QObject, pyqtSlot, QPoint
 from PyQt6.QtGui import QImage, QPixmap, QColor
@@ -251,6 +256,11 @@ class AnomalyDetector:
         self.primary_hue_enabled = True
         self.secondary_hue_enabled = True
         self.tertiary_hue_enabled = True
+        self.yolo_model = None
+        self.yolo_model_path = ''
+        self.yolo_enabled = False
+        self.yolo_confidence = 0.35
+        self._yolo_names = {}
 
     def set_mode(self, mode: str):
         self.mode = mode
@@ -282,12 +292,37 @@ class AnomalyDetector:
         self.contour_area_threshold = int(value)
     def set_threshold(self, value):
         self.mse_threshold = float(value)
+    def set_yolo_confidence(self, value):
+        try:
+            conf = float(value)
+        except (TypeError, ValueError):
+            return
+        self.yolo_confidence = max(0.01, min(0.99, conf))
     def set_primary_hue_enabled(self, enabled: bool):
         self.primary_hue_enabled = bool(enabled)
     def set_secondary_hue_enabled(self, enabled: bool):
         self.secondary_hue_enabled = bool(enabled)
     def set_tertiary_hue_enabled(self, enabled: bool):
         self.tertiary_hue_enabled = bool(enabled)
+    def set_yolo_enabled(self, enabled: bool):
+        self.yolo_enabled = bool(enabled and self.yolo_model is not None)
+    def load_yolo_model(self, model_path: str):
+        self.yolo_model = None
+        self.yolo_model_path = model_path or ''
+        if not model_path:
+            self.yolo_enabled = False
+            return False, 'No YOLO model selected.'
+        if UltralyticsYOLO is None:
+            self.yolo_enabled = False
+            return False, 'Ultralytics YOLO package is not installed.'
+        try:
+            self.yolo_model = UltralyticsYOLO(model_path)
+            self._yolo_names = getattr(self.yolo_model, 'names', {}) or {}
+            return True, f'YOLO model loaded from {os.path.basename(model_path)}.'
+        except Exception as err:
+            self.yolo_model = None
+            self.yolo_enabled = False
+            return False, f'Failed to load YOLO model: {err}'
 
     def load_model(self, model_path):
         if model_path and model_path.endswith('.pth'):
@@ -318,6 +353,84 @@ class AnomalyDetector:
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         return [c for c in contours if cv2.contourArea(c) > self.contour_area_threshold]
+
+    def _bbox_to_contour(self, bbox):
+        x1, y1, x2, y2 = bbox
+        return np.array(
+            [[[x1, y1]],
+             [[x2, y1]],
+             [[x2, y2]],
+             [[x1, y2]]],
+            dtype=np.int32
+        )
+
+    def _run_yolo_detection(self, frame):
+        if not (self.yolo_enabled and self.yolo_model is not None):
+            return []
+        try:
+            results = self.yolo_model(frame, conf=self.yolo_confidence, verbose=False)
+        except Exception as err:
+            print(f"[WARN] YOLO inference failed: {err}")
+            return []
+        if not results:
+            return []
+        result = results[0]
+        boxes = getattr(result, 'boxes', None)
+        if boxes is None:
+            return []
+        xyxy = getattr(boxes, 'xyxy', None)
+        confs = getattr(boxes, 'conf', None)
+        classes = getattr(boxes, 'cls', None)
+        if xyxy is None or confs is None or classes is None:
+            return []
+        xyxy = xyxy.detach().cpu().numpy()
+        confs = confs.detach().cpu().numpy()
+        classes = classes.detach().cpu().numpy().astype(int)
+        frame_h, frame_w = frame.shape[:2]
+        detections = []
+        for idx, box in enumerate(xyxy):
+            conf = float(confs[idx])
+            if conf < self.yolo_confidence:
+                continue
+            cls_id = int(classes[idx])
+            label = self._yolo_names.get(cls_id, f"class {cls_id}")
+            x1 = int(max(0, min(box[0], frame_w - 1)))
+            y1 = int(max(0, min(box[1], frame_h - 1)))
+            x2 = int(max(0, min(box[2], frame_w - 1)))
+            y2 = int(max(0, min(box[3], frame_h - 1)))
+            detections.append({'bbox': (x1, y1, x2, y2), 'label': label, 'conf': conf})
+        return detections
+
+    def _apply_yolo_results(self, original_frame, annotated_frame, mse, is_anom, contours):
+        yolo_detections = self._run_yolo_detection(original_frame)
+        if not yolo_detections:
+            return annotated_frame, mse, is_anom, contours
+        combined_contours = list(contours) if contours else []
+        for det in yolo_detections:
+            x1, y1, x2, y2 = det['bbox']
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (255, 165, 0), 2)
+            text = f"{det['label']} {det['conf']:.2f}"
+            text_y = y1 - 8 if y1 - 8 > 12 else y1 + 18
+            cv2.putText(
+                annotated_frame,
+                text,
+                (x1, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 200, 0),
+                2
+            )
+            combined_contours.append(self._bbox_to_contour(det['bbox']))
+        cv2.putText(
+            annotated_frame,
+            'YOLO detections active',
+            (10, 90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (255, 200, 0),
+            2
+        )
+        return annotated_frame, mse, (is_anom or bool(yolo_detections)), combined_contours
 
     def _mask_color(self, frame):
         if not self.primary_hue_enabled:
@@ -459,7 +572,7 @@ class AnomalyDetector:
                 cv2.putText(out, 'Color Anomaly (Hue1/Hue2/Hue3)', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,255,0), 3)
             mask_means = [mask_primary.mean(), mask_secondary.mean(), mask_tertiary.mean()]
             mse = float(sum(mask_means)/(len(mask_means)*255.0))
-            return out, mse, is_anom, all_contours
+            return self._apply_yolo_results(frame, out, mse, is_anom, all_contours)
 
         if self.mode == 'recon':
             mask, mse = self._mask_recon_or_dummy(frame, is_first_frame)
@@ -471,7 +584,7 @@ class AnomalyDetector:
             is_anom = len(contours) > 0
             if is_anom:
                 cv2.putText(out, 'Anomaly (Recon)', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
-            return out, mse, is_anom, contours
+            return self._apply_yolo_results(frame, out, mse, is_anom, contours)
 
         # HYBRID OR
         mask_recon, mse = self._mask_recon_or_dummy(frame, is_first_frame)
@@ -501,7 +614,7 @@ class AnomalyDetector:
             cv2.putText(out, 'HYBRID: Color OR Recon', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255,255,255), 3)
         mask_mean_component = (mask_color_primary.mean() + mask_color_secondary.mean() + mask_color_tertiary.mean())/(3*255.0)
         mse_hybrid = 0.5*mse + 0.5*mask_mean_component
-        return out, float(mse_hybrid), is_anom, all_contours
+        return self._apply_yolo_results(frame, out, float(mse_hybrid), is_anom, all_contours)
 
 class VideoThread(QThread):
     change_pixmap_signal = pyqtSignal(np.ndarray)
@@ -569,6 +682,7 @@ class DetectionWorker(QObject):
     result_ready = pyqtSignal(np.ndarray, np.ndarray, float, bool, int)
     status_update = pyqtSignal(str)
     arduino_state_changed = pyqtSignal(str)
+    detection_saved = pyqtSignal(str)
     def __init__(self, detector):
         super().__init__()
         self.detector = detector
@@ -600,6 +714,7 @@ class DetectionWorker(QObject):
         self._arduino_last_trigger_time = 0.0
         self._last_anomaly_seen_time = 0.0
         self._arduino_trigger_timer = None
+        self.last_saved_detection_path = ""
 
     def _beep_thread_target(self):
         try:
@@ -639,6 +754,10 @@ class DetectionWorker(QObject):
                 thread.join(timeout=0.1)
             except Exception:
                 pass
+
+    def stop_all_beeps(self):
+        """Public helper so UI can force-stop any continuous beep."""
+        self._stop_stop_feed_beep()
 
     def _format_arduino_command(self, command, angle):
         if not command:
@@ -808,12 +927,23 @@ class DetectionWorker(QObject):
             ori_dir = os.path.join('output','original')
             os.makedirs(det_dir, exist_ok=True)
             os.makedirs(ori_dir, exist_ok=True)
-            cv2.imwrite(os.path.join(det_dir,fname), processed_frame)
-            cv2.imwrite(os.path.join(ori_dir,fname), original_frame)
+            det_path = os.path.join(det_dir, fname)
+            ori_path = os.path.join(ori_dir, fname)
+            cv2.imwrite(det_path, processed_frame)
+            cv2.imwrite(ori_path, original_frame)
+            abs_det_path = os.path.abspath(det_path)
+            self.last_saved_detection_path = abs_det_path
             self.status_update.emit(f"Anomaly saved as {fname}")
             self.last_save_time = now_ts
+            if self.stop_feeder_on_detect:
+                self.detection_saved.emit(abs_det_path)
 
-        if self.random_save_enabled and (now_ts - self.last_random_save_time) >= self.random_save_min_interval:
+        can_random_save = (
+            self.random_save_enabled
+            and not is_anomaly_present  # only keep clean frames for training
+            and (now_ts - self.last_random_save_time) >= self.random_save_min_interval
+        )
+        if can_random_save:
             if random.random() < self.random_save_probability:
                 ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
                 rand_suffix = random.randint(0, 9999)
@@ -1188,6 +1318,9 @@ class MainWindow(QMainWindow):
         self.show_video_labels = True
         self.zoom_level = 1.0
         self.pan_offset = QPoint(0, 0)
+        self._detection_popup = None
+        self._detection_popup_image_label = None
+        self._detection_popup_path_label = None
         self._sample_state = {
             'primary': {'pending': None, 'timestamp': 0.0, 'first': None, 'second': None, 'combined': None},
             'secondary': {'pending': None, 'timestamp': 0.0, 'first': None, 'second': None, 'combined': None},
@@ -1214,6 +1347,7 @@ class MainWindow(QMainWindow):
         self.detection_worker.result_ready.connect(self.display_processed_frame)
         self.detection_worker.status_update.connect(lambda msg: self.status_bar.showMessage(msg, 3000))
         self.detection_worker.arduino_state_changed.connect(self._handle_servo_state_changed)
+        self.detection_worker.detection_saved.connect(self._handle_stop_feed_detection_popup)
         self.auto_save_check.toggled.connect(self.detection_worker.set_auto_save)
         self.tripwire_check.toggled.connect(self.detection_worker.set_tripwire_enabled)
         if hasattr(self, 'stop_feed_on_detect_check'):
@@ -1250,6 +1384,59 @@ class MainWindow(QMainWindow):
             f"background-color: {color}; border-radius: 9px; border: 1px solid #111;"
         )
         label.setText(text)
+
+    def _ensure_detection_popup(self):
+        if self._detection_popup is not None:
+            return self._detection_popup
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Last Detection Snapshot')
+        dialog.setModal(False)
+        dialog.resize(720, 520)
+        layout = QVBoxLayout(dialog)
+        img_label = QLabel('ยังไม่มีภาพที่บันทึก')
+        img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        img_label.setStyleSheet('background-color:#111; border:1px solid #555; padding:4px;')
+        layout.addWidget(img_label)
+        path_label = QLabel('')
+        path_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        path_label.setWordWrap(True)
+        path_label.setStyleSheet('color:#cccccc; font-size:9pt;')
+        layout.addWidget(path_label)
+        close_btn = QPushButton('Close')
+        close_btn.clicked.connect(dialog.close)
+        layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+        self._detection_popup = dialog
+        self._detection_popup_image_label = img_label
+        self._detection_popup_path_label = path_label
+        return dialog
+
+    @pyqtSlot(str)
+    def _handle_stop_feed_detection_popup(self, image_path):
+        if not image_path:
+            return
+        abs_path = os.path.abspath(image_path)
+        if not os.path.exists(abs_path):
+            QMessageBox.warning(self, 'Last Detection', 'ไม่พบไฟล์ภาพล่าสุดที่บันทึกไว้')
+            return
+        dialog = self._ensure_detection_popup()
+        pixmap = QPixmap(abs_path)
+        if pixmap.isNull():
+            self._detection_popup_image_label.setText('ไม่สามารถเปิดไฟล์ภาพได้')
+            self._detection_popup_image_label.setPixmap(QPixmap())
+        else:
+            max_w, max_h = 900, 600
+            scaled = pixmap.scaled(
+                max_w,
+                max_h,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self._detection_popup_image_label.setPixmap(scaled)
+            self._detection_popup_image_label.setText('')
+        self._detection_popup_path_label.setText(abs_path)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def _create_top_bar(self):
         top = QHBoxLayout()
@@ -1306,6 +1493,36 @@ class MainWindow(QMainWindow):
         thresholds_layout.setSpacing(8)
         thresholds_layout.setContentsMargins(10, 10, 10, 10)
         thresholds_layout.addLayout(top_bar_layout)
+
+        yolo_row = QHBoxLayout()
+        yolo_row.addWidget(QLabel('YOLO Model:'))
+        self.yolo_model_path_edit = QLineEdit()
+        self.yolo_model_path_edit.setReadOnly(True)
+        self.yolo_model_path_edit.setPlaceholderText('Select YOLO model (.pt/.onnx)')
+        yolo_row.addWidget(self.yolo_model_path_edit)
+        self.yolo_browse_btn = QPushButton('Browse YOLO...')
+        self.yolo_browse_btn.clicked.connect(self._browse_yolo_model)
+        yolo_row.addWidget(self.yolo_browse_btn)
+        self.yolo_enable_check = QCheckBox('Enable YOLO detection')
+        self.yolo_enable_check.setEnabled(False)
+        self.yolo_enable_check.toggled.connect(self._toggle_yolo_detection)
+        yolo_row.addWidget(self.yolo_enable_check)
+        self.yolo_status_label = QLabel('Not loaded')
+        self.yolo_status_label.setStyleSheet('color: #d35400; font-weight: bold;')
+        yolo_row.addWidget(self.yolo_status_label)
+        yolo_row.addStretch()
+        thresholds_layout.addLayout(yolo_row)
+        yolo_conf_row = QHBoxLayout()
+        yolo_conf_row.addWidget(QLabel('YOLO Confidence:'))
+        self.yolo_conf_slider = QSlider(Qt.Orientation.Horizontal)
+        self.yolo_conf_slider.setRange(5, 99)
+        default_yolo_conf = int(max(1, min(99, round(self.detector.yolo_confidence * 100))))
+        self.yolo_conf_slider.setValue(default_yolo_conf)
+        self.yolo_conf_slider.valueChanged.connect(self._update_yolo_confidence)
+        self.yolo_conf_label = QLabel(f"{self.yolo_conf_slider.value()/100:.2f}")
+        yolo_conf_row.addWidget(self.yolo_conf_slider)
+        yolo_conf_row.addWidget(self.yolo_conf_label)
+        thresholds_layout.addLayout(yolo_conf_row)
         thresholds_layout.addLayout(thr)
         thresholds_layout.addLayout(cvthr)
         thresholds_layout.addLayout(cont)
@@ -1910,6 +2127,65 @@ class MainWindow(QMainWindow):
             if self.mode_combo.currentIndex() == 0:
                 self.start_btn.setDisabled(True); self.test_image_btn.setDisabled(True)
 
+    def _browse_yolo_model(self):
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            'Open YOLO Model',
+            '',
+            'YOLO Model Files (*.pt *.onnx);;All Files (*.*)'
+        )
+        if file_name:
+            self._load_yolo_model_action(file_name)
+
+    def _load_yolo_model_action(self, file_name, notify=True):
+        success, message = self.detector.load_yolo_model(file_name)
+        if success:
+            self.yolo_model_path_edit.setText(file_name)
+            self.yolo_status_label.setText('Loaded')
+            self.yolo_status_label.setStyleSheet('color: #27ae60; font-weight: bold;')
+            self.yolo_enable_check.setEnabled(True)
+            if notify:
+                self.status_bar.showMessage(message, 4000)
+        else:
+            self.yolo_model_path_edit.setText('')
+            self.yolo_status_label.setText('Load failed')
+            self.yolo_status_label.setStyleSheet('color: #e74c3c; font-weight: bold;')
+            self.yolo_enable_check.blockSignals(True)
+            self.yolo_enable_check.setChecked(False)
+            self.yolo_enable_check.blockSignals(False)
+            self.yolo_enable_check.setEnabled(False)
+            self.detector.set_yolo_enabled(False)
+            if notify:
+                self.status_bar.showMessage(message, 5000)
+        return success
+
+    def _toggle_yolo_detection(self, checked, notify=True):
+        if checked and self.detector.yolo_model is None:
+            if notify:
+                self.status_bar.showMessage('Load a YOLO model before enabling detection.', 4000)
+            self.yolo_enable_check.blockSignals(True)
+            self.yolo_enable_check.setChecked(False)
+            self.yolo_enable_check.blockSignals(False)
+            return
+        self.detector.set_yolo_enabled(checked)
+        if checked:
+            self.yolo_status_label.setText('Enabled')
+            self.yolo_status_label.setStyleSheet('color: #27ae60; font-weight: bold;')
+        else:
+            if self.detector.yolo_model is None:
+                self.yolo_status_label.setText('Not loaded')
+                self.yolo_status_label.setStyleSheet('color: #d35400; font-weight: bold;')
+            else:
+                self.yolo_status_label.setText('Loaded')
+                self.yolo_status_label.setStyleSheet('color: #27ae60; font-weight: bold;')
+        if not self.is_detection_running and self.last_tested_image is not None and notify:
+            self._reprocess_image()
+        if notify:
+            self.status_bar.showMessage(
+                'YOLO detection enabled.' if checked else 'YOLO detection disabled.',
+                3000
+            )
+
     def _list_cameras(self):
         self.cam_combo.clear()
         prefer_backend = getattr(self, 'backend_combo', None)
@@ -1930,6 +2206,11 @@ class MainWindow(QMainWindow):
         self.thresh_label.setText(f"{value/1000:.3f}"); self.detector.set_threshold(value/1000.0); self._reprocess_image()
     def _update_cv_threshold(self, value):
         self.cv_thresh_label.setText(str(value)); self.detector.set_cv_threshold(value); self._reprocess_image()
+    def _update_yolo_confidence(self, value):
+        conf = max(1, min(99, int(value))) / 100.0
+        self.yolo_conf_label.setText(f"{conf:.2f}")
+        self.detector.set_yolo_confidence(conf)
+        self._reprocess_image()
     def _update_contour_threshold(self, value):
         self.contour_label.setText(str(value)); self.detector.set_contour_threshold(value); self._reprocess_image()
     def _update_auto_save_status(self, checked):
@@ -2441,6 +2722,8 @@ class MainWindow(QMainWindow):
         if hasattr(self,'video_thread') and self.video_thread.isRunning(): self.video_thread.stop()
         self.is_detection_running = False
         self.is_paused = False
+        if hasattr(self, 'detection_worker'):
+            self.detection_worker.stop_all_beeps()
         if self.last_tested_image is None and (self.video_window.video_label.pixmap() is None or self.video_window.video_label.pixmap().isNull()):
             self.video_window.video_label.setText("Press 'Start Detection' or 'Test Image' to begin")
         if hasattr(self, 'fourcc_status_label'):
@@ -2700,6 +2983,7 @@ class MainWindow(QMainWindow):
         s.setValue('model_path', self.model_path_edit.text())
         s.setValue('mse_threshold', self.thresh_slider.value())
         s.setValue('cv_threshold', self.cv_thresh_slider.value())
+        s.setValue('yolo_confidence', self.yolo_conf_slider.value())
         s.setValue('contour_area', self.contour_slider.value())
         if hasattr(self, 'backend_combo'):
             s.setValue('backend_index', self.backend_combo.currentIndex())
@@ -2717,6 +3001,9 @@ class MainWindow(QMainWindow):
         s.setValue('auto_save', self.auto_save_check.isChecked())
         if hasattr(self, 'video_labels_check'):
             s.setValue('video_labels_enabled', self.video_labels_check.isChecked())
+        if hasattr(self, 'yolo_model_path_edit'):
+            s.setValue('yolo_model_path', self.yolo_model_path_edit.text())
+            s.setValue('yolo_enabled', self.yolo_enable_check.isChecked())
         s.setValue('mode_index', self.mode_combo.currentIndex())
         s.setValue('h_low', self.h_low_slider.value())
         s.setValue('h_high', self.h_high_slider.value())
@@ -2754,8 +3041,25 @@ class MainWindow(QMainWindow):
         s = QSettings('config.ini', QSettings.Format.IniFormat)
         model_path = s.value('model_path','')
         if model_path and os.path.exists(model_path): self._load_model_action(model_path)
+        if hasattr(self, 'yolo_model_path_edit'):
+            yolo_path = s.value('yolo_model_path', '')
+            if yolo_path and os.path.exists(yolo_path):
+                loaded = self._load_yolo_model_action(yolo_path, notify=False)
+                if loaded:
+                    self.yolo_enable_check.setEnabled(True)
+            else:
+                self.yolo_model_path_edit.setText('')
+                self.yolo_enable_check.setEnabled(False)
+            saved_yolo_enabled = s.value('yolo_enabled', False, type=bool)
+            self.yolo_enable_check.blockSignals(True)
+            self.yolo_enable_check.setChecked(saved_yolo_enabled and self.yolo_enable_check.isEnabled())
+            self.yolo_enable_check.blockSignals(False)
+            if self.yolo_enable_check.isEnabled():
+                self._toggle_yolo_detection(self.yolo_enable_check.isChecked(), notify=False)
         self.thresh_slider.setValue(s.value('mse_threshold',10,type=int))
         self.cv_thresh_slider.setValue(s.value('cv_threshold',40,type=int))
+        default_yolo_conf = int(max(1, min(99, round(self.detector.yolo_confidence * 100))))
+        self.yolo_conf_slider.setValue(s.value('yolo_confidence',default_yolo_conf,type=int))
         self.contour_slider.setValue(s.value('contour_area',10,type=int))
         if hasattr(self, 'backend_combo'):
             backend_idx = s.value('backend_index', 0, type=int)
