@@ -683,6 +683,7 @@ class DetectionWorker(QObject):
     status_update = pyqtSignal(str)
     arduino_state_changed = pyqtSignal(str)
     detection_saved = pyqtSignal(str)
+    service_breaker_triggered = pyqtSignal(str)
     def __init__(self, detector):
         super().__init__()
         self.detector = detector
@@ -699,6 +700,10 @@ class DetectionWorker(QObject):
         self.stop_feeder_on_detect = False
         self._stop_feed_beep_active = False
         self._stop_feed_beep_thread = None
+        self.service_breaker_enabled = False
+        self.service_breaker_limit = 16
+        self._consecutive_detection_events = 0
+        self._service_breaker_fired = False
         self.recently_detected_centroids = []
         self.first_frame_processed = False # <--- LOGGING FLAG
         self.arduino_manager = None
@@ -755,9 +760,36 @@ class DetectionWorker(QObject):
             except Exception:
                 pass
 
-    def stop_all_beeps(self):
-        """Public helper so UI can force-stop any continuous beep."""
-        self._stop_stop_feed_beep()
+    def _play_service_breaker_alarm(self):
+        def _alarm():
+            try:
+                winsound.Beep(1500, 2000)
+            except Exception as e:
+                print(f"Error playing service breaker alarm: {e}")
+        threading.Thread(target=_alarm, daemon=True).start()
+
+    def _reset_service_breaker_state(self):
+        self._consecutive_detection_events = 0
+        self._service_breaker_fired = False
+
+    def _save_detection_snapshot(self, processed_frame, original_frame, now_ts, idx=None, notify=True):
+        idx = idx if idx is not None else self.anomaly_count
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+        fname = f"anomaly_{idx:05d}_{ts}.png"
+        det_dir = os.path.join('output', 'detections')
+        ori_dir = os.path.join('output', 'original')
+        os.makedirs(det_dir, exist_ok=True)
+        os.makedirs(ori_dir, exist_ok=True)
+        det_path = os.path.join(det_dir, fname)
+        ori_path = os.path.join(ori_dir, fname)
+        cv2.imwrite(det_path, processed_frame)
+        cv2.imwrite(ori_path, original_frame)
+        abs_det_path = os.path.abspath(det_path)
+        self.last_saved_detection_path = abs_det_path
+        self.last_save_time = now_ts
+        if notify:
+            self.status_update.emit(f"Anomaly saved as {fname}")
+        return abs_det_path
 
     def _format_arduino_command(self, command, angle):
         if not command:
@@ -847,6 +879,9 @@ class DetectionWorker(QObject):
     def process_frame(self, cv_img):
         if self.is_busy: return
         self.is_busy = True
+        if self._service_breaker_fired:
+            self.is_busy = False
+            return
 
         is_first_frame = not self.first_frame_processed
         if is_first_frame:
@@ -901,6 +936,17 @@ class DetectionWorker(QObject):
         if is_anomaly_present:
             self._last_anomaly_seen_time = now_ts
 
+        if is_new_anomaly_found:
+            self._consecutive_detection_events += 1
+        elif not is_anomaly_present:
+            self._consecutive_detection_events = 0
+
+        should_trip_breaker = (
+            self.service_breaker_enabled
+            and not self._service_breaker_fired
+            and self._consecutive_detection_events >= self.service_breaker_limit
+        )
+
 
         if is_first_frame:
             end_process_time = time.time()
@@ -920,23 +966,32 @@ class DetectionWorker(QObject):
                     self._send_arduino_clear()
 
         if is_new_anomaly_found and self.auto_save:
-            ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-            idx = self.anomaly_count
-            fname = f"anomaly_{idx:05d}_{ts}.png"
-            det_dir = os.path.join('output','detections')
-            ori_dir = os.path.join('output','original')
-            os.makedirs(det_dir, exist_ok=True)
-            os.makedirs(ori_dir, exist_ok=True)
-            det_path = os.path.join(det_dir, fname)
-            ori_path = os.path.join(ori_dir, fname)
-            cv2.imwrite(det_path, processed_frame)
-            cv2.imwrite(ori_path, original_frame)
-            abs_det_path = os.path.abspath(det_path)
-            self.last_saved_detection_path = abs_det_path
-            self.status_update.emit(f"Anomaly saved as {fname}")
-            self.last_save_time = now_ts
+            saved_path = self._save_detection_snapshot(
+                processed_frame,
+                original_frame,
+                now_ts,
+                idx=self.anomaly_count,
+                notify=True,
+            )
             if self.stop_feeder_on_detect:
-                self.detection_saved.emit(abs_det_path)
+                self.detection_saved.emit(saved_path)
+
+        if should_trip_breaker:
+            self._service_breaker_fired = True
+            trip_path = self.last_saved_detection_path if self.auto_save else ""
+            if not trip_path or not os.path.exists(trip_path):
+                trip_path = self._save_detection_snapshot(
+                    processed_frame,
+                    original_frame,
+                    now_ts,
+                    idx=self.anomaly_count,
+                    notify=not self.auto_save,
+                )
+            self.send_arduino_feed_off()
+            self._play_service_breaker_alarm()
+            self.service_breaker_triggered.emit(trip_path or "")
+            self.is_busy = False
+            return
 
         can_random_save = (
             self.random_save_enabled
@@ -1034,15 +1089,22 @@ class DetectionWorker(QObject):
     @pyqtSlot()
     def send_arduino_feed_off(self):
         self._send_arduino_command("FEEDOFF", require_enabled=False)
+        self._stop_stop_feed_beep()
     @pyqtSlot(bool)
     def set_stop_feeder_on_detect(self, status):
         self.stop_feeder_on_detect = bool(status)
         if not self.stop_feeder_on_detect:
             self._stop_stop_feed_beep()
+    @pyqtSlot(bool)
+    def set_service_breaker_enabled(self, status):
+        self.service_breaker_enabled = bool(status)
+        if not self.service_breaker_enabled:
+            self._reset_service_breaker_state()
 
     def reset_counter(self):
         self.anomaly_count = 0
         self.first_frame_processed = False
+        self._reset_service_breaker_state()
         self.detector.first_inference = True
         self._last_anomaly_seen_time = 0.0
         self._cancel_arduino_trigger_timer()
@@ -1348,6 +1410,9 @@ class MainWindow(QMainWindow):
         self.detection_worker.status_update.connect(lambda msg: self.status_bar.showMessage(msg, 3000))
         self.detection_worker.arduino_state_changed.connect(self._handle_servo_state_changed)
         self.detection_worker.detection_saved.connect(self._handle_stop_feed_detection_popup)
+        self.detection_worker.service_breaker_triggered.connect(self._handle_service_breaker_trigger)
+        if hasattr(self, 'service_breaker_check'):
+            self.service_breaker_check.toggled.connect(self.detection_worker.set_service_breaker_enabled)
         self.auto_save_check.toggled.connect(self.detection_worker.set_auto_save)
         self.tripwire_check.toggled.connect(self.detection_worker.set_tripwire_enabled)
         if hasattr(self, 'stop_feed_on_detect_check'):
@@ -1357,6 +1422,8 @@ class MainWindow(QMainWindow):
         self.detection_worker.set_beep_enabled(self.beep_check.isChecked())
         if hasattr(self, 'stop_feed_on_detect_check'):
             self.detection_worker.set_stop_feeder_on_detect(self.stop_feed_on_detect_check.isChecked())
+        if hasattr(self, 'service_breaker_check'):
+            self.detection_worker.set_service_breaker_enabled(self.service_breaker_check.isChecked())
         self._update_random_save_status(self.random_save_check.isChecked())
         self._push_arduino_config()
         self._handle_servo_state_changed(self.detection_worker._arduino_last_signal)
@@ -1437,6 +1504,13 @@ class MainWindow(QMainWindow):
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
+
+    @pyqtSlot(str)
+    def _handle_service_breaker_trigger(self, image_path):
+        self.status_bar.showMessage('Service breaker triggered: repeated detections. Detection stopped.', 6000)
+        self._stop_detection()
+        if image_path:
+            self._handle_stop_feed_detection_popup(image_path)
 
     def _create_top_bar(self):
         top = QHBoxLayout()
@@ -1570,6 +1644,10 @@ class MainWindow(QMainWindow):
         self.stop_feed_on_detect_check = QCheckBox('Stop feeder on detection')
         self.stop_feed_on_detect_check.setToolTip('Automatically send FEEDOFF when a new anomaly is detected.')
         auto_beep_row.addWidget(self.stop_feed_on_detect_check)
+        auto_beep_row.addSpacing(24)
+        self.service_breaker_check = QCheckBox('Service Breaker')
+        self.service_breaker_check.setToolTip('Stop feeder and detection if repeated detections happen back-to-back.')
+        auto_beep_row.addWidget(self.service_breaker_check)
         auto_beep_row.addSpacing(24)
         self.beep_check = QCheckBox('Enable Beep Sound')
         self.beep_check.toggled.connect(self._update_beep_status)
@@ -2722,8 +2800,6 @@ class MainWindow(QMainWindow):
         if hasattr(self,'video_thread') and self.video_thread.isRunning(): self.video_thread.stop()
         self.is_detection_running = False
         self.is_paused = False
-        if hasattr(self, 'detection_worker'):
-            self.detection_worker.stop_all_beeps()
         if self.last_tested_image is None and (self.video_window.video_label.pixmap() is None or self.video_window.video_label.pixmap().isNull()):
             self.video_window.video_label.setText("Press 'Start Detection' or 'Test Image' to begin")
         if hasattr(self, 'fourcc_status_label'):
@@ -2999,6 +3075,8 @@ class MainWindow(QMainWindow):
         s.setValue('resolution_text', self.res_combo.currentText())
         s.setValue('fps_limit_text', self.fps_combo.currentText())
         s.setValue('auto_save', self.auto_save_check.isChecked())
+        if hasattr(self, 'service_breaker_check'):
+            s.setValue('service_breaker_enabled', self.service_breaker_check.isChecked())
         if hasattr(self, 'video_labels_check'):
             s.setValue('video_labels_enabled', self.video_labels_check.isChecked())
         if hasattr(self, 'yolo_model_path_edit'):
@@ -3079,6 +3157,12 @@ class MainWindow(QMainWindow):
         fps_text = s.value('fps_limit_text','Uncapped');
         if fps_text in self.fps_options: self.fps_combo.setCurrentText(fps_text)
         auto_save = s.value('auto_save',False,type=bool); self.auto_save_check.setChecked(auto_save); self.detection_worker.set_auto_save(auto_save)
+        if hasattr(self, 'service_breaker_check'):
+            breaker_enabled = s.value('service_breaker_enabled', False, type=bool)
+            self.service_breaker_check.blockSignals(True)
+            self.service_breaker_check.setChecked(breaker_enabled)
+            self.service_breaker_check.blockSignals(False)
+            self.detection_worker.set_service_breaker_enabled(breaker_enabled)
         if hasattr(self, 'arduino_port_combo'):
             self._refresh_arduino_ports(initial=True)
             saved_port = s.value('arduino_port', '')
