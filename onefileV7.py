@@ -408,7 +408,7 @@ class AnomalyDetector:
         combined_contours = list(contours) if contours else []
         for det in yolo_detections:
             x1, y1, x2, y2 = det['bbox']
-            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (255, 165, 0), 2)
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (12, 42, 237), 1)
             text = f"{det['label']} {det['conf']:.2f}"
             text_y = y1 - 8 if y1 - 8 > 12 else y1 + 18
             cv2.putText(
@@ -417,8 +417,8 @@ class AnomalyDetector:
                 (x1, text_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
-                (255, 200, 0),
-                2
+                (12, 42, 237),
+                1
             )
             combined_contours.append(self._bbox_to_contour(det['bbox']))
         cv2.putText(
@@ -427,7 +427,7 @@ class AnomalyDetector:
             (10, 90),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.9,
-            (255, 200, 0),
+            (203, 192, 255),
             2
         )
         return annotated_frame, mse, (is_anom or bool(yolo_detections)), combined_contours
