@@ -261,6 +261,7 @@ class AnomalyDetector:
         self.yolo_enabled = False
         self.yolo_confidence = 0.35
         self._yolo_names = {}
+        self.yolo_class_filter = set()
 
     def set_mode(self, mode: str):
         self.mode = mode
@@ -298,6 +299,29 @@ class AnomalyDetector:
         except (TypeError, ValueError):
             return
         self.yolo_confidence = max(0.01, min(0.99, conf))
+    def set_yolo_class_filter(self, items):
+        """Accept comma/newline separated labels or class ids; empty disables filtering."""
+        normalized = set()
+        if isinstance(items, str):
+            tokens = re.split(r'[,\n]+', items)
+        elif items is None:
+            tokens = []
+        else:
+            try:
+                tokens = list(items)
+            except TypeError:
+                tokens = [items]
+        for token in tokens:
+            if token is None:
+                continue
+            if isinstance(token, (int, float)):
+                normalized.add(str(int(token)).strip())
+                continue
+            text = str(token).strip()
+            if not text:
+                continue
+            normalized.add(text.lower())
+        self.yolo_class_filter = normalized
     def set_primary_hue_enabled(self, enabled: bool):
         self.primary_hue_enabled = bool(enabled)
     def set_secondary_hue_enabled(self, enabled: bool):
@@ -388,12 +412,22 @@ class AnomalyDetector:
         classes = classes.detach().cpu().numpy().astype(int)
         frame_h, frame_w = frame.shape[:2]
         detections = []
+        class_filter = self.yolo_class_filter
+        filter_active = bool(class_filter)
         for idx, box in enumerate(xyxy):
             conf = float(confs[idx])
             if conf < self.yolo_confidence:
                 continue
             cls_id = int(classes[idx])
             label = self._yolo_names.get(cls_id, f"class {cls_id}")
+            if filter_active:
+                label_key = label.lower()
+                cls_key = str(cls_id)
+                if (
+                    label_key not in class_filter
+                    and cls_key not in class_filter
+                ):
+                    continue
             x1 = int(max(0, min(box[0], frame_w - 1)))
             y1 = int(max(0, min(box[1], frame_h - 1)))
             x2 = int(max(0, min(box[2], frame_w - 1)))
@@ -408,7 +442,7 @@ class AnomalyDetector:
         combined_contours = list(contours) if contours else []
         for det in yolo_detections:
             x1, y1, x2, y2 = det['bbox']
-            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (12, 42, 237), 1)
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 0, 0), 2)
             text = f"{det['label']} {det['conf']:.2f}"
             text_y = y1 - 8 if y1 - 8 > 12 else y1 + 18
             cv2.putText(
@@ -417,8 +451,8 @@ class AnomalyDetector:
                 (x1, text_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
-                (12, 42, 237),
-                1
+                (0, 0, 0),
+                2
             )
             combined_contours.append(self._bbox_to_contour(det['bbox']))
         cv2.putText(
@@ -427,7 +461,7 @@ class AnomalyDetector:
             (10, 90),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.9,
-            (203, 192, 255),
+            (0, 0, 0),
             2
         )
         return annotated_frame, mse, (is_anom or bool(yolo_detections)), combined_contours
@@ -684,6 +718,7 @@ class DetectionWorker(QObject):
     arduino_state_changed = pyqtSignal(str)
     detection_saved = pyqtSignal(str)
     service_breaker_triggered = pyqtSignal(str)
+    stop_detection_requested = pyqtSignal()
     def __init__(self, detector):
         super().__init__()
         self.detector = detector
@@ -960,6 +995,7 @@ class DetectionWorker(QObject):
             if self.stop_feeder_on_detect:
                 self.send_arduino_feed_off()
                 self._start_stop_feed_beep()
+                self.stop_detection_requested.emit()
         elif self.arduino_enabled and self.arduino_clear_enabled and not is_anomaly_present:
             if self._arduino_last_signal == "trigger" and self._arduino_last_trigger_time > 0:
                 if now_ts - self._arduino_last_trigger_time >= self.arduino_clear_delay:
@@ -1411,6 +1447,7 @@ class MainWindow(QMainWindow):
         self.detection_worker.arduino_state_changed.connect(self._handle_servo_state_changed)
         self.detection_worker.detection_saved.connect(self._handle_stop_feed_detection_popup)
         self.detection_worker.service_breaker_triggered.connect(self._handle_service_breaker_trigger)
+        self.detection_worker.stop_detection_requested.connect(self._handle_stop_detection_request)
         if hasattr(self, 'service_breaker_check'):
             self.service_breaker_check.toggled.connect(self.detection_worker.set_service_breaker_enabled)
         self.auto_save_check.toggled.connect(self.detection_worker.set_auto_save)
@@ -1431,6 +1468,13 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str)
     def _handle_servo_state_changed(self, state):
         self._apply_servo_state_to_indicator(state)
+
+    @pyqtSlot()
+    def _handle_stop_detection_request(self):
+        if not self.is_detection_running:
+            return
+        self._stop_detection()
+        self.status_bar.showMessage('Detection auto-stopped because feeder stop on detect is enabled.')
 
     def _apply_servo_state_to_indicator(self, state):
         light = getattr(self, "arduino_servo_light", None)
@@ -1597,6 +1641,18 @@ class MainWindow(QMainWindow):
         yolo_conf_row.addWidget(self.yolo_conf_slider)
         yolo_conf_row.addWidget(self.yolo_conf_label)
         thresholds_layout.addLayout(yolo_conf_row)
+        yolo_class_row = QHBoxLayout()
+        yolo_class_row.addWidget(QLabel('YOLO Class Filter:'))
+        self.yolo_class_filter_edit = QLineEdit()
+        self.yolo_class_filter_edit.setPlaceholderText('e.g. Black_Head, White_Spot (blank = all classes)')
+        self.yolo_class_filter_edit.textChanged.connect(self._update_yolo_class_filter)
+        yolo_class_row.addWidget(self.yolo_class_filter_edit)
+        self.yolo_class_filter_status = QLabel('All classes')
+        self.yolo_class_filter_status.setStyleSheet('color: #bdc3c7;')
+        yolo_class_row.addWidget(self.yolo_class_filter_status)
+        yolo_class_row.addStretch()
+        thresholds_layout.addLayout(yolo_class_row)
+        self._update_yolo_class_filter('')
         thresholds_layout.addLayout(thr)
         thresholds_layout.addLayout(cvthr)
         thresholds_layout.addLayout(cont)
@@ -1642,7 +1698,7 @@ class MainWindow(QMainWindow):
         auto_beep_row.addWidget(self.auto_save_status_label)
         auto_beep_row.addSpacing(24)
         self.stop_feed_on_detect_check = QCheckBox('Stop feeder on detection')
-        self.stop_feed_on_detect_check.setToolTip('Automatically send FEEDOFF when a new anomaly is detected.')
+        self.stop_feed_on_detect_check.setToolTip('Automatically send FEEDOFF and stop detection when a new anomaly is detected.')
         auto_beep_row.addWidget(self.stop_feed_on_detect_check)
         auto_beep_row.addSpacing(24)
         self.service_breaker_check = QCheckBox('Service Breaker')
@@ -1892,23 +1948,22 @@ class MainWindow(QMainWindow):
         self.arduino_enable_check = QCheckBox('Enable trigger on anomaly')
         self.arduino_enable_check.toggled.connect(self._arduino_config_changed)
         enable_row.addWidget(self.arduino_enable_check)
+        enable_row.addSpacing(12)
         enable_row.addWidget(QLabel('Trigger delay (s):'))
         self.arduino_trigger_delay_spin = DelayControl(minimum=0.0, maximum=30.0, step=0.1, value=0.0, decimals=1)
         self.arduino_trigger_delay_spin.valueChanged.connect(lambda _: self._arduino_config_changed())
         enable_row.addWidget(self.arduino_trigger_delay_spin)
-        enable_row.addStretch()
-        layout.addLayout(enable_row)
-
-        clear_row = QHBoxLayout()
+        enable_row.addSpacing(24)
         self.arduino_auto_clear_check = QCheckBox('Auto-clear')
         self.arduino_auto_clear_check.toggled.connect(self._arduino_config_changed)
-        clear_row.addWidget(self.arduino_auto_clear_check)
-        clear_row.addWidget(QLabel('Delay (s):'))
+        enable_row.addWidget(self.arduino_auto_clear_check)
+        enable_row.addSpacing(12)
+        enable_row.addWidget(QLabel('Delay (s):'))
         self.arduino_clear_delay_spin = DelayControl(minimum=0.0, maximum=30.0, step=0.1, value=1.0, decimals=1)
         self.arduino_clear_delay_spin.valueChanged.connect(lambda _: self._arduino_config_changed())
-        clear_row.addWidget(self.arduino_clear_delay_spin)
-        clear_row.addStretch()
-        layout.addLayout(clear_row)
+        enable_row.addWidget(self.arduino_clear_delay_spin)
+        enable_row.addStretch()
+        layout.addLayout(enable_row)
 
         command_row = QHBoxLayout()
         command_row.addWidget(QLabel('Trigger cmd:'))
@@ -2288,6 +2343,18 @@ class MainWindow(QMainWindow):
         conf = max(1, min(99, int(value))) / 100.0
         self.yolo_conf_label.setText(f"{conf:.2f}")
         self.detector.set_yolo_confidence(conf)
+        self._reprocess_image()
+    def _update_yolo_class_filter(self, text):
+        self.detector.set_yolo_class_filter(text or "")
+        status_label = getattr(self, 'yolo_class_filter_status', None)
+        if status_label is not None:
+            if self.detector.yolo_class_filter:
+                count = len(self.detector.yolo_class_filter)
+                status_label.setText(f"Filtering {count} class{'es' if count != 1 else ''}")
+                status_label.setStyleSheet('color: #f1c40f;')
+            else:
+                status_label.setText('All classes')
+                status_label.setStyleSheet('color: #bdc3c7;')
         self._reprocess_image()
     def _update_contour_threshold(self, value):
         self.contour_label.setText(str(value)); self.detector.set_contour_threshold(value); self._reprocess_image()
@@ -3082,6 +3149,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'yolo_model_path_edit'):
             s.setValue('yolo_model_path', self.yolo_model_path_edit.text())
             s.setValue('yolo_enabled', self.yolo_enable_check.isChecked())
+        if hasattr(self, 'yolo_class_filter_edit'):
+            s.setValue('yolo_class_filter', self.yolo_class_filter_edit.text())
         s.setValue('mode_index', self.mode_combo.currentIndex())
         s.setValue('h_low', self.h_low_slider.value())
         s.setValue('h_high', self.h_high_slider.value())
@@ -3138,6 +3207,12 @@ class MainWindow(QMainWindow):
         self.cv_thresh_slider.setValue(s.value('cv_threshold',40,type=int))
         default_yolo_conf = int(max(1, min(99, round(self.detector.yolo_confidence * 100))))
         self.yolo_conf_slider.setValue(s.value('yolo_confidence',default_yolo_conf,type=int))
+        if hasattr(self, 'yolo_class_filter_edit'):
+            saved_filter = s.value('yolo_class_filter', '', type=str)
+            self.yolo_class_filter_edit.blockSignals(True)
+            self.yolo_class_filter_edit.setText(saved_filter)
+            self.yolo_class_filter_edit.blockSignals(False)
+            self._update_yolo_class_filter(saved_filter)
         self.contour_slider.setValue(s.value('contour_area',10,type=int))
         if hasattr(self, 'backend_combo'):
             backend_idx = s.value('backend_index', 0, type=int)
