@@ -30,10 +30,11 @@ from PyQt6.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QLineEdit, QSlider, QCheckBox,
     QStatusBar, QComboBox, QSizePolicy, QMessageBox, QGroupBox, QDoubleSpinBox,
-    QAbstractSpinBox, QDialog
+    QAbstractSpinBox, QDialog, QPlainTextEdit
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QObject, pyqtSlot, QPoint
-from PyQt6.QtGui import QImage, QPixmap, QColor
+from PyQt6.QtGui import QImage, QPixmap, QColor, QTextDocument, QFont
+from PyQt6.QtPrintSupport import QPrinter, QPrintDialog
 from PyQt6.QtMultimedia import QMediaDevices
 
 # ... (ส่วน THEME และ open_camera_by_index เหมือนเดิม) ...
@@ -262,6 +263,8 @@ class AnomalyDetector:
         self.yolo_confidence = 0.35
         self._yolo_names = {}
         self.yolo_class_filter = set()
+        self.last_yolo_detections = []
+        self.last_detection_sources = []
 
     def set_mode(self, mode: str):
         self.mode = mode
@@ -436,7 +439,11 @@ class AnomalyDetector:
         return detections
 
     def _apply_yolo_results(self, original_frame, annotated_frame, mse, is_anom, contours):
+        if self.mode not in ('hybrid', 'yolo'):
+            self.last_yolo_detections = []
+            return annotated_frame, mse, is_anom, contours
         yolo_detections = self._run_yolo_detection(original_frame)
+        self.last_yolo_detections = [det['label'] for det in yolo_detections]
         if not yolo_detections:
             return annotated_frame, mse, is_anom, contours
         combined_contours = list(contours) if contours else []
@@ -583,6 +590,10 @@ class AnomalyDetector:
         return mask, float((np.square(diff)).mean())
 
     def process_frame(self, frame, is_first_frame=False):
+        self.last_detection_sources = []
+        if self.mode == 'yolo':
+            out = frame.copy()
+            return self._apply_yolo_results(frame, out, 0.0, False, [])
         if self.mode == 'color':
             mask_primary = self._mask_color(frame)
             mask_secondary = self._mask_color_secondary(frame)
@@ -603,6 +614,7 @@ class AnomalyDetector:
             all_contours = contours_primary + contours_secondary + contours_tertiary
             is_anom = len(all_contours) > 0
             if is_anom:
+                self.last_detection_sources.append("Color")
                 cv2.putText(out, 'Color Anomaly (Hue1/Hue2/Hue3)', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,255,0), 3)
             mask_means = [mask_primary.mean(), mask_secondary.mean(), mask_tertiary.mean()]
             mse = float(sum(mask_means)/(len(mask_means)*255.0))
@@ -617,6 +629,7 @@ class AnomalyDetector:
                 cv2.rectangle(out, (x,y), (x+w, y+h), (0,0,255), 2)
             is_anom = len(contours) > 0
             if is_anom:
+                self.last_detection_sources.append("Model")
                 cv2.putText(out, 'Anomaly (Recon)', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
             return self._apply_yolo_results(frame, out, mse, is_anom, contours)
 
@@ -645,6 +658,10 @@ class AnomalyDetector:
         all_contours = contours_recon + contours_color_primary + contours_color_secondary + contours_color_tertiary
         is_anom = len(all_contours) > 0
         if is_anom:
+            if len(contours_recon) > 0:
+                self.last_detection_sources.append("Model")
+            if len(contours_color_primary) > 0 or len(contours_color_secondary) > 0 or len(contours_color_tertiary) > 0:
+                self.last_detection_sources.append("Color")
             cv2.putText(out, 'HYBRID: Color OR Recon', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255,255,255), 3)
         mask_mean_component = (mask_color_primary.mean() + mask_color_secondary.mean() + mask_color_tertiary.mean())/(3*255.0)
         mse_hybrid = 0.5*mse + 0.5*mask_mean_component
@@ -725,6 +742,7 @@ class DetectionWorker(QObject):
         self.is_busy = False
         self.auto_save = False
         self.last_save_time = 0
+        self.auto_save_min_interval = 0.8
         self.random_save_enabled = False
         self.random_save_probability = 0.05
         self.random_save_min_interval = 2.0
@@ -740,6 +758,7 @@ class DetectionWorker(QObject):
         self._consecutive_detection_events = 0
         self._service_breaker_fired = False
         self.recently_detected_centroids = []
+        self.detection_summary = {}
         self.first_frame_processed = False # <--- LOGGING FLAG
         self.arduino_manager = None
         self.arduino_enabled = False
@@ -927,6 +946,8 @@ class DetectionWorker(QObject):
         processed_frame, mse, is_anomaly_present, contours = self.detector.process_frame(cv_img, is_first_frame)
 
         now_ts = time.time()
+        yolo_labels = list(getattr(self.detector, 'last_yolo_detections', []))
+        detection_sources = list(getattr(self.detector, 'last_detection_sources', []))
         is_new_anomaly_found = False
 
         if self.tripwire_enabled and is_anomaly_present:
@@ -990,6 +1011,7 @@ class DetectionWorker(QObject):
 
         if is_new_anomaly_found:
             self.anomaly_count += 1
+            self._record_detection_summary(yolo_labels, detection_sources)
             self._play_beep_async()
             self._schedule_arduino_trigger()
             if self.stop_feeder_on_detect:
@@ -1001,7 +1023,9 @@ class DetectionWorker(QObject):
                 if now_ts - self._arduino_last_trigger_time >= self.arduino_clear_delay:
                     self._send_arduino_clear()
 
-        if is_new_anomaly_found and self.auto_save:
+        should_auto_save = self.auto_save and is_anomaly_present
+        save_due = (now_ts - self.last_save_time) >= self.auto_save_min_interval
+        if should_auto_save and (is_new_anomaly_found or save_due):
             saved_path = self._save_detection_snapshot(
                 processed_frame,
                 original_frame,
@@ -1050,6 +1074,47 @@ class DetectionWorker(QObject):
 
         self.result_ready.emit(processed_frame, original_frame, mse, is_anomaly, self.anomaly_count)
         self.is_busy = False
+
+    def _record_detection_summary(self, yolo_labels, detection_sources):
+        recorded = False
+        if yolo_labels:
+            for label in yolo_labels:
+                key = str(label).strip() or "YOLO"
+                self.detection_summary[key] = self.detection_summary.get(key, 0) + 1
+            recorded = True
+        if detection_sources:
+            for source in detection_sources:
+                if source == "Color":
+                    key = "Anomaly (Color)"
+                elif source == "Model":
+                    key = "Anomaly (Model)"
+                else:
+                    key = f"Anomaly ({source})"
+                self.detection_summary[key] = self.detection_summary.get(key, 0) + 1
+            recorded = True
+        if recorded:
+            return
+        mode = getattr(self.detector, 'mode', 'unknown')
+        if mode == 'color':
+            key = "Anomaly (Color)"
+        elif mode == 'hybrid':
+            key = "Anomaly (Hybrid)"
+        else:
+            key = "Anomaly (Model)"
+        self.detection_summary[key] = self.detection_summary.get(key, 0) + 1
+
+    def get_detection_summary_text(self):
+        total = int(self.anomaly_count or 0)
+        if total <= 0:
+            return "สรุปการตรวจจับ\nไม่พบสิ่งผิดปกติ"
+        lines = ["สรุปการตรวจจับ", f"รวมทั้งหมด: {total}", ""]
+        if self.detection_summary:
+            lines.append("รายการ:")
+            for key, count in sorted(self.detection_summary.items(), key=lambda item: (-item[1], item[0])):
+                lines.append(f"- {key}: {count}")
+        else:
+            lines.append("รายการ: ไม่มีรายละเอียด")
+        return "\n".join(lines)
 
     @pyqtSlot(bool)
     def set_beep_enabled(self, status):
@@ -1139,10 +1204,15 @@ class DetectionWorker(QObject):
 
     def reset_counter(self):
         self.anomaly_count = 0
+        self.detection_summary = {}
         self.first_frame_processed = False
         self._reset_service_breaker_state()
         self.detector.first_inference = True
         self._last_anomaly_seen_time = 0.0
+        if hasattr(self.detector, 'last_yolo_detections'):
+            self.detector.last_yolo_detections = []
+        if hasattr(self.detector, 'last_detection_sources'):
+            self.detector.last_detection_sources = []
         self._cancel_arduino_trigger_timer()
         if self.arduino_enabled and self.arduino_clear_enabled:
             self._send_arduino_clear()
@@ -1419,6 +1489,8 @@ class MainWindow(QMainWindow):
         self._detection_popup = None
         self._detection_popup_image_label = None
         self._detection_popup_path_label = None
+        self._summary_dialog = None
+        self._summary_text_edit = None
         self._sample_state = {
             'primary': {'pending': None, 'timestamp': 0.0, 'first': None, 'second': None, 'combined': None},
             'secondary': {'pending': None, 'timestamp': 0.0, 'first': None, 'second': None, 'combined': None},
@@ -1520,6 +1592,57 @@ class MainWindow(QMainWindow):
         self._detection_popup_image_label = img_label
         self._detection_popup_path_label = path_label
         return dialog
+
+    def _ensure_summary_dialog(self):
+        if self._summary_dialog is not None:
+            return self._summary_dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Detection Summary')
+        dialog.setModal(False)
+        dialog.resize(520, 360)
+        layout = QVBoxLayout(dialog)
+        text_edit = QPlainTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setStyleSheet('background-color:#111; border:1px solid #555; padding:6px; color:#ddd;')
+        layout.addWidget(text_edit)
+        btn_row = QHBoxLayout()
+        print_btn = QPushButton('Print')
+        copy_btn = QPushButton('Copy')
+        close_btn = QPushButton('Close')
+        print_btn.clicked.connect(self._print_detection_summary)
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(text_edit.toPlainText()))
+        close_btn.clicked.connect(dialog.close)
+        btn_row.addStretch(1)
+        btn_row.addWidget(print_btn)
+        btn_row.addWidget(copy_btn)
+        btn_row.addWidget(close_btn)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+        self._summary_dialog = dialog
+        self._summary_text_edit = text_edit
+        return dialog
+
+    def _print_detection_summary(self):
+        if self._summary_text_edit is None:
+            return
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        dialog = QPrintDialog(printer, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            doc = QTextDocument()
+            doc.setDefaultFont(QFont("Arial", 16))
+            doc.setPlainText(self._summary_text_edit.toPlainText())
+            doc.print(printer)
+
+    def _show_detection_summary(self):
+        if not hasattr(self, 'detection_worker'):
+            return
+        summary_text = self.detection_worker.get_detection_summary_text()
+        dialog = self._ensure_summary_dialog()
+        if self._summary_text_edit is not None:
+            self._summary_text_edit.setPlainText(summary_text)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     @pyqtSlot(str)
     def _handle_stop_feed_detection_popup(self, image_path):
@@ -1734,7 +1857,7 @@ class MainWindow(QMainWindow):
 
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel('Mode:'))
-        self.mode_combo = QComboBox(); self.mode_combo.addItems(['Reconstruction/Model','Color (HSV)','Hybrid (OR)'])
+        self.mode_combo = QComboBox(); self.mode_combo.addItems(['Reconstruction/Model','Color (HSV)','Hybrid (OR)','YOLO Only'])
         self.mode_combo.currentIndexChanged.connect(self._mode_changed)
         mode_row.addWidget(self.mode_combo)
         mode_row.addStretch()
@@ -2181,7 +2304,7 @@ class MainWindow(QMainWindow):
     def _create_status_bar(self):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage('Ready. Load a model or choose Color/Hybrid mode.')
+        self.status_bar.showMessage('Ready. Load a model or choose Color/Hybrid/YOLO mode.')
         self.fourcc_status_label = QLabel('Active FourCC: -')
         self.status_bar.addPermanentWidget(self.fourcc_status_label, 0)
 
@@ -2432,12 +2555,20 @@ class MainWindow(QMainWindow):
             self.hsv3_summary_label.setEnabled(True)
 
     def _mode_changed(self, idx):
-        mode = ['reconstruction/model','color','hybrid'][idx]
-        self.detector.set_mode({'reconstruction/model':'recon','color':'color','hybrid':'hybrid'}[mode])
+        mode = ['reconstruction/model','color','hybrid','yolo'][idx]
+        self.detector.set_mode({'reconstruction/model':'recon','color':'color','hybrid':'hybrid','yolo':'yolo'}[mode])
         self._enable_hsv_controls(idx in (1,2))
         self._update_hsv_summary()
         if idx in (1,2):
             self.start_btn.setDisabled(False); self.test_image_btn.setDisabled(False)
+        elif idx == 3:
+            has_yolo = bool(self.yolo_model_path_edit.text())
+            if has_yolo and hasattr(self, 'yolo_enable_check') and not self.yolo_enable_check.isChecked():
+                self.yolo_enable_check.blockSignals(True)
+                self.yolo_enable_check.setChecked(True)
+                self.yolo_enable_check.blockSignals(False)
+                self.detector.set_yolo_enabled(True)
+            self.start_btn.setDisabled(not has_yolo); self.test_image_btn.setDisabled(not has_yolo)
         else:
             if not self.model_path_edit.text():
                 self.start_btn.setDisabled(True); self.test_image_btn.setDisabled(True)
@@ -2863,7 +2994,8 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage('Detection resumed.')
         self._toggle_controls(False)
 
-    def _stop_detection(self):
+    def _stop_detection(self, *args, show_summary=True):
+        was_running = self.is_detection_running
         if hasattr(self,'video_thread') and self.video_thread.isRunning(): self.video_thread.stop()
         self.is_detection_running = False
         self.is_paused = False
@@ -2872,6 +3004,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'fourcc_status_label'):
             self.fourcc_status_label.setText('Active FourCC: -')
         self.status_bar.showMessage('Detection stopped.'); self._toggle_controls(True)
+        if show_summary and was_running:
+            self._show_detection_summary()
 
     # ... (ส่วนที่เหลือของ MainWindow เหมือนเดิม) ...
     def _toggle_controls(self, enable):
@@ -2924,7 +3058,7 @@ class MainWindow(QMainWindow):
     def _clear_output_folder(self):
         was_running = self.is_detection_running
         if was_running:
-            self._stop_detection()
+            self._stop_detection(show_summary=False)
         reply = QMessageBox.question(
             self,
             'Confirm Delete',
@@ -3000,7 +3134,7 @@ class MainWindow(QMainWindow):
             cv2.rectangle(frame, (roi_rect[0], roi_rect[1]), (roi_rect[2], roi_rect[3]), (0, 255, 255), 2)
 
     def _test_image(self):
-        if self.is_detection_running: self._stop_detection()
+        if self.is_detection_running: self._stop_detection(show_summary=False)
         file_name, _ = QFileDialog.getOpenFileName(self, 'Open Image', '', 'Image Files (*.png *.jpg *.jpeg *.bmp)')
         if not file_name: return
         cv_img = cv2.imread(file_name)
@@ -3035,7 +3169,7 @@ class MainWindow(QMainWindow):
         if is_anomaly and show_labels:
             h,w,_ = processed_frame.shape; text='Detections: 1'; (tw,_),_ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)
             cv2.putText(processed_frame, text, (w-tw-10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
-        mode_map = {'recon':'Recon','color':'HSV','hybrid':'Hybrid'}; mode = mode_map[self.detector.mode]
+        mode_map = {'recon':'Recon','color':'HSV','hybrid':'Hybrid','yolo':'YOLO'}; mode = mode_map[self.detector.mode]
         self.status_bar.showMessage(f"Last Image Test | Mode: {mode} | MSE: {mse:.4f} | Anomaly: {'Yes' if is_anomaly else 'No'}")
         focus_value, roi_rect = self._compute_focus_measure(self.current_frame)
         self.focus_measure = focus_value
@@ -3351,7 +3485,7 @@ class MainWindow(QMainWindow):
             self.start_btn.setDisabled(False); self.test_image_btn.setDisabled(False)
 
     def closeEvent(self, event):
-        self._save_settings(); self._stop_detection(); self.video_window.close(); self.detection_thread.quit(); self.detection_thread.wait(); event.accept()
+        self._save_settings(); self._stop_detection(show_summary=False); self.video_window.close(); self.detection_thread.quit(); self.detection_thread.wait(); event.accept()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
