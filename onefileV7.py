@@ -754,7 +754,7 @@ class DetectionWorker(QObject):
         self._stop_feed_beep_active = False
         self._stop_feed_beep_thread = None
         self.service_breaker_enabled = False
-        self.service_breaker_limit = 16
+        self.service_breaker_limit =18
         self._consecutive_detection_events = 0
         self._service_breaker_fired = False
         self.recently_detected_centroids = []
@@ -817,7 +817,9 @@ class DetectionWorker(QObject):
     def _play_service_breaker_alarm(self):
         def _alarm():
             try:
-                winsound.Beep(1500, 2000)
+                for _ in range(5):
+                    winsound.Beep(1500, 400)
+                    time.sleep(2)
             except Exception as e:
                 print(f"Error playing service breaker alarm: {e}")
         threading.Thread(target=_alarm, daemon=True).start()
@@ -825,6 +827,9 @@ class DetectionWorker(QObject):
     def _reset_service_breaker_state(self):
         self._consecutive_detection_events = 0
         self._service_breaker_fired = False
+
+    def reset_service_breaker(self):
+        self._reset_service_breaker_state()
 
     def _save_detection_snapshot(self, processed_frame, original_frame, now_ts, idx=None, notify=True):
         idx = idx if idx is not None else self.anomaly_count
@@ -992,9 +997,9 @@ class DetectionWorker(QObject):
         if is_anomaly_present:
             self._last_anomaly_seen_time = now_ts
 
-        if is_new_anomaly_found:
+        if is_anomaly_present:
             self._consecutive_detection_events += 1
-        elif not is_anomaly_present:
+        else:
             self._consecutive_detection_events = 0
 
         should_trip_breaker = (
@@ -1674,8 +1679,10 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str)
     def _handle_service_breaker_trigger(self, image_path):
-        self.status_bar.showMessage('Service breaker triggered: repeated detections. Detection stopped.', 6000)
-        self._stop_detection()
+        self.status_bar.showMessage('Service breaker triggered: repeated detections. Detection paused.', 6000)
+        if hasattr(self, 'detection_worker'):
+            self.detection_worker._play_service_breaker_alarm()
+        self._pause_detection()
         if image_path:
             self._handle_stop_feed_detection_popup(image_path)
 
@@ -2986,6 +2993,8 @@ class MainWindow(QMainWindow):
     def _resume_detection(self):
         if not self.is_detection_running or not self.is_paused:
             return
+        if hasattr(self, 'detection_worker'):
+            self.detection_worker.reset_service_breaker()
         if hasattr(self, 'video_thread') and self.video_thread.isRunning():
             self.video_thread.resume()
         self.is_paused = False
