@@ -263,7 +263,9 @@ class AnomalyDetector:
         self.yolo_confidence = 0.35
         self._yolo_names = {}
         self.yolo_class_filter = set()
+        self.yolo_dangerous_classes = set()
         self.last_yolo_detections = []
+        self.last_yolo_class_ids = []
         self.last_detection_sources = []
 
     def set_mode(self, mode: str):
@@ -302,8 +304,7 @@ class AnomalyDetector:
         except (TypeError, ValueError):
             return
         self.yolo_confidence = max(0.01, min(0.99, conf))
-    def set_yolo_class_filter(self, items):
-        """Accept comma/newline separated labels or class ids; empty disables filtering."""
+    def _normalize_yolo_class_items(self, items):
         normalized = set()
         if isinstance(items, str):
             tokens = re.split(r'[,\n]+', items)
@@ -324,7 +325,15 @@ class AnomalyDetector:
             if not text:
                 continue
             normalized.add(text.lower())
-        self.yolo_class_filter = normalized
+        return normalized
+
+    def set_yolo_class_filter(self, items):
+        """Accept comma/newline separated labels or class ids; empty disables exceptions."""
+        self.yolo_class_filter = self._normalize_yolo_class_items(items)
+
+    def set_yolo_dangerous_classes(self, items):
+        """Accept comma/newline separated labels or class ids; empty disables dangerous class checks."""
+        self.yolo_dangerous_classes = self._normalize_yolo_class_items(items)
     def set_primary_hue_enabled(self, enabled: bool):
         self.primary_hue_enabled = bool(enabled)
     def set_secondary_hue_enabled(self, enabled: bool):
@@ -426,24 +435,23 @@ class AnomalyDetector:
             if filter_active:
                 label_key = label.lower()
                 cls_key = str(cls_id)
-                if (
-                    label_key not in class_filter
-                    and cls_key not in class_filter
-                ):
+                if label_key in class_filter or cls_key in class_filter:
                     continue
             x1 = int(max(0, min(box[0], frame_w - 1)))
             y1 = int(max(0, min(box[1], frame_h - 1)))
             x2 = int(max(0, min(box[2], frame_w - 1)))
             y2 = int(max(0, min(box[3], frame_h - 1)))
-            detections.append({'bbox': (x1, y1, x2, y2), 'label': label, 'conf': conf})
+            detections.append({'bbox': (x1, y1, x2, y2), 'label': label, 'conf': conf, 'cls_id': cls_id})
         return detections
 
     def _apply_yolo_results(self, original_frame, annotated_frame, mse, is_anom, contours):
         if self.mode not in ('hybrid', 'yolo'):
             self.last_yolo_detections = []
+            self.last_yolo_class_ids = []
             return annotated_frame, mse, is_anom, contours
         yolo_detections = self._run_yolo_detection(original_frame)
         self.last_yolo_detections = [det['label'] for det in yolo_detections]
+        self.last_yolo_class_ids = [det.get('cls_id') for det in yolo_detections]
         if not yolo_detections:
             return annotated_frame, mse, is_anom, contours
         combined_contours = list(contours) if contours else []
@@ -736,6 +744,7 @@ class DetectionWorker(QObject):
     detection_saved = pyqtSignal(str)
     service_breaker_triggered = pyqtSignal(str)
     stop_detection_requested = pyqtSignal()
+    dangerous_detection_triggered = pyqtSignal(str)
     def __init__(self, detector):
         super().__init__()
         self.detector = detector
@@ -753,6 +762,7 @@ class DetectionWorker(QObject):
         self.stop_feeder_on_detect = False
         self._stop_feed_beep_active = False
         self._stop_feed_beep_thread = None
+        self._danger_alarm_active = False
         self.service_breaker_enabled = False
         self.service_breaker_limit =18
         self._consecutive_detection_events = 0
@@ -823,6 +833,34 @@ class DetectionWorker(QObject):
             except Exception as e:
                 print(f"Error playing service breaker alarm: {e}")
         threading.Thread(target=_alarm, daemon=True).start()
+
+    def _play_danger_alarm(self):
+        def _alarm():
+            try:
+                for _ in range(3):
+                    winsound.Beep(1800, 2000)
+                    time.sleep(0.2)
+            except Exception as e:
+                print(f"Error playing danger alarm: {e}")
+        threading.Thread(target=_alarm, daemon=True).start()
+
+    def _get_dangerous_yolo_hits(self, labels, class_ids):
+        dangerous_set = getattr(self.detector, 'yolo_dangerous_classes', set()) or set()
+        if not dangerous_set:
+            return []
+        hits = []
+        for label in labels or []:
+            key = str(label).strip().lower()
+            if key and key in dangerous_set:
+                hits.append(str(label).strip())
+        for cls_id in class_ids or []:
+            try:
+                cls_key = str(int(cls_id))
+            except (TypeError, ValueError):
+                continue
+            if cls_key in dangerous_set and cls_key not in hits:
+                hits.append(cls_key)
+        return hits
 
     def _reset_service_breaker_state(self):
         self._consecutive_detection_events = 0
@@ -953,6 +991,9 @@ class DetectionWorker(QObject):
         now_ts = time.time()
         yolo_labels = list(getattr(self.detector, 'last_yolo_detections', []))
         detection_sources = list(getattr(self.detector, 'last_detection_sources', []))
+        yolo_ids = list(getattr(self.detector, 'last_yolo_class_ids', []))
+        dangerous_hits = self._get_dangerous_yolo_hits(yolo_labels, yolo_ids)
+        dangerous_hit = bool(dangerous_hits)
         is_new_anomaly_found = False
 
         if self.tripwire_enabled and is_anomaly_present:
@@ -994,6 +1035,10 @@ class DetectionWorker(QObject):
             if is_anomaly:
                 is_new_anomaly_found = True
 
+        if dangerous_hit:
+            is_anomaly = True
+            is_new_anomaly_found = True
+
         if is_anomaly_present:
             self._last_anomaly_seen_time = now_ts
 
@@ -1014,12 +1059,21 @@ class DetectionWorker(QObject):
             print(f"[LOG {end_process_time:.2f}] FIRST frame processed. Took {end_process_time - start_process_time:.4f} seconds.")
             self.first_frame_processed = True
 
+        if dangerous_hit and not self._danger_alarm_active:
+            self._danger_alarm_active = True
+            self.send_arduino_feed_off()
+            self._play_danger_alarm()
+            message = "Dangerous YOLO class detected"
+            if dangerous_hits:
+                message = f"{message}: {', '.join(dangerous_hits)}"
+            self.dangerous_detection_triggered.emit(message)
+
         if is_new_anomaly_found:
             self.anomaly_count += 1
             self._record_detection_summary(yolo_labels, detection_sources)
             self._play_beep_async()
             self._schedule_arduino_trigger()
-            if self.stop_feeder_on_detect:
+            if self.stop_feeder_on_detect and not dangerous_hit:
                 self.send_arduino_feed_off()
                 self._start_stop_feed_beep()
                 self.stop_detection_requested.emit()
@@ -1068,11 +1122,8 @@ class DetectionWorker(QObject):
                 ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
                 rand_suffix = random.randint(0, 9999)
                 base_name = f"train_{ts}_{rand_suffix:04d}.png"
-                det_dir = os.path.join('output', 'training_samples', 'detected')
                 ori_dir = os.path.join('output', 'training_samples', 'original')
-                os.makedirs(det_dir, exist_ok=True)
                 os.makedirs(ori_dir, exist_ok=True)
-                cv2.imwrite(os.path.join(det_dir, base_name), processed_frame)
                 cv2.imwrite(os.path.join(ori_dir, base_name), original_frame)
                 self.status_update.emit(f"Training sample saved as {base_name}")
                 self.last_random_save_time = now_ts
@@ -1214,8 +1265,11 @@ class DetectionWorker(QObject):
         self._reset_service_breaker_state()
         self.detector.first_inference = True
         self._last_anomaly_seen_time = 0.0
+        self._danger_alarm_active = False
         if hasattr(self.detector, 'last_yolo_detections'):
             self.detector.last_yolo_detections = []
+        if hasattr(self.detector, 'last_yolo_class_ids'):
+            self.detector.last_yolo_class_ids = []
         if hasattr(self.detector, 'last_detection_sources'):
             self.detector.last_detection_sources = []
         self._cancel_arduino_trigger_timer()
@@ -1486,6 +1540,8 @@ class MainWindow(QMainWindow):
         self.frame_count = 0
         self.start_time = 0
         self.fps = 0.0
+        self.detection_timer_start = None
+        self.detection_elapsed_total = 0.0
         self._last_pixmap_size = (0, 0)
         self.focus_measure = 0.0
         self.show_video_labels = True
@@ -1515,6 +1571,19 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(DARK_THEME_STYLESHEET)
         self._load_settings()
 
+    def _format_duration(self, seconds):
+        total_seconds = max(0, int(seconds))
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        secs = total_seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def _get_detection_elapsed_seconds(self):
+        elapsed = float(self.detection_elapsed_total or 0.0)
+        if self.is_detection_running and not self.is_paused and self.detection_timer_start:
+            elapsed += time.time() - self.detection_timer_start
+        return elapsed
+
     def _setup_detection_thread(self):
         self.detection_thread = QThread()
         self.detection_worker = DetectionWorker(self.detector)
@@ -1525,6 +1594,7 @@ class MainWindow(QMainWindow):
         self.detection_worker.detection_saved.connect(self._handle_stop_feed_detection_popup)
         self.detection_worker.service_breaker_triggered.connect(self._handle_service_breaker_trigger)
         self.detection_worker.stop_detection_requested.connect(self._handle_stop_detection_request)
+        self.detection_worker.dangerous_detection_triggered.connect(self._handle_dangerous_detection)
         if hasattr(self, 'service_breaker_check'):
             self.service_breaker_check.toggled.connect(self.detection_worker.set_service_breaker_enabled)
         self.auto_save_check.toggled.connect(self.detection_worker.set_auto_save)
@@ -1552,6 +1622,13 @@ class MainWindow(QMainWindow):
             return
         self._stop_detection()
         self.status_bar.showMessage('Detection auto-stopped because feeder stop on detect is enabled.')
+
+    @pyqtSlot(str)
+    def _handle_dangerous_detection(self, message):
+        if not self.is_detection_running:
+            return
+        self.status_bar.showMessage(f"{message}. Detection paused.", 8000)
+        self._pause_detection()
 
     def _apply_servo_state_to_indicator(self, state):
         light = getattr(self, "arduino_servo_light", None)
@@ -1642,6 +1719,8 @@ class MainWindow(QMainWindow):
         if not hasattr(self, 'detection_worker'):
             return
         summary_text = self.detection_worker.get_detection_summary_text()
+        duration_text = self._format_duration(self._get_detection_elapsed_seconds())
+        summary_text = f"{summary_text}\n\nเวลาที่ใช้ทั้งหมด: {duration_text}"
         dialog = self._ensure_summary_dialog()
         if self._summary_text_edit is not None:
             self._summary_text_edit.setPlainText(summary_text)
@@ -1772,17 +1851,29 @@ class MainWindow(QMainWindow):
         yolo_conf_row.addWidget(self.yolo_conf_label)
         thresholds_layout.addLayout(yolo_conf_row)
         yolo_class_row = QHBoxLayout()
-        yolo_class_row.addWidget(QLabel('YOLO Class Filter:'))
+        yolo_class_row.addWidget(QLabel('YOLO Class Exception Filter:'))
         self.yolo_class_filter_edit = QLineEdit()
-        self.yolo_class_filter_edit.setPlaceholderText('e.g. Black_Head, White_Spot (blank = all classes)')
+        self.yolo_class_filter_edit.setPlaceholderText('e.g. Black_Head, White_Spot (blank = none)')
         self.yolo_class_filter_edit.textChanged.connect(self._update_yolo_class_filter)
         yolo_class_row.addWidget(self.yolo_class_filter_edit)
-        self.yolo_class_filter_status = QLabel('All classes')
+        self.yolo_class_filter_status = QLabel('No exceptions')
         self.yolo_class_filter_status.setStyleSheet('color: #bdc3c7;')
         yolo_class_row.addWidget(self.yolo_class_filter_status)
         yolo_class_row.addStretch()
         thresholds_layout.addLayout(yolo_class_row)
         self._update_yolo_class_filter('')
+        yolo_danger_row = QHBoxLayout()
+        yolo_danger_row.addWidget(QLabel('YOLO Dangerous Classes:'))
+        self.yolo_danger_class_edit = QLineEdit()
+        self.yolo_danger_class_edit.setPlaceholderText('e.g. Black_Head, 2 (blank = none)')
+        self.yolo_danger_class_edit.textChanged.connect(self._update_yolo_dangerous_classes)
+        yolo_danger_row.addWidget(self.yolo_danger_class_edit)
+        self.yolo_danger_class_status = QLabel('None')
+        self.yolo_danger_class_status.setStyleSheet('color: #bdc3c7;')
+        yolo_danger_row.addWidget(self.yolo_danger_class_status)
+        yolo_danger_row.addStretch()
+        thresholds_layout.addLayout(yolo_danger_row)
+        self._update_yolo_dangerous_classes('')
         thresholds_layout.addLayout(thr)
         thresholds_layout.addLayout(cvthr)
         thresholds_layout.addLayout(cont)
@@ -2045,23 +2136,19 @@ class MainWindow(QMainWindow):
         port_row.addWidget(self.arduino_refresh_btn)
         layout.addLayout(port_row)
 
-        baud_row = QHBoxLayout()
-        baud_row.addWidget(QLabel('Baud:'))
+        connect_row = QHBoxLayout()
+        connect_row.addWidget(QLabel('Baud:'))
         self.arduino_baud_combo = QComboBox()
         self.arduino_baud_combo.addItems(['9600', '19200', '38400', '57600', '115200'])
-        baud_row.addWidget(self.arduino_baud_combo)
-        baud_row.addStretch()
-        layout.addLayout(baud_row)
-
-        control_row = QHBoxLayout()
+        connect_row.addWidget(self.arduino_baud_combo)
         self.arduino_connect_btn = QPushButton('Connect')
         self.arduino_connect_btn.clicked.connect(self._handle_arduino_connect)
-        control_row.addWidget(self.arduino_connect_btn)
+        connect_row.addWidget(self.arduino_connect_btn)
         self.arduino_status_label = QLabel('Not connected' if serial is not None else 'pyserial not installed')
         self.arduino_status_label.setStyleSheet('color: #d35400; font-weight: bold;')
-        control_row.addWidget(self.arduino_status_label, 1)
-        control_row.addStretch()
-        layout.addLayout(control_row)
+        connect_row.addWidget(self.arduino_status_label, 1)
+        connect_row.addStretch()
+        layout.addLayout(connect_row)
 
         servo_row = QHBoxLayout()
         servo_row.addWidget(QLabel('Servo Status:'))
@@ -2480,10 +2567,22 @@ class MainWindow(QMainWindow):
         if status_label is not None:
             if self.detector.yolo_class_filter:
                 count = len(self.detector.yolo_class_filter)
-                status_label.setText(f"Filtering {count} class{'es' if count != 1 else ''}")
+                status_label.setText(f"Excepting {count} class{'es' if count != 1 else ''}")
                 status_label.setStyleSheet('color: #f1c40f;')
             else:
-                status_label.setText('All classes')
+                status_label.setText('No exceptions')
+                status_label.setStyleSheet('color: #bdc3c7;')
+        self._reprocess_image()
+    def _update_yolo_dangerous_classes(self, text):
+        self.detector.set_yolo_dangerous_classes(text or "")
+        status_label = getattr(self, 'yolo_danger_class_status', None)
+        if status_label is not None:
+            if self.detector.yolo_dangerous_classes:
+                count = len(self.detector.yolo_dangerous_classes)
+                status_label.setText(f"Danger: {count} class{'es' if count != 1 else ''}")
+                status_label.setStyleSheet('color: #e74c3c;')
+            else:
+                status_label.setText('None')
                 status_label.setStyleSheet('color: #bdc3c7;')
         self._reprocess_image()
     def _update_contour_threshold(self, value):
@@ -2947,6 +3046,8 @@ class MainWindow(QMainWindow):
         if self.cam_combo.currentText() == 'No Camera Found':
             self.status_bar.showMessage('Error: No camera selected or found.'); return
         self.last_tested_image = None; self.status_bar.showMessage('Starting detection...')
+        self.detection_elapsed_total = 0.0
+        self.detection_timer_start = time.time()
         self.frame_count = 0; self.start_time = time.time(); self.detection_worker.reset_counter()
         res_text = self.res_combo.currentText()
         resolution = tuple(map(int, res_text.lower().split('x'))) if res_text != 'Source/Native' else None
@@ -2985,6 +3086,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'video_thread') and self.video_thread.isRunning():
             self.video_thread.pause()
         self.is_paused = True
+        if self.detection_timer_start:
+            self.detection_elapsed_total += time.time() - self.detection_timer_start
+            self.detection_timer_start = None
         self.frame_count = 0
         self.start_time = time.time()
         self.status_bar.showMessage('Detection paused.')
@@ -2998,6 +3102,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'video_thread') and self.video_thread.isRunning():
             self.video_thread.resume()
         self.is_paused = False
+        self.detection_timer_start = time.time()
         self.frame_count = 0
         self.start_time = time.time()
         self.status_bar.showMessage('Detection resumed.')
@@ -3005,6 +3110,9 @@ class MainWindow(QMainWindow):
 
     def _stop_detection(self, *args, show_summary=True):
         was_running = self.is_detection_running
+        if was_running and not self.is_paused and self.detection_timer_start:
+            self.detection_elapsed_total += time.time() - self.detection_timer_start
+            self.detection_timer_start = None
         if hasattr(self,'video_thread') and self.video_thread.isRunning(): self.video_thread.stop()
         self.is_detection_running = False
         self.is_paused = False
@@ -3294,6 +3402,8 @@ class MainWindow(QMainWindow):
             s.setValue('yolo_enabled', self.yolo_enable_check.isChecked())
         if hasattr(self, 'yolo_class_filter_edit'):
             s.setValue('yolo_class_filter', self.yolo_class_filter_edit.text())
+        if hasattr(self, 'yolo_danger_class_edit'):
+            s.setValue('yolo_dangerous_classes', self.yolo_danger_class_edit.text())
         s.setValue('mode_index', self.mode_combo.currentIndex())
         s.setValue('h_low', self.h_low_slider.value())
         s.setValue('h_high', self.h_high_slider.value())
@@ -3356,6 +3466,12 @@ class MainWindow(QMainWindow):
             self.yolo_class_filter_edit.setText(saved_filter)
             self.yolo_class_filter_edit.blockSignals(False)
             self._update_yolo_class_filter(saved_filter)
+        if hasattr(self, 'yolo_danger_class_edit'):
+            saved_danger = s.value('yolo_dangerous_classes', '', type=str)
+            self.yolo_danger_class_edit.blockSignals(True)
+            self.yolo_danger_class_edit.setText(saved_danger)
+            self.yolo_danger_class_edit.blockSignals(False)
+            self._update_yolo_dangerous_classes(saved_danger)
         self.contour_slider.setValue(s.value('contour_area',10,type=int))
         if hasattr(self, 'backend_combo'):
             backend_idx = s.value('backend_index', 0, type=int)
