@@ -328,7 +328,7 @@ class AnomalyDetector:
         return normalized
 
     def set_yolo_class_filter(self, items):
-        """Accept comma/newline separated labels or class ids; empty disables exceptions."""
+        """Accept comma/newline separated labels or class ids; empty disables filtering."""
         self.yolo_class_filter = self._normalize_yolo_class_items(items)
 
     def set_yolo_dangerous_classes(self, items):
@@ -435,7 +435,10 @@ class AnomalyDetector:
             if filter_active:
                 label_key = label.lower()
                 cls_key = str(cls_id)
-                if label_key in class_filter or cls_key in class_filter:
+                if (
+                    label_key not in class_filter
+                    and cls_key not in class_filter
+                ):
                     continue
             x1 = int(max(0, min(box[0], frame_w - 1)))
             y1 = int(max(0, min(box[1], frame_h - 1)))
@@ -1851,12 +1854,12 @@ class MainWindow(QMainWindow):
         yolo_conf_row.addWidget(self.yolo_conf_label)
         thresholds_layout.addLayout(yolo_conf_row)
         yolo_class_row = QHBoxLayout()
-        yolo_class_row.addWidget(QLabel('YOLO Class Exception Filter:'))
+        yolo_class_row.addWidget(QLabel('YOLO Class Filter:'))
         self.yolo_class_filter_edit = QLineEdit()
-        self.yolo_class_filter_edit.setPlaceholderText('e.g. Black_Head, White_Spot (blank = none)')
+        self.yolo_class_filter_edit.setPlaceholderText('e.g. Black_Head, White_Spot (blank = all classes)')
         self.yolo_class_filter_edit.textChanged.connect(self._update_yolo_class_filter)
         yolo_class_row.addWidget(self.yolo_class_filter_edit)
-        self.yolo_class_filter_status = QLabel('No exceptions')
+        self.yolo_class_filter_status = QLabel('All classes')
         self.yolo_class_filter_status.setStyleSheet('color: #bdc3c7;')
         yolo_class_row.addWidget(self.yolo_class_filter_status)
         yolo_class_row.addStretch()
@@ -2567,10 +2570,10 @@ class MainWindow(QMainWindow):
         if status_label is not None:
             if self.detector.yolo_class_filter:
                 count = len(self.detector.yolo_class_filter)
-                status_label.setText(f"Excepting {count} class{'es' if count != 1 else ''}")
+                status_label.setText(f"Filtering {count} class{'es' if count != 1 else ''}")
                 status_label.setStyleSheet('color: #f1c40f;')
             else:
-                status_label.setText('No exceptions')
+                status_label.setText('All classes')
                 status_label.setStyleSheet('color: #bdc3c7;')
         self._reprocess_image()
     def _update_yolo_dangerous_classes(self, text):
