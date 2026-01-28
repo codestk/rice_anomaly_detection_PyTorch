@@ -425,7 +425,7 @@ class AnomalyDetector:
                 frame,
                 conf=self.yolo_confidence,
                 device=self.yolo_device,
-                verbose=False,
+                verbose=False,half=True
             )
         except Exception as err:
             print(f"[WARN] YOLO inference failed: {err}")
@@ -970,10 +970,13 @@ class DetectionWorker(QObject):
             finally:
                 self._save_queue.task_done()
 
-    def _save_detection_snapshot(self, processed_frame, original_frame, now_ts, idx=None, notify=True):
+    def _save_detection_snapshot(self, processed_frame, original_frame, now_ts, idx=None, notify=True, label_text=None):
         idx = idx if idx is not None else self.anomaly_count
         ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-        fname = f"anomaly_{idx:05d}_{ts}.png"
+        if label_text is None:
+            label_text = getattr(self, "_last_detection_label_text", "")
+        suffix = f" {label_text}" if label_text else ""
+        fname = f"anomaly_{idx:05d}_{ts}{suffix}.png"
         det_dir = os.path.join('output', 'detections')
         ori_dir = os.path.join('output', 'original')
         os.makedirs(det_dir, exist_ok=True)
@@ -989,10 +992,13 @@ class DetectionWorker(QObject):
             self.status_update.emit(f"Anomaly saved as {fname}")
         return abs_det_path
 
-    def _enqueue_detection_snapshot(self, processed_frame, original_frame, now_ts, idx=None, notify=True, emit_detection_saved=False):
+    def _enqueue_detection_snapshot(self, processed_frame, original_frame, now_ts, idx=None, notify=True, emit_detection_saved=False, label_text=None):
         idx = idx if idx is not None else self.anomaly_count
         ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-        fname = f"anomaly_{idx:05d}_{ts}.png"
+        if label_text is None:
+            label_text = getattr(self, "_last_detection_label_text", "")
+        suffix = f" {label_text}" if label_text else ""
+        fname = f"anomaly_{idx:05d}_{ts}{suffix}.png"
         det_dir = os.path.join('output', 'detections')
         ori_dir = os.path.join('output', 'original')
         det_path = os.path.join(det_dir, fname)
@@ -1015,6 +1021,36 @@ class DetectionWorker(QObject):
         except queue.Full:
             return ""
         return os.path.abspath(det_path)
+
+    def _sanitize_label_for_filename(self, text, max_len=120):
+        cleaned = re.sub(r'[\\/:*?"<>|]+', ' ', str(text))
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        if len(cleaned) > max_len:
+            cleaned = cleaned[:max_len].rstrip()
+        return cleaned
+
+    def _build_detection_label_text(self, yolo_labels, detection_sources):
+        parts = []
+        seen = set()
+        def _add(item):
+            label = str(item).strip()
+            if not label:
+                return
+            key = label.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            parts.append(label)
+        for label in yolo_labels or []:
+            _add(label)
+        for source in detection_sources or []:
+            if source == "Color":
+                _add("Color")
+            elif source == "Model":
+                _add("Model")
+            else:
+                _add(source)
+        return self._sanitize_label_for_filename(" ".join(parts))
 
     def _enqueue_training_sample(self, original_frame, base_name, notify=True):
         ori_dir = os.path.join('output', 'training_samples', 'original')
@@ -1141,6 +1177,8 @@ class DetectionWorker(QObject):
         yolo_labels = list(getattr(self.detector, 'last_yolo_detections', []))
         detection_sources = list(getattr(self.detector, 'last_detection_sources', []))
         yolo_ids = list(getattr(self.detector, 'last_yolo_class_ids', []))
+        label_text = self._build_detection_label_text(yolo_labels, detection_sources)
+        self._last_detection_label_text = label_text
         dangerous_hits = self._get_dangerous_yolo_hits(yolo_labels, yolo_ids)
         dangerous_hit = bool(dangerous_hits)
         is_new_anomaly_found = False
@@ -1245,6 +1283,7 @@ class DetectionWorker(QObject):
                 idx=self.anomaly_count,
                 notify=True,
                 emit_detection_saved=self.stop_feeder_on_detect,
+                label_text=label_text,
             )
             save_ms = (time.perf_counter() - save_start) * 1000.0
 
@@ -1258,6 +1297,7 @@ class DetectionWorker(QObject):
                     now_ts,
                     idx=self.anomaly_count,
                     notify=not self.auto_save,
+                    label_text=label_text,
                 )
             self.send_arduino_feed_off()
             self._play_service_breaker_alarm()
@@ -1310,6 +1350,13 @@ class DetectionWorker(QObject):
 
         self.result_ready.emit(processed_frame, original_frame, mse, is_anomaly, self.anomaly_count)
         self.is_busy = False
+
+    def preview_detection(self, cv_img):
+        original_frame = cv_img.copy()
+        processed_frame, mse, is_anomaly_present, contours = self.detector.process_frame(cv_img, False)
+        detection_count = len(contours) if contours is not None else 0
+        is_anomaly = bool(is_anomaly_present)
+        return processed_frame, original_frame, mse, is_anomaly, detection_count
 
     def _record_detection_summary(self, yolo_labels, detection_sources):
         recorded = False
@@ -3460,14 +3507,33 @@ class MainWindow(QMainWindow):
 
     def _reprocess_image(self):
         if self.last_tested_image is None or self.is_detection_running: return
+        if hasattr(self, 'mode_combo'):
+            mode_idx = self.mode_combo.currentIndex()
+            mode_key = {0: 'recon', 1: 'color', 2: 'hybrid', 3: 'yolo'}.get(mode_idx, 'recon')
+            self.detector.set_mode(mode_key)
+            if mode_key == 'yolo':
+                has_yolo = bool(getattr(self, 'yolo_model_path_edit', None) and self.yolo_model_path_edit.text())
+                if has_yolo and hasattr(self, 'yolo_enable_check') and not self.yolo_enable_check.isChecked():
+                    self.yolo_enable_check.blockSignals(True)
+                    self.yolo_enable_check.setChecked(True)
+                    self.yolo_enable_check.blockSignals(False)
+                    self.detector.set_yolo_enabled(True)
         self.current_frame = self.last_tested_image.copy()
-        processed_frame, mse, is_anomaly, _ = self.detector.process_frame(self.last_tested_image.copy())
+        if hasattr(self, 'detection_worker'):
+            processed_frame, _, mse, is_anomaly, detection_count = self.detection_worker.preview_detection(
+                self.last_tested_image.copy()
+            )
+        else:
+            processed_frame, mse, is_anomaly, contours = self.detector.process_frame(self.last_tested_image.copy())
+            detection_count = len(contours) if contours else 0
         show_labels = getattr(self, 'show_video_labels', True)
-        if is_anomaly and show_labels:
-            h,w,_ = processed_frame.shape; text='Detections: 1'; (tw,_),_ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)
+        if detection_count > 0 and show_labels:
+            h,w,_ = processed_frame.shape; text=f'Detections: {detection_count}'; (tw,_),_ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)
             cv2.putText(processed_frame, text, (w-tw-10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
         mode_map = {'recon':'Recon','color':'HSV','hybrid':'Hybrid','yolo':'YOLO'}; mode = mode_map[self.detector.mode]
-        self.status_bar.showMessage(f"Last Image Test | Mode: {mode} | MSE: {mse:.4f} | Anomaly: {'Yes' if is_anomaly else 'No'}")
+        self.status_bar.showMessage(
+            f"Last Image Test | Mode: {mode} | MSE: {mse:.4f} | Detections: {detection_count} | Anomaly: {'Yes' if is_anomaly else 'No'}"
+        )
         focus_value, roi_rect = self._compute_focus_measure(self.current_frame)
         self.focus_measure = focus_value
         self._apply_visual_guides(processed_frame)
