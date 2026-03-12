@@ -997,6 +997,7 @@ class DetectionWorker(QObject):
         yolo_ids = list(getattr(self.detector, 'last_yolo_class_ids', []))
         dangerous_hits = self._get_dangerous_yolo_hits(yolo_labels, yolo_ids)
         dangerous_hit = bool(dangerous_hits)
+        danger_event_started = dangerous_hit and not self._danger_alarm_active
         is_new_anomaly_found = False
 
         if self.tripwire_enabled and is_anomaly_present:
@@ -1062,7 +1063,7 @@ class DetectionWorker(QObject):
             print(f"[LOG {end_process_time:.2f}] FIRST frame processed. Took {end_process_time - start_process_time:.4f} seconds.")
             self.first_frame_processed = True
 
-        if dangerous_hit and not self._danger_alarm_active:
+        if danger_event_started:
             self._danger_alarm_active = True
             self.send_arduino_feed_off()
             self._play_danger_alarm()
@@ -1087,6 +1088,7 @@ class DetectionWorker(QObject):
 
         should_auto_save = self.auto_save and is_anomaly_present
         save_due = (now_ts - self.last_save_time) >= self.auto_save_min_interval
+        emit_popup_snapshot = self.stop_feeder_on_detect or danger_event_started
         if should_auto_save and (is_new_anomaly_found or save_due):
             saved_path = self._save_detection_snapshot(
                 processed_frame,
@@ -1095,8 +1097,18 @@ class DetectionWorker(QObject):
                 idx=self.anomaly_count,
                 notify=True,
             )
-            if self.stop_feeder_on_detect:
+            if emit_popup_snapshot:
                 self.detection_saved.emit(saved_path)
+        elif danger_event_started:
+            # Ensure dangerous classes always produce a popup snapshot even when auto-save is disabled.
+            saved_path = self._save_detection_snapshot(
+                processed_frame,
+                original_frame,
+                now_ts,
+                idx=self.anomaly_count,
+                notify=True,
+            )
+            self.detection_saved.emit(saved_path)
 
         if should_trip_breaker:
             self._service_breaker_fired = True
