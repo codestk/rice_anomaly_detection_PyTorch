@@ -1386,9 +1386,11 @@ class DetectionWorker(QObject):
         if not self.arduino_enabled:
             return
         delay = max(0.0, float(self.arduino_trigger_delay or 0.0))
-        self._cancel_arduino_trigger_timer()
         if delay <= 0.0:
             self._send_arduino_trigger()
+            return
+        existing_timer = self._arduino_trigger_timer
+        if existing_timer is not None and existing_timer.is_alive():
             return
         timer = threading.Timer(delay, self._delayed_arduino_trigger_fire)
         timer.daemon = True
@@ -2011,6 +2013,8 @@ class VideoWindow(QWidget):
 
 
 class MainWindow(QMainWindow):
+    detection_frame_ready = pyqtSignal(np.ndarray)
+
     # ... (ส่วน __init__ และอื่นๆ เหมือนเดิม) ...
     def __init__(self):
         super().__init__()
@@ -2035,6 +2039,8 @@ class MainWindow(QMainWindow):
         self.show_video_labels = True
         self.zoom_level = 1.0
         self.pan_offset = QPoint(0, 0)
+        self._pending_detection_frame = None
+        self._detection_frame_inflight = False
         self._detection_popup = None
         self._detection_popup_image_label = None
         self._detection_popup_path_label = None
@@ -2076,6 +2082,7 @@ class MainWindow(QMainWindow):
         self.detection_thread = QThread()
         self.detection_worker = DetectionWorker(self.detector)
         self.detection_worker.moveToThread(self.detection_thread)
+        self.detection_frame_ready.connect(self.detection_worker.process_frame)
         self.detection_worker.result_ready.connect(self.display_processed_frame)
         self.detection_worker.status_update.connect(lambda msg: self.status_bar.showMessage(msg, 3000))
         self.detection_worker.arduino_state_changed.connect(self._handle_servo_state_changed)
@@ -2099,6 +2106,35 @@ class MainWindow(QMainWindow):
         self._update_random_save_status(self.random_save_check.isChecked())
         self._push_arduino_config()
         self._handle_servo_state_changed(self.detection_worker._arduino_last_signal)
+
+    @pyqtSlot(np.ndarray)
+    def _queue_detection_frame(self, frame):
+        if not self.is_detection_running or self.is_paused:
+            return
+        if self._detection_frame_inflight:
+            self._pending_detection_frame = frame
+            return
+        self._dispatch_detection_frame(frame)
+
+    def _dispatch_detection_frame(self, frame):
+        if frame is None or not self.is_detection_running or self.is_paused:
+            self._pending_detection_frame = None
+            self._detection_frame_inflight = False
+            return
+        self._detection_frame_inflight = True
+        self.detection_frame_ready.emit(frame)
+
+    def _dispatch_latest_pending_detection_frame(self):
+        if not self.is_detection_running or self.is_paused:
+            self._pending_detection_frame = None
+            self._detection_frame_inflight = False
+            return
+        next_frame = self._pending_detection_frame
+        self._pending_detection_frame = None
+        if next_frame is None:
+            self._detection_frame_inflight = False
+            return
+        self._dispatch_detection_frame(next_frame)
 
     @pyqtSlot(str)
     def _handle_servo_state_changed(self, state):
@@ -2250,6 +2286,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'detection_worker'):
             self.detection_worker._play_service_breaker_alarm()
         self._pause_detection()
+        self._detection_frame_inflight = False
         if image_path:
             self._handle_stop_feed_detection_popup(image_path)
 
@@ -3601,6 +3638,8 @@ class MainWindow(QMainWindow):
         print(f"[LOG {time.time():.2f}] Detection runtime device: {runtime_device_message}")
         self.detection_elapsed_total = 0.0
         self.detection_timer_start = time.time()
+        self._pending_detection_frame = None
+        self._detection_frame_inflight = False
         self.frame_count = 0; self.start_time = time.time(); self.detection_worker.reset_counter()
         res_text = self.res_combo.currentText()
         resolution = tuple(map(int, res_text.lower().split('x'))) if res_text != 'Source/Native' else None
@@ -3622,7 +3661,7 @@ class MainWindow(QMainWindow):
             preferred_fourcc=preferred_fourcc,
             exposure_value=exposure_value
         )
-        self.video_thread.change_pixmap_signal.connect(self.detection_worker.process_frame)
+        self.video_thread.change_pixmap_signal.connect(self._queue_detection_frame)
         self.video_thread.fourcc_signal.connect(self._update_fourcc_label)
         
         print(f"[LOG {time.time():.2f}] Starting VideoThread...")
@@ -3640,6 +3679,7 @@ class MainWindow(QMainWindow):
             return
         if hasattr(self, 'video_thread') and self.video_thread.isRunning():
             self.video_thread.pause()
+        self._pending_detection_frame = None
         self.is_paused = True
         if self.detection_timer_start:
             self.detection_elapsed_total += time.time() - self.detection_timer_start
@@ -3654,6 +3694,7 @@ class MainWindow(QMainWindow):
             return
         if hasattr(self, 'detection_worker'):
             self.detection_worker.reset_service_breaker()
+        self._pending_detection_frame = None
         if hasattr(self, 'video_thread') and self.video_thread.isRunning():
             self.video_thread.resume()
         self.is_paused = False
@@ -3668,6 +3709,8 @@ class MainWindow(QMainWindow):
         if was_running and not self.is_paused and self.detection_timer_start:
             self.detection_elapsed_total += time.time() - self.detection_timer_start
             self.detection_timer_start = None
+        self._pending_detection_frame = None
+        self._detection_frame_inflight = False
         if hasattr(self,'video_thread') and self.video_thread.isRunning(): self.video_thread.stop()
         self.is_detection_running = False
         self.is_paused = False
@@ -3893,6 +3936,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(np.ndarray, np.ndarray, float, bool, int)
     def display_processed_frame(self, processed_frame, original_frame, mse, is_anomaly, anomaly_count):
+        self._dispatch_latest_pending_detection_frame()
         self.current_frame = original_frame
         self.frame_count += 1; elapsed = time.time() - self.start_time
         if elapsed > 1.0:
