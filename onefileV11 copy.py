@@ -249,7 +249,6 @@ class ArduinoManager:
                 data = bytes(command)
             if not data.endswith(b"\n"):
                 data += b"\n"
-            print(f">>> SENDING TO ARDUINO: {data}") # เพิ่มบรรทัดนี้เพื่อ Debug
             self._serial.write(data)
             self._serial.flush()
 
