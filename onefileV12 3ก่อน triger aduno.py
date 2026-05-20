@@ -9,6 +9,7 @@ import queue
 from datetime import datetime
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F_torch
 from torchvision.transforms import functional as F
 import winsound # Import for beep sound
@@ -130,6 +131,33 @@ def open_camera_by_index(index, resolution=None, prefer_backend="DSHOW", fps=Non
     fourcc_value = cap.get(cv2.CAP_PROP_FOURCC)
     fourcc_mode = _fourcc_to_string(fourcc_value)
     return cap, fourcc_mode
+
+
+class Autoencoder(nn.Module):
+    """Reconstruction network matching src/train.py state_dict checkpoints."""
+
+    def __init__(self):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+        )
+        self.decoder = nn.Sequential(
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(32, 1, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
 
 
 class ArduinoManager:
@@ -276,13 +304,19 @@ class AnomalyDetector:
         self._torch_device = torch.device("cpu")
         self.cv_threshold = 40
         self.contour_area_threshold = 10
-        self.mse_threshold = 0.01
+        self.mse_threshold = 0.001
         self.h_low, self.h_high = 15, 35
         self.s_min, self.v_min = 60, 120
         self.h2_low, self.h2_high = 75, 95
         self.s2_min, self.v2_min = 60, 120
         self.h3_low, self.h3_high = 105, 125
         self.s3_min, self.v3_min = 60, 120
+        self.hue_tolerance = 5
+        self.recon_input_size = (128, 128)
+        self.recon_state = "unloaded"
+        self.recon_state_message = "Reconstruction model not loaded."
+        self._pending_runtime_status_message = ""
+        self._last_runtime_status_signature = None
         self.mode = 'recon'
         self.first_inference = True # <--- LOGGING FLAG
         self.primary_hue_enabled = True
@@ -347,6 +381,30 @@ class AnomalyDetector:
 
     def set_mode(self, mode: str):
         self.mode = mode
+    def has_reconstruction_model(self):
+        return self.model is not None and callable(self.model) and self.recon_state == "ready"
+    def _queue_runtime_status(self, signature, message):
+        normalized_message = str(message or "").strip()
+        if not normalized_message:
+            return
+        normalized_signature = (str(signature or "").strip(), normalized_message)
+        if normalized_signature == self._last_runtime_status_signature:
+            return
+        self._last_runtime_status_signature = normalized_signature
+        self._pending_runtime_status_message = normalized_message
+    def consume_runtime_status_message(self):
+        message = self._pending_runtime_status_message
+        self._pending_runtime_status_message = ""
+        return message
+    def _set_reconstruction_state(self, state, message=None, queue_status=False):
+        normalized_state = str(state or "unloaded").strip() or "unloaded"
+        normalized_message = str(message or "").strip()
+        self.recon_state = normalized_state
+        self.recon_state_message = normalized_message
+        if normalized_state == "ready":
+            self._last_runtime_status_signature = None
+        elif queue_status and normalized_message:
+            self._queue_runtime_status(f"recon:{normalized_state}", normalized_message)
     def set_hsv_thresholds(self, h_low=None, h_high=None, s_min=None, v_min=None):
         if h_low is not None:  self.h_low  = int(max(0, min(179, h_low)))
         if h_high is not None: self.h_high = int(max(0, min(179, h_high)))
@@ -375,6 +433,12 @@ class AnomalyDetector:
         self.contour_area_threshold = int(value)
     def set_threshold(self, value):
         self.mse_threshold = float(value)
+    def set_hue_tolerance(self, value):
+        try:
+            tolerance = int(value)
+        except (TypeError, ValueError):
+            return
+        self.hue_tolerance = max(0, min(20, tolerance))
     def set_yolo_confidence(self, value):
         try:
             conf = float(value)
@@ -451,23 +515,33 @@ class AnomalyDetector:
         if model_path and model_path.endswith('.pth'):
             self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
             self._torch_device = torch.device(self.device)
+            self.model = None
             try:
                 device = self._torch_device
                 try:
-                    self.model = torch.load(model_path, map_location=device, weights_only=True)
+                    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
                 except TypeError:
-                    self.model = torch.load(model_path, map_location=device)
-                if isinstance(self.model, dict):
-                    print("Loaded a state_dict. No model class available -> using dummy recon path.")
-                    self.model = "loaded"
+                    checkpoint = torch.load(model_path, map_location=device)
+                if isinstance(checkpoint, dict):
+                    state_dict = checkpoint.get('state_dict', checkpoint)
+                    model = Autoencoder().to(device)
+                    model.load_state_dict(state_dict)
+                    model.eval()
+                    self.model = model
+                    self._set_reconstruction_state("ready", "Reconstruction model ready.")
+                    print(f"Reconstruction state_dict loaded into Autoencoder: {model_path}")
                 else:
+                    self.model = checkpoint
                     if hasattr(self.model, 'to'): self.model.to(device)
                     if hasattr(self.model, 'eval'): self.model.eval()
+                    self._set_reconstruction_state("ready", "Reconstruction model ready.")
                 print(f"Model loaded: {model_path}")
             except Exception as e:
-                print(f"Model load failed: {e} -> using dummy recon")
-                self.model = "loaded"
-            return True
+                self.model = None
+                self._set_reconstruction_state("load_error", f"Reconstruction model load failed: {e}")
+                print(f"Model load failed: {e}")
+                return False
+            return self.model is not None
         return False
 
     def _contours_from_mask(self, mask):
@@ -608,31 +682,28 @@ class AnomalyDetector:
         if not self.primary_hue_enabled:
             return np.zeros(frame.shape[:2], dtype=np.uint8)
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        lower1 = np.array([self.h_low, self.s_min, self.v_min], dtype=np.uint8)
-        upper1 = np.array([self.h_high, 255, 255], dtype=np.uint8)
-        lower2 = np.array([max(self.h_low-5,0), self.s_min, self.v_min], dtype=np.uint8)
-        upper2 = np.array([min(self.h_high+5,179), 255, 255], dtype=np.uint8)
-        return cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
+        tolerance = self.hue_tolerance
+        lower = np.array([max(self.h_low - tolerance, 0), self.s_min, self.v_min], dtype=np.uint8)
+        upper = np.array([min(self.h_high + tolerance, 179), 255, 255], dtype=np.uint8)
+        return cv2.inRange(hsv, lower, upper)
 
     def _mask_color_secondary(self, frame):
         if not self.secondary_hue_enabled:
             return np.zeros(frame.shape[:2], dtype=np.uint8)
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        lower1 = np.array([self.h2_low, self.s2_min, self.v2_min], dtype=np.uint8)
-        upper1 = np.array([self.h2_high, 255, 255], dtype=np.uint8)
-        lower2 = np.array([max(self.h2_low-5,0), self.s2_min, self.v2_min], dtype=np.uint8)
-        upper2 = np.array([min(self.h2_high+5,179), 255, 255], dtype=np.uint8)
-        return cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
+        tolerance = self.hue_tolerance
+        lower = np.array([max(self.h2_low - tolerance, 0), self.s2_min, self.v2_min], dtype=np.uint8)
+        upper = np.array([min(self.h2_high + tolerance, 179), 255, 255], dtype=np.uint8)
+        return cv2.inRange(hsv, lower, upper)
 
     def _mask_color_tertiary(self, frame):
         if not self.tertiary_hue_enabled:
             return np.zeros(frame.shape[:2], dtype=np.uint8)
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        lower1 = np.array([self.h3_low, self.s3_min, self.v3_min], dtype=np.uint8)
-        upper1 = np.array([self.h3_high, 255, 255], dtype=np.uint8)
-        lower2 = np.array([max(self.h3_low-5,0), self.s3_min, self.v3_min], dtype=np.uint8)
-        upper2 = np.array([min(self.h3_high+5,179), 255, 255], dtype=np.uint8)
-        return cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
+        tolerance = self.hue_tolerance
+        lower = np.array([max(self.h3_low - tolerance, 0), self.s3_min, self.v3_min], dtype=np.uint8)
+        upper = np.array([min(self.h3_high + tolerance, 179), 255, 255], dtype=np.uint8)
+        return cv2.inRange(hsv, lower, upper)
 
     def _hsv_from_bgr_torch(self, frame):
         if self._torch_device.type != 'cuda' or not torch.cuda.is_available():
@@ -679,20 +750,23 @@ class AnomalyDetector:
         h_high = int(max(0, min(179, h_high)))
         if h_low > h_high:
             h_low, h_high = h_high, h_low
-        low2 = max(h_low - 5, 0)
-        high2 = min(h_high + 5, 179)
-        mask1 = (h >= h_low) & (h <= h_high) & (s >= s_min) & (v >= v_min)
-        mask2 = (h >= low2) & (h <= high2) & (s >= s_min) & (v >= v_min)
-        mask = (mask1 | mask2).to(torch.uint8) * 255
+        tolerance = self.hue_tolerance
+        hue_low = max(h_low - tolerance, 0)
+        hue_high = min(h_high + tolerance, 179)
+        mask = ((h >= hue_low) & (h <= hue_high) & (s >= s_min) & (v >= v_min)).to(torch.uint8) * 255
         return mask.detach().cpu().numpy()
 
-    def _tensor_to_bgr(self, tensor):
+    def _tensor_to_gray_uint8(self, tensor):
         tensor = tensor.detach()
         if tensor.dim() == 3:
             tensor = tensor.unsqueeze(0)
         tensor = tensor.squeeze(0).clamp(0.0, 1.0).cpu()
-        array = tensor.mul(255.0).clamp(0.0, 255.0).to(torch.uint8).permute(1, 2, 0).numpy()
-        return cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+        if tensor.dim() == 3:
+            if tensor.shape[0] == 1:
+                tensor = tensor.squeeze(0)
+            else:
+                tensor = tensor.mean(dim=0)
+        return tensor.mul(255.0).clamp(0.0, 255.0).to(torch.uint8).numpy()
 
     def _prepare_model_output_tensor(self, output):
         tensor = None
@@ -713,64 +787,74 @@ class AnomalyDetector:
             tensor = tensor.unsqueeze(0)
         return tensor.to(self._torch_device).float()
 
-    def _gpu_mask_from_tensors(self, original_tensor, recon_tensor):
-        orig_gray = F.rgb_to_grayscale(original_tensor)
-        recon_gray = F.rgb_to_grayscale(recon_tensor)
+    def _gpu_mask_from_tensors(self, original_tensor, recon_tensor, output_size=None):
+        orig_gray = original_tensor if original_tensor.shape[1] == 1 else F.rgb_to_grayscale(original_tensor)
+        recon_gray = recon_tensor if recon_tensor.shape[1] == 1 else F.rgb_to_grayscale(recon_tensor)
         diff_scaled = torch.abs(orig_gray - recon_gray) * 255.0
         mask = (diff_scaled >= float(self.cv_threshold)).float()
-        diff_uint8 = diff_scaled.clamp(0.0, 255.0).to(torch.uint8)
-        diff_sq = torch.mul(diff_uint8, diff_uint8)
-        mse = float(diff_sq.float().mean().item())
+        mse = float((torch.square(diff_scaled).mean() / (255.0 * 255.0)).item())
         kernel = 11
         pad = kernel // 2
         dilated = F_torch.max_pool2d(mask, kernel_size=kernel, stride=1, padding=pad)
         eroded = -F_torch.max_pool2d(-dilated, kernel_size=kernel, stride=1, padding=pad)
         mask_uint8 = eroded.squeeze(0).squeeze(0).clamp(0.0, 1.0).mul(255.0).to(torch.uint8).cpu().numpy()
+        if output_size and mask_uint8.shape[::-1] != output_size:
+            mask_uint8 = cv2.resize(mask_uint8, output_size, interpolation=cv2.INTER_NEAREST)
         return mask_uint8, mse
 
-    def _mask_recon_or_dummy(self, frame, is_first_frame=False):
+    def _mask_reconstruction(self, frame, is_first_frame=False):
         use_gpu_post = self._torch_device.type == 'cuda' and torch.cuda.is_available()
-        reconstructed = None
-        try:
-            if self.model is not None and self.model != "loaded" and callable(self.model):
-                with torch.no_grad():
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    inp = F.to_tensor(rgb).unsqueeze(0).to(self._torch_device, non_blocking=use_gpu_post)
-                    if hasattr(self.model, 'eval'):
-                        self.model.eval()
-
-                    if self.first_inference:  # <--- LOGGING
-                        print(f"[LOG {time.time():.2f}]   - Performing FIRST model inference (model warm-up)...")
-                        start_infer_time = time.time()
-
-                    rec = self.model(inp)
-                    rec_tensor = self._prepare_model_output_tensor(rec).clamp(0.0, 1.0)
-
-                    if self.first_inference:  # <--- LOGGING
-                        end_infer_time = time.time()
-                        print(f"[LOG {end_infer_time:.2f}]   - FIRST model inference took {end_infer_time - start_infer_time:.4f} seconds.")
-                        self.first_inference = False
-
-                    if use_gpu_post and inp.is_cuda:
-                        return self._gpu_mask_from_tensors(inp, rec_tensor)
-
-                    reconstructed = self._tensor_to_bgr(rec_tensor)
+        if not self.has_reconstruction_model():
+            if self.recon_state in ("inference_error", "load_error") and self.recon_state_message:
+                self._queue_runtime_status(f"recon:{self.recon_state}", self.recon_state_message)
             else:
-                reconstructed = cv2.GaussianBlur(frame, (7,7), 0)
+                self._set_reconstruction_state(
+                    "unavailable",
+                    "Reconstruction model unavailable; recon-based detection is disabled.",
+                    queue_status=True,
+                )
+            return None, 0.0
+        try:
+            with torch.no_grad():
+                source_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                model_gray = cv2.resize(source_gray, self.recon_input_size, interpolation=cv2.INTER_AREA)
+                inp = torch.from_numpy(model_gray).unsqueeze(0).unsqueeze(0)
+                inp = inp.to(self._torch_device, non_blocking=use_gpu_post).float().div(255.0)
+                if hasattr(self.model, 'eval'):
+                    self.model.eval()
+
+                if self.first_inference:  # <--- LOGGING
+                    print(f"[LOG {time.time():.2f}]   - Performing FIRST model inference (model warm-up)...")
+                    start_infer_time = time.time()
+
+                rec = self.model(inp)
+                rec_tensor = self._prepare_model_output_tensor(rec).clamp(0.0, 1.0)
+
+                if self.first_inference:  # <--- LOGGING
+                    end_infer_time = time.time()
+                    print(f"[LOG {end_infer_time:.2f}]   - FIRST model inference took {end_infer_time - start_infer_time:.4f} seconds.")
+                    self.first_inference = False
+
+                if use_gpu_post and inp.is_cuda:
+                    return self._gpu_mask_from_tensors(
+                        inp,
+                        rec_tensor,
+                        output_size=(frame.shape[1], frame.shape[0]),
+                    )
+
+                reconstructed_gray = self._tensor_to_gray_uint8(rec_tensor)
+                diff = cv2.absdiff(model_gray, reconstructed_gray)
+                _, mask = cv2.threshold(diff, self.cv_threshold, 255, cv2.THRESH_BINARY)
+                kernel = np.ones((11,11), np.uint8)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+                mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+                mse = float(np.square(diff.astype(np.float32)).mean() / (255.0 * 255.0))
+                return mask, mse
         except Exception as e:
-            print(f"Inference error: {e} -> fallback to dummy")
-            reconstructed = cv2.GaussianBlur(frame, (7,7), 0)
-
-        if reconstructed is None:
-            reconstructed = cv2.GaussianBlur(frame, (7,7), 0)
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray_rec = cv2.cvtColor(reconstructed, cv2.COLOR_BGR2GRAY)
-        diff = cv2.absdiff(gray, gray_rec)
-        _, mask = cv2.threshold(diff, self.cv_threshold, 255, cv2.THRESH_BINARY)
-        kernel = np.ones((11,11), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-        return mask, float((np.square(diff)).mean())
+            message = f"Reconstruction inference failed: {e}"
+            self._set_reconstruction_state("inference_error", message, queue_status=True)
+            print(message)
+            return None, 0.0
 
     def process_frame(self, frame, is_first_frame=False):
         self.last_detection_sources = []
@@ -822,20 +906,35 @@ class AnomalyDetector:
             return self._apply_yolo_results(frame, out, mse, is_anom, all_contours)
 
         if self.mode == 'recon':
-            mask, mse = self._mask_recon_or_dummy(frame, is_first_frame)
+            mask, mse = self._mask_reconstruction(frame, is_first_frame)
+            if mask is None:
+                out = frame.copy()
+                cv2.putText(out, 'Recon unavailable', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 3)
+                return self._apply_yolo_results(frame, out, mse, False, [])
             contours = self._contours_from_mask(mask)
             out = frame.copy()
-            for c in contours:
+            recon_mse_passed = mse >= self.mse_threshold
+            active_contours = contours if recon_mse_passed else []
+            for c in active_contours:
                 x,y,w,h = cv2.boundingRect(c)
                 cv2.rectangle(out, (x,y), (x+w, y+h), (0,0,255), 2)
-            is_anom = len(contours) > 0
+            is_anom = bool(active_contours)
             if is_anom:
                 self.last_detection_sources.append("Model")
                 cv2.putText(out, 'Anomaly (Recon)', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
-            return self._apply_yolo_results(frame, out, mse, is_anom, contours)
+            return self._apply_yolo_results(frame, out, mse, is_anom, active_contours)
 
         # HYBRID OR
-        mask_recon, mse = self._mask_recon_or_dummy(frame, is_first_frame)
+        mask_recon, mse = self._mask_reconstruction(frame, is_first_frame)
+        recon_available = mask_recon is not None
+        if not recon_available:
+            if self.recon_state == "unavailable":
+                self._queue_runtime_status(
+                    "hybrid:color-only",
+                    "Hybrid is running in color-only mode because the reconstruction model is unavailable.",
+                )
+            mask_recon = np.zeros(frame.shape[:2], dtype=np.uint8)
+            mse = 0.0
         hsv_gpu = self._hsv_from_bgr_torch(frame)
         if hsv_gpu is not None:
             mask_color_primary = self._mask_from_hsv_torch(
@@ -858,11 +957,13 @@ class AnomalyDetector:
             mask_color_secondary = self._mask_color_secondary(frame)
             mask_color_tertiary = self._mask_color_tertiary(frame)
         contours_recon = self._contours_from_mask(mask_recon)
+        recon_mse_passed = recon_available and mse >= self.mse_threshold
+        active_recon_contours = contours_recon if recon_mse_passed else []
         contours_color_primary = self._contours_from_mask(mask_color_primary)
         contours_color_secondary = self._contours_from_mask(mask_color_secondary)
         contours_color_tertiary = self._contours_from_mask(mask_color_tertiary)
         out = frame.copy()
-        for c in contours_recon:
+        for c in active_recon_contours:
             x,y,w,h = cv2.boundingRect(c)
             cv2.rectangle(out, (x,y), (x+w,y+h), (0,0,255), 2)
         for c in contours_color_primary:
@@ -874,14 +975,17 @@ class AnomalyDetector:
         for c in contours_color_tertiary:
             x,y,w,h = cv2.boundingRect(c)
             cv2.rectangle(out, (x,y), (x+w,y+h), (255,0,0), 2)
-        all_contours = contours_recon + contours_color_primary + contours_color_secondary + contours_color_tertiary
+        all_contours = active_recon_contours + contours_color_primary + contours_color_secondary + contours_color_tertiary
         is_anom = len(all_contours) > 0
         if is_anom:
-            if len(contours_recon) > 0:
+            if len(active_recon_contours) > 0:
                 self.last_detection_sources.append("Model")
             if len(contours_color_primary) > 0 or len(contours_color_secondary) > 0 or len(contours_color_tertiary) > 0:
                 self.last_detection_sources.append("Color")
-            cv2.putText(out, 'HYBRID: Color OR Recon', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255,255,255), 3)
+            status_text = 'HYBRID: Color OR Recon' if recon_available else 'HYBRID: Color only'
+            cv2.putText(out, status_text, (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255,255,255), 3)
+        elif not recon_available:
+            cv2.putText(out, 'HYBRID: Color only', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,255), 3)
         mask_mean_component = (mask_color_primary.mean() + mask_color_secondary.mean() + mask_color_tertiary.mean())/(3*255.0)
         mse_hybrid = 0.5*mse + 0.5*mask_mean_component
         return self._apply_yolo_results(frame, out, float(mse_hybrid), is_anom, all_contours)
@@ -1335,10 +1439,20 @@ class DetectionWorker(QObject):
 
     @pyqtSlot(np.ndarray)
     def process_frame(self, cv_img):
-        if self.is_busy: return
+        if self.is_busy:
+            return
         self.is_busy = True
-        if self._service_breaker_fired:
+        try:
+            self._process_frame_impl(cv_img)
+        except Exception as err:
+            message = f"Frame processing error: {err}"
+            print(f"[WARN {time.time():.2f}] {message}")
+            self.status_update.emit(message)
+        finally:
             self.is_busy = False
+
+    def _process_frame_impl(self, cv_img):
+        if self._service_breaker_fired:
             return
 
         self._profile_frame_counter += 1
@@ -1352,6 +1466,9 @@ class DetectionWorker(QObject):
         detect_start = time.perf_counter()
         processed_frame, mse, is_anomaly_present, contours = self.detector.process_frame(cv_img, is_first_frame)
         detect_ms = (time.perf_counter() - detect_start) * 1000.0
+        runtime_status = self.detector.consume_runtime_status_message()
+        if runtime_status:
+            self.status_update.emit(runtime_status)
 
         now_ts = time.time()
         yolo_labels = list(getattr(self.detector, 'last_yolo_detections', []))
@@ -1506,7 +1623,6 @@ class DetectionWorker(QObject):
             self.send_arduino_feed_off()
             self._play_service_breaker_alarm()
             self.service_breaker_triggered.emit(trip_path or "")
-            self.is_busy = False
             return
 
         can_random_save = (
@@ -1553,7 +1669,6 @@ class DetectionWorker(QObject):
             )
 
         self.result_ready.emit(processed_frame, original_frame, mse, is_anomaly, self.anomaly_count)
-        self.is_busy = False
 
     def preview_detection(self, cv_img):
         original_frame = cv_img.copy()
@@ -2231,7 +2346,7 @@ class MainWindow(QMainWindow):
         # thresholds
         thr = QHBoxLayout(); thr.addWidget(QLabel('MSE Threshold:'))
         self.thresh_slider = QSlider(Qt.Orientation.Horizontal); self.thresh_slider.setRange(1,1000); self.thresh_slider.setValue(10); self.thresh_slider.valueChanged.connect(self._update_mse_threshold)
-        self.thresh_label = QLabel(f"{self.thresh_slider.value()/1000:.3f}")
+        self.thresh_label = QLabel(f"{self.thresh_slider.value()/10000:.4f}")
         thr.addWidget(self.thresh_slider); thr.addWidget(self.thresh_label)
         cvthr = QHBoxLayout(); cvthr.addWidget(QLabel('CV Threshold:'))
         self.cv_thresh_slider = QSlider(Qt.Orientation.Horizontal); self.cv_thresh_slider.setRange(5,200); self.cv_thresh_slider.setValue(40); self.cv_thresh_slider.valueChanged.connect(self._update_cv_threshold)
@@ -2504,6 +2619,19 @@ class MainWindow(QMainWindow):
             'hsv3_summary_label'
         )
         right.addWidget(hue3_group)
+
+        tolerance_row = QHBoxLayout()
+        tolerance_row.addWidget(QLabel('Hue Tolerance:'))
+        self.hue_tolerance_slider = QSlider(Qt.Orientation.Horizontal)
+        self.hue_tolerance_slider.setRange(0, 20)
+        self.hue_tolerance_slider.setValue(5)
+        self.hue_tolerance_slider.setToolTip('Expands each hue range on both sides; 5 matches the previous behavior.')
+        self.hue_tolerance_slider.valueChanged.connect(self._update_hue_tolerance)
+        self.hue_tolerance_label = QLabel(str(self.hue_tolerance_slider.value()))
+        self.hue_tolerance_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        tolerance_row.addWidget(self.hue_tolerance_slider, 1)
+        tolerance_row.addWidget(self.hue_tolerance_label)
+        right.addLayout(tolerance_row)
 
         right.addSpacing(6)
 
@@ -3010,7 +3138,8 @@ class MainWindow(QMainWindow):
         return f'{value} ({hint})'
 
     def _update_mse_threshold(self, value):
-        self.thresh_label.setText(f"{value/1000:.3f}"); self.detector.set_threshold(value/1000.0); self._reprocess_image()
+        threshold = value / 10000.0
+        self.thresh_label.setText(f"{threshold:.4f}"); self.detector.set_threshold(threshold); self._reprocess_image()
     def _update_cv_threshold(self, value):
         self.cv_thresh_label.setText(str(value)); self.detector.set_cv_threshold(value); self._reprocess_image()
     def _update_exposure(self, value):
@@ -3029,6 +3158,12 @@ class MainWindow(QMainWindow):
         conf = max(1, min(99, int(value))) / 100.0
         self.yolo_conf_label.setText(f"{conf:.2f}")
         self.detector.set_yolo_confidence(conf)
+        self._reprocess_image()
+    def _update_hue_tolerance(self, value):
+        tolerance = max(0, min(20, int(value)))
+        self.hue_tolerance_label.setText(str(tolerance))
+        self.detector.set_hue_tolerance(tolerance)
+        self._update_hsv_summary()
         self._reprocess_image()
     def _update_yolo_class_filter(self, text):
         self.detector.set_yolo_class_filter(text or "")
@@ -3114,7 +3249,8 @@ class MainWindow(QMainWindow):
                   self.h2_low_slider, self.h2_high_slider, self.s2_min_slider, self.v2_min_slider,
                   self.h2_low_label, self.h2_high_label, self.s2_min_label, self.v2_min_label,
                   self.h3_low_slider, self.h3_high_slider, self.s3_min_slider, self.v3_min_slider,
-                  self.h3_low_label, self.h3_high_label, self.s3_min_label, self.v3_min_label]:
+                  self.h3_low_label, self.h3_high_label, self.s3_min_label, self.v3_min_label,
+                  self.hue_tolerance_slider, self.hue_tolerance_label]:
             w.setEnabled(enabled)
         if hasattr(self, 'hue1_enable_check'):
             self.hue1_enable_check.setEnabled(enabled)
@@ -3136,6 +3272,11 @@ class MainWindow(QMainWindow):
         self._update_hsv_summary()
         if idx in (1,2):
             self.start_btn.setDisabled(False); self.test_image_btn.setDisabled(False)
+            if idx == 2 and not self.detector.has_reconstruction_model():
+                self.status_bar.showMessage(
+                    'Hybrid selected without a reconstruction model; detection will run in color-only mode.',
+                    5000,
+                )
         elif idx == 3:
             has_yolo = bool(self.yolo_model_path_edit.text())
             if has_yolo and hasattr(self, 'yolo_enable_check') and not self.yolo_enable_check.isChecked():
@@ -3239,7 +3380,10 @@ class MainWindow(QMainWindow):
         else:
             h_low = self.h_low_slider.value(); h_high = self.h_high_slider.value()
             s_min = self.s_min_slider.value(); v_min = self.v_min_slider.value()
-            self.hsv_summary_label.setText(f'H {h_low}-{h_high} | S >= {s_min} | V >= {v_min}')
+            tolerance = self.detector.hue_tolerance
+            effective_low = max(0, h_low - tolerance)
+            effective_high = min(179, h_high + tolerance)
+            self.hsv_summary_label.setText(f'H {effective_low}-{effective_high} (Tol {tolerance}) | S >= {s_min} | V >= {v_min}')
             hue_mid = max(0, min(179, (h_low + h_high) // 2))
             sat_preview = max(s_min, min(255, s_min + (255 - s_min) // 2))
             val_preview = max(v_min, min(255, v_min + (255 - v_min) // 2))
@@ -3264,7 +3408,10 @@ class MainWindow(QMainWindow):
             return
         h_low = self.h2_low_slider.value(); h_high = self.h2_high_slider.value()
         s_min = self.s2_min_slider.value(); v_min = self.v2_min_slider.value()
-        self.hsv2_summary_label.setText(f'H {h_low}-{h_high} | S >= {s_min} | V >= {v_min}')
+        tolerance = self.detector.hue_tolerance
+        effective_low = max(0, h_low - tolerance)
+        effective_high = min(179, h_high + tolerance)
+        self.hsv2_summary_label.setText(f'H {effective_low}-{effective_high} (Tol {tolerance}) | S >= {s_min} | V >= {v_min}')
         hue_mid = max(0, min(179, (h_low + h_high) // 2))
         sat_preview = max(s_min, min(255, s_min + (255 - s_min) // 2))
         val_preview = max(v_min, min(255, v_min + (255 - v_min) // 2))
@@ -3287,7 +3434,10 @@ class MainWindow(QMainWindow):
             return
         h_low = self.h3_low_slider.value(); h_high = self.h3_high_slider.value()
         s_min = self.s3_min_slider.value(); v_min = self.v3_min_slider.value()
-        self.hsv3_summary_label.setText(f'H {h_low}-{h_high} | S >= {s_min} | V >= {v_min}')
+        tolerance = self.detector.hue_tolerance
+        effective_low = max(0, h_low - tolerance)
+        effective_high = min(179, h_high + tolerance)
+        self.hsv3_summary_label.setText(f'H {effective_low}-{effective_high} (Tol {tolerance}) | S >= {s_min} | V >= {v_min}')
         hue_mid = max(0, min(179, (h_low + h_high) // 2))
         sat_preview = max(s_min, min(255, s_min + (255 - s_min) // 2))
         val_preview = max(v_min, min(255, v_min + (255 - v_min) // 2))
@@ -3773,6 +3923,9 @@ class MainWindow(QMainWindow):
         else:
             processed_frame, mse, is_anomaly, contours = self.detector.process_frame(self.last_tested_image.copy())
             detection_count = len(contours) if contours else 0
+        runtime_status = self.detector.consume_runtime_status_message()
+        if runtime_status:
+            self.status_bar.showMessage(runtime_status, 5000)
         show_labels = getattr(self, 'show_video_labels', True)
         if detection_count > 0 and show_labels:
             h,w,_ = processed_frame.shape; text=f'Detections: {detection_count}'; (tw,_),_ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)
@@ -3912,6 +4065,7 @@ class MainWindow(QMainWindow):
         s.setValue('h3_high', self.h3_high_slider.value())
         s.setValue('s3_min', self.s3_min_slider.value())
         s.setValue('v3_min', self.v3_min_slider.value())
+        s.setValue('hue_tolerance', self.hue_tolerance_slider.value())
         s.setValue('beep_enabled', self.beep_check.isChecked())
         s.setValue('random_save', self.random_save_check.isChecked())
         s.setValue('hsv_target_lock', self.hsv_lock_check.isChecked())
@@ -4055,6 +4209,12 @@ class MainWindow(QMainWindow):
         self.s2_min_slider.setValue(s.value('s2_min',60,type=int)); self.v2_min_slider.setValue(s.value('v2_min',120,type=int))
         self.h3_low_slider.setValue(s.value('h3_low',105,type=int)); self.h3_high_slider.setValue(s.value('h3_high',125,type=int))
         self.s3_min_slider.setValue(s.value('s3_min',60,type=int)); self.v3_min_slider.setValue(s.value('v3_min',120,type=int))
+        hue_tolerance = max(0, min(20, s.value('hue_tolerance', 5, type=int)))
+        self.hue_tolerance_slider.blockSignals(True)
+        self.hue_tolerance_slider.setValue(hue_tolerance)
+        self.hue_tolerance_slider.blockSignals(False)
+        self.hue_tolerance_label.setText(str(hue_tolerance))
+        self.detector.set_hue_tolerance(hue_tolerance)
         self.h_low_label.setText(str(self.h_low_slider.value())); self.h_high_label.setText(str(self.h_high_slider.value()))
         self.s_min_label.setText(str(self.s_min_slider.value())); self.v_min_label.setText(str(self.v_min_slider.value()))
         self.h2_low_label.setText(str(self.h2_low_slider.value())); self.h2_high_label.setText(str(self.h2_high_slider.value()))

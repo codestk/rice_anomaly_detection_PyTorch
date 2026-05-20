@@ -1566,13 +1566,12 @@ class DetectionWorker(QObject):
                 self.stop_detection_requested.emit()
         if (
             self.arduino_enabled
+            and is_new_anomaly_found
             and servo_detection_active
             and self._arduino_last_signal != "trigger"
             and self._arduino_trigger_timer is None
         ):
             self._schedule_arduino_trigger()
-        elif not servo_detection_active and self._arduino_trigger_timer is not None:
-            self._cancel_arduino_trigger_timer()
         elif self.arduino_enabled and self.arduino_clear_enabled and not servo_detection_active:
             if self._arduino_last_signal == "trigger" and self._arduino_last_trigger_time > 0:
                 if now_ts - self._arduino_last_trigger_time >= self.arduino_clear_delay:
@@ -1804,7 +1803,7 @@ class DetectionWorker(QObject):
         if not self.service_breaker_enabled:
             self._reset_service_breaker_state()
 
-    def reset_counter(self):
+    def reset_counter(self, force_clear=False):
         self.anomaly_count = 0
         self.detection_summary = {}
         self.first_frame_processed = False
@@ -1819,7 +1818,7 @@ class DetectionWorker(QObject):
         if hasattr(self.detector, 'last_detection_sources'):
             self.detector.last_detection_sources = []
         self._cancel_arduino_trigger_timer()
-        if self.arduino_enabled and self.arduino_clear_enabled:
+        if self.arduino_enabled and (self.arduino_clear_enabled or force_clear):
             self._send_arduino_clear()
         self._stop_stop_feed_beep()
 
@@ -3670,7 +3669,7 @@ class MainWindow(QMainWindow):
         print(f"[LOG {time.time():.2f}] Detection runtime device: {runtime_device_message}")
         self.detection_elapsed_total = 0.0
         self.detection_timer_start = time.time()
-        self.frame_count = 0; self.start_time = time.time(); self.detection_worker.reset_counter()
+        self.frame_count = 0; self.start_time = time.time(); self.detection_worker.reset_counter(force_clear=True)
         res_text = self.res_combo.currentText()
         resolution = tuple(map(int, res_text.lower().split('x'))) if res_text != 'Source/Native' else None
         fps_text = self.fps_combo.currentText(); fps_limit = int(fps_text) if fps_text != 'Uncapped' else None
