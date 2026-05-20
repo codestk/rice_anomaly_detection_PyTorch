@@ -10,15 +10,11 @@ from datetime import datetime
 import numpy as np
 import torch
 import torch.nn.functional as F_torch
-from torchvision.transforms import functional as F
 import winsound # Import for beep sound
 import threading
 import subprocess
 
-try:
-    from ultralytics import YOLO as UltralyticsYOLO
-except ImportError:
-    UltralyticsYOLO = None
+UltralyticsYOLO = None
 
 try:
     import serial
@@ -54,6 +50,48 @@ QCheckBox::indicator:hover { border-color: #0078d7; }
 QCheckBox::indicator:checked { background-color: #0078d7; border: 1px solid #0078d7; }
 QStatusBar { background-color: #3c3c3c; font-size: 11pt; }
 """
+
+def _rgb_to_tensor(image):
+    """Convert an HWC RGB image to a CHW float tensor in [0, 1]."""
+    if image is None:
+        raise ValueError("image must not be None")
+    tensor = torch.from_numpy(np.ascontiguousarray(image))
+    if tensor.dim() != 3:
+        raise ValueError(f"Expected HWC image, got shape {tuple(tensor.shape)}")
+    if tensor.dtype == torch.uint8:
+        tensor = tensor.float().div(255.0)
+    else:
+        tensor = tensor.float()
+        if tensor.numel() > 0 and tensor.max().item() > 1.0:
+            tensor = tensor.div(255.0)
+    return tensor.permute(2, 0, 1).contiguous()
+
+
+def _rgb_to_grayscale(tensor):
+    """Convert RGB CHW/NCHW tensors to grayscale while keeping batch dims."""
+    if tensor.dim() == 3:
+        tensor = tensor.unsqueeze(0)
+    if tensor.dim() != 4:
+        raise ValueError(f"Expected CHW or NCHW tensor, got {tuple(tensor.shape)}")
+    if tensor.shape[1] == 1:
+        return tensor
+    if tensor.shape[1] != 3:
+        raise ValueError(f"Expected 1 or 3 channels, got {tensor.shape[1]}")
+    weights = tensor.new_tensor([0.2989, 0.5870, 0.1140]).view(1, 3, 1, 1)
+    return (tensor * weights).sum(dim=1, keepdim=True)
+
+
+def _get_ultralytics_yolo():
+    global UltralyticsYOLO
+    if UltralyticsYOLO is not None:
+        return UltralyticsYOLO
+    try:
+        from ultralytics import YOLO as _UltralyticsYOLO
+    except ImportError:
+        return None
+    UltralyticsYOLO = _UltralyticsYOLO
+    return UltralyticsYOLO
+
 
 def _fourcc_to_string(fourcc_value):
     """Convert numeric FOURCC to readable string."""
@@ -223,9 +261,9 @@ class ArduinoManager:
 #         backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
 #     else:
 #         backends = [cv2.CAP_ANY, cv2.CAP_MSMF, cv2.CAP_DSHOW]
-
+#
 #     fourcc_list = preferred_fourcc or [ "YUY2","MJPG",  "H264", None]
-
+#
 #     def _apply_settings(cap, fourcc_code):
 #         if fourcc_code:
 #             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc_code))
@@ -234,17 +272,20 @@ class ArduinoManager:
 #             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resolution[1])
 #         if fps:
 #             cap.set(cv2.CAP_PROP_FPS, fps)
+#
 #     for backend in backends:
 #         base_cap = cv2.VideoCapture(index, backend)
 #         if not base_cap.isOpened():
 #             base_cap.release()
 #             continue
+#
 #         for attempt, fourcc_code in enumerate(fourcc_list):
 #             if attempt > 0:
 #                 base_cap.release()
 #                 base_cap = cv2.VideoCapture(index, backend)
 #                 if not base_cap.isOpened():
 #                     break
+#
 #             _apply_settings(base_cap, fourcc_code)
 #             ok = True
 #             for _ in range(max(1, warmup_frames)):
@@ -258,9 +299,9 @@ class ArduinoManager:
 #                 else:
 #                     print(f"[LOG {time.time():.2f}] Camera {index}: using default FOURCC via backend {backend}.")
 #                 return base_cap
-
+#
 #         base_cap.release()
-
+#
 #     print(f"[LOG {time.time():.2f}] Unable to configure camera {index} with requested formats.")
 #     return None
 
@@ -425,11 +466,12 @@ class AnomalyDetector:
         if not model_path:
             self.yolo_enabled = False
             return False, 'No YOLO model selected.'
-        if UltralyticsYOLO is None:
+        yolo_cls = _get_ultralytics_yolo()
+        if yolo_cls is None:
             self.yolo_enabled = False
             return False, 'Ultralytics YOLO package is not installed.'
         try:
-            self.yolo_model = UltralyticsYOLO(model_path)
+            self.yolo_model = yolo_cls(model_path)
             self._yolo_names = getattr(self.yolo_model, 'names', {}) or {}
             device_hint = "unknown"
             try:
@@ -716,8 +758,8 @@ class AnomalyDetector:
         return tensor.to(self._torch_device).float()
 
     def _gpu_mask_from_tensors(self, original_tensor, recon_tensor):
-        orig_gray = F.rgb_to_grayscale(original_tensor)
-        recon_gray = F.rgb_to_grayscale(recon_tensor)
+        orig_gray = _rgb_to_grayscale(original_tensor)
+        recon_gray = _rgb_to_grayscale(recon_tensor)
         diff_scaled = torch.abs(orig_gray - recon_gray) * 255.0
         mask = (diff_scaled >= float(self.cv_threshold)).float()
         diff_uint8 = diff_scaled.clamp(0.0, 255.0).to(torch.uint8)
@@ -737,7 +779,7 @@ class AnomalyDetector:
             if self.model is not None and self.model != "loaded" and callable(self.model):
                 with torch.no_grad():
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    inp = F.to_tensor(rgb).unsqueeze(0).to(self._torch_device, non_blocking=use_gpu_post)
+                    inp = _rgb_to_tensor(rgb).unsqueeze(0).to(self._torch_device, non_blocking=use_gpu_post)
                     if hasattr(self.model, 'eval'):
                         self.model.eval()
 
@@ -1344,9 +1386,11 @@ class DetectionWorker(QObject):
         if not self.arduino_enabled:
             return
         delay = max(0.0, float(self.arduino_trigger_delay or 0.0))
-        self._cancel_arduino_trigger_timer()
         if delay <= 0.0:
             self._send_arduino_trigger()
+            return
+        existing_timer = self._arduino_trigger_timer
+        if existing_timer is not None and existing_timer.is_alive():
             return
         timer = threading.Timer(delay, self._delayed_arduino_trigger_fire)
         timer.daemon = True
@@ -1969,6 +2013,8 @@ class VideoWindow(QWidget):
 
 
 class MainWindow(QMainWindow):
+    detection_frame_ready = pyqtSignal(np.ndarray)
+
     # ... (ส่วน __init__ และอื่นๆ เหมือนเดิม) ...
     def __init__(self):
         super().__init__()
@@ -1993,6 +2039,8 @@ class MainWindow(QMainWindow):
         self.show_video_labels = True
         self.zoom_level = 1.0
         self.pan_offset = QPoint(0, 0)
+        self._pending_detection_frame = None
+        self._detection_frame_inflight = False
         self._detection_popup = None
         self._detection_popup_image_label = None
         self._detection_popup_path_label = None
@@ -2034,6 +2082,7 @@ class MainWindow(QMainWindow):
         self.detection_thread = QThread()
         self.detection_worker = DetectionWorker(self.detector)
         self.detection_worker.moveToThread(self.detection_thread)
+        self.detection_frame_ready.connect(self.detection_worker.process_frame)
         self.detection_worker.result_ready.connect(self.display_processed_frame)
         self.detection_worker.status_update.connect(lambda msg: self.status_bar.showMessage(msg, 3000))
         self.detection_worker.arduino_state_changed.connect(self._handle_servo_state_changed)
@@ -2057,6 +2106,35 @@ class MainWindow(QMainWindow):
         self._update_random_save_status(self.random_save_check.isChecked())
         self._push_arduino_config()
         self._handle_servo_state_changed(self.detection_worker._arduino_last_signal)
+
+    @pyqtSlot(np.ndarray)
+    def _queue_detection_frame(self, frame):
+        if not self.is_detection_running or self.is_paused:
+            return
+        if self._detection_frame_inflight:
+            self._pending_detection_frame = frame
+            return
+        self._dispatch_detection_frame(frame)
+
+    def _dispatch_detection_frame(self, frame):
+        if frame is None or not self.is_detection_running or self.is_paused:
+            self._pending_detection_frame = None
+            self._detection_frame_inflight = False
+            return
+        self._detection_frame_inflight = True
+        self.detection_frame_ready.emit(frame)
+
+    def _dispatch_latest_pending_detection_frame(self):
+        if not self.is_detection_running or self.is_paused:
+            self._pending_detection_frame = None
+            self._detection_frame_inflight = False
+            return
+        next_frame = self._pending_detection_frame
+        self._pending_detection_frame = None
+        if next_frame is None:
+            self._detection_frame_inflight = False
+            return
+        self._dispatch_detection_frame(next_frame)
 
     @pyqtSlot(str)
     def _handle_servo_state_changed(self, state):
@@ -2208,6 +2286,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'detection_worker'):
             self.detection_worker._play_service_breaker_alarm()
         self._pause_detection()
+        self._detection_frame_inflight = False
         if image_path:
             self._handle_stop_feed_detection_popup(image_path)
 
@@ -3559,6 +3638,8 @@ class MainWindow(QMainWindow):
         print(f"[LOG {time.time():.2f}] Detection runtime device: {runtime_device_message}")
         self.detection_elapsed_total = 0.0
         self.detection_timer_start = time.time()
+        self._pending_detection_frame = None
+        self._detection_frame_inflight = False
         self.frame_count = 0; self.start_time = time.time(); self.detection_worker.reset_counter()
         res_text = self.res_combo.currentText()
         resolution = tuple(map(int, res_text.lower().split('x'))) if res_text != 'Source/Native' else None
@@ -3580,7 +3661,7 @@ class MainWindow(QMainWindow):
             preferred_fourcc=preferred_fourcc,
             exposure_value=exposure_value
         )
-        self.video_thread.change_pixmap_signal.connect(self.detection_worker.process_frame)
+        self.video_thread.change_pixmap_signal.connect(self._queue_detection_frame)
         self.video_thread.fourcc_signal.connect(self._update_fourcc_label)
         
         print(f"[LOG {time.time():.2f}] Starting VideoThread...")
@@ -3598,6 +3679,7 @@ class MainWindow(QMainWindow):
             return
         if hasattr(self, 'video_thread') and self.video_thread.isRunning():
             self.video_thread.pause()
+        self._pending_detection_frame = None
         self.is_paused = True
         if self.detection_timer_start:
             self.detection_elapsed_total += time.time() - self.detection_timer_start
@@ -3612,6 +3694,7 @@ class MainWindow(QMainWindow):
             return
         if hasattr(self, 'detection_worker'):
             self.detection_worker.reset_service_breaker()
+        self._pending_detection_frame = None
         if hasattr(self, 'video_thread') and self.video_thread.isRunning():
             self.video_thread.resume()
         self.is_paused = False
@@ -3626,6 +3709,8 @@ class MainWindow(QMainWindow):
         if was_running and not self.is_paused and self.detection_timer_start:
             self.detection_elapsed_total += time.time() - self.detection_timer_start
             self.detection_timer_start = None
+        self._pending_detection_frame = None
+        self._detection_frame_inflight = False
         if hasattr(self,'video_thread') and self.video_thread.isRunning(): self.video_thread.stop()
         self.is_detection_running = False
         self.is_paused = False
@@ -3851,6 +3936,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(np.ndarray, np.ndarray, float, bool, int)
     def display_processed_frame(self, processed_frame, original_frame, mse, is_anomaly, anomaly_count):
+        self._dispatch_latest_pending_detection_frame()
         self.current_frame = original_frame
         self.frame_count += 1; elapsed = time.time() - self.start_time
         if elapsed > 1.0:

@@ -1,3 +1,9 @@
+<<<<<<< HEAD
+import torch
+
+print(torch.cuda.is_available())
+print(torch.cuda.get_device_name(0))
+=======
 import cv2
 import os
 
@@ -102,3 +108,4 @@ if __name__ == "__main__":
 #         print(f"{name} | sharpness={v:.2f}")
 
 #     print(f"\nTotal blurry: {len(blurry)}")
+>>>>>>> 52b1e18a5c32dc75886255b5c56dbdc23115dc1a

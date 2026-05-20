@@ -234,17 +234,20 @@ class ArduinoManager:
 #             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resolution[1])
 #         if fps:
 #             cap.set(cv2.CAP_PROP_FPS, fps)
+
 #     for backend in backends:
 #         base_cap = cv2.VideoCapture(index, backend)
 #         if not base_cap.isOpened():
 #             base_cap.release()
 #             continue
+
 #         for attempt, fourcc_code in enumerate(fourcc_list):
 #             if attempt > 0:
 #                 base_cap.release()
 #                 base_cap = cv2.VideoCapture(index, backend)
 #                 if not base_cap.isOpened():
 #                     break
+
 #             _apply_settings(base_cap, fourcc_code)
 #             ok = True
 #             for _ in range(max(1, warmup_frames)):
@@ -263,6 +266,7 @@ class ArduinoManager:
 
 #     print(f"[LOG {time.time():.2f}] Unable to configure camera {index} with requested formats.")
 #     return None
+
 
 
 class AnomalyDetector:
