@@ -3,3 +3,7 @@
 
 
  resolutions_sorted = ['Source/Native','2592x1944','2592x1440','2560x1440','2048x1536','2304x1296','1920x1080','1600x1200','1600x900','1280X960','1280x720','1024x768','960X720','1024x576','960x540','800x600','848x480','800x450','640x480','640x360']
+
+
+
+python.exe check_blurry_png.py "\\pc-max\D\docker\label-studio\media\upload\9" --threshold 100 --csv blur_report.csv
