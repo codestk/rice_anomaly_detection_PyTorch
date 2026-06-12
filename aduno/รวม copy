@@ -1,0 +1,143 @@
+#include <Servo.h>
+
+// --- ค่าคงที่จาก Code 1 (Servo) ---
+Servo gateServo;
+constexpr byte SERVO_PIN = 9;
+constexpr int DEFAULT_OPEN_ANGLE = 180;
+constexpr int DEFAULT_CLOSE_ANGLE = 0;
+
+// --- ค่าคงที่จาก Code 2 (Feeder) ---
+constexpr byte FEEDER_PIN = 7; // ใช้ขา 7 ในการควบคุม Feeder
+
+// --- ตัวแปร Global ---
+int openAngle = DEFAULT_OPEN_ANGLE;
+int closeAngle = DEFAULT_CLOSE_ANGLE;
+String incoming;
+
+// --- ฟังก์ชันจาก Code 1 (Servo) ---
+
+void moveServo(int angle) {
+  angle = constrain(angle, 0, 180);
+  gateServo.write(angle);
+}
+
+void sendAck(const char *label, int angle) {
+  Serial.print("Servo -> ");
+  Serial.print(label);
+  Serial.print(" @ ");
+  Serial.println(angle);
+}
+
+void commandOpen(int angle) {
+  moveServo(angle);
+  sendAck("OPEN", angle);
+}
+
+void commandClose(int angle) {
+  moveServo(angle);
+  sendAck("CLOSE", angle);
+}
+
+bool tryParseAngle(const String &token, int &angleOut) {
+  if (token.length() == 0) return false;
+  char c0 = token[0];
+  if ((c0 < '0' || c0 > '9') && c0 != '+' && c0 != '-') return false;
+  angleOut = constrain(token.toInt(), 0, 180);
+  return true;
+}
+
+// --- ฟังก์ชันใหม่สำหรับควบคุม Feeder (จาก Code 2) ---
+
+void commandFeedOn() {
+  digitalWrite(FEEDER_PIN, LOW); // LOW = RUN (ตามคู่มือ)
+  Serial.println("Feeder -> RUNNING (LOW)");
+}
+
+void commandFeedOff() {
+  digitalWrite(FEEDER_PIN, HIGH); // HIGH = STOP (ตามคู่มือ)
+  Serial.println("Feeder -> STOPPED (HIGH)");
+}
+
+
+// --- ฟังก์ชันจัดการคำสั่งที่รวมแล้ว ---
+
+void handleCommand(const String &cmdRaw) {
+  if (cmdRaw.length() == 0) return;
+
+  String cmd = cmdRaw;
+  cmd.trim();
+
+  int spacePos = cmd.indexOf(' ');
+  String verb = spacePos == -1 ? cmd : cmd.substring(0, spacePos);
+  String arg = spacePos == -1 ? "" : cmd.substring(spacePos + 1);
+  arg.trim();
+
+  String verbUpper = verb;
+  verbUpper.toUpperCase();
+
+  int angle = 0;
+  bool hasAngle = tryParseAngle(arg, angle);
+
+  // --- ส่วนจัดการคำสั่ง Servo (จาก Code 1) ---
+  if (verbUpper == "1" || verbUpper == "OPEN") {
+    commandOpen(hasAngle ? angle : openAngle);
+  } else if (verbUpper == "0" || verbUpper == "CLOSE") {
+    commandClose(hasAngle ? angle : closeAngle);
+  } else if (verbUpper == "SETOPEN" && hasAngle) {
+    openAngle = angle;
+    Serial.print("Servo open angle stored: ");
+    Serial.println(openAngle);
+  } else if (verbUpper == "SETCLOSE" && hasAngle) {
+    closeAngle = angle;
+    Serial.print("Servo close angle stored: ");
+    Serial.println(closeAngle);
+    
+  // --- ส่วนจัดการคำสั่ง Feeder (ใหม่) ---
+  } else if (verbUpper == "FEEDON" || verbUpper == "FEED") {
+    commandFeedOn();
+  } else if (verbUpper == "FEEDOFF" || verbUpper == "STOPFEED") {
+    commandFeedOff();
+
+  // --- ส่วนจัดการคำสั่ง Servo (ต่อ) ---
+  } else if (tryParseAngle(cmd, angle)) {
+    moveServo(angle);
+    sendAck("MOVE", angle);
+  } else {
+    Serial.print("Unknown cmd: ");
+    Serial.println(cmd);
+  }
+}
+
+// --- ฟังก์ชัน setup() ที่รวมแล้ว ---
+
+void setup() {
+  // ตั้งค่า Servo (จาก Code 1)
+  gateServo.attach(SERVO_PIN);
+  moveServo(DEFAULT_CLOSE_ANGLE); // เริ่มต้นให้ Servo ปิด
+
+  // ตั้งค่า Feeder (จาก Code 2)
+  pinMode(FEEDER_PIN, OUTPUT);
+  digitalWrite(FEEDER_PIN, HIGH); // เริ่มต้นให้ Feeder หยุด (HIGH = STOP)
+
+  // ตั้งค่า Serial (ใช้ร่วมกัน)
+  Serial.begin(9600);
+  Serial.setTimeout(100);
+  
+  Serial.println("Servo controller ready.");
+  Serial.println("Feeder ready (STOPPED).");
+  Serial.println("--- Combined Controller Ready ---");
+}
+
+// --- ฟังก์ชัน loop() (จาก Code 1) ---
+
+void loop() {
+  // ตรวจสอบคำสั่งใหม่จาก Serial
+  if (Serial.available()) {
+    incoming = Serial.readStringUntil('\n');
+    incoming.trim();
+    handleCommand(incoming);
+  }
+  
+  // ลบ loop ทดสอบที่ใช้ delay() จาก Code 2 ออก
+  // เพื่อให้โปรแกรมตอบสนองต่อคำสั่ง Serial ตลอดเวลา
+}
