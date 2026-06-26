@@ -1,5 +1,23 @@
 แกหแกห
 
+## 2026-06-23
+
+- Updated `onefileV13.py` Arduino controls to add fan ON/OFF buttons for the fan relay on Arduino pin 8.
+- Added `DetectionWorker.send_arduino_fan_on()` and `send_arduino_fan_off()` methods that send `FANON` and `FANOFF` over the existing Arduino serial connection.
+- Added `Fan ON (Pin 8)` and `Fan OFF` buttons next to the feeder controls, with enabled/disabled state tied to Arduino connection status.
+- Updated `aduno/รวม  พัดลม v13` so plain `FANON` keeps the fan on until `FANOFF`, while `FAN` and `FANON <milliseconds>` still support timed fan runs.
+- Verified syntax with `python3 -m py_compile onefileV13.py`.
+
+## 2026-06-23
+
+- Updated Arduino sketch `aduno/รวม  พัดลม` to add fan control on Arduino pin 8.
+- Added serial commands:
+  - `FAN` or `FANON [milliseconds]` turns the fan on and auto-stops after the configured delay.
+  - `FANOFF` or `STOPFAN` turns the fan off immediately.
+  - `SETFANDELAY <milliseconds>` changes the default fan delay, initially 5000 ms.
+- Implemented the fan auto-stop with `millis()` timing instead of blocking `delay()` so servo and feeder serial commands remain responsive.
+- Note: fan pin uses LOW = ON and HIGH = OFF, matching the feeder relay behavior in the existing sketch.
+
 ## 2026-06-12
 
 - Investigated servo misfires when 2-3 anomalies are detected close together in `onefileV12.py`.
