@@ -1,5 +1,12 @@
 แกหแกห
 
+## 2026-06-29
+
+- Updated `onefileV14.py` danger-class pause/resume behavior.
+- Added `DetectionWorker.reset_danger_alarm()` to re-arm dangerous YOLO class handling.
+- `_resume_detection()` now resets both service breaker and danger alarm state so pressing Resume can pause/break detection again if a dangerous class is detected.
+- Issue fixed: after the first danger-class pause, `_danger_alarm_active` stayed true across Resume and blocked later `dangerous_detection_triggered` signals until Stop/Start reset the worker counters.
+
 ## 2026-06-23
 
 - Updated `onefileV13.py` Arduino controls to add fan ON/OFF buttons for the fan relay on Arduino pin 8.
