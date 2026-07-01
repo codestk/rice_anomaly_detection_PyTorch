@@ -2084,6 +2084,28 @@ class VideoWindow(QWidget):
         layout.addWidget(self.video_label)
 
 
+class MonitorWindow(QWidget):
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+        self.setWindowTitle('Monitor Live View')
+        self.resize(640, 480)
+        self.setStyleSheet('background-color:#000;')
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.video_label = QLabel("Press 'Start Monitor' to begin")
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.video_label.setStyleSheet('background-color:#000; color:#f0f0f0;')
+        layout.addWidget(self.video_label)
+
+    def closeEvent(self, event):
+        if self.main_window is not None:
+            self.main_window._stop_monitor(notify=False)
+        event.accept()
+
+
 class MainWindow(QMainWindow):
     # ... (ส่วน __init__ และอื่นๆ เหมือนเดิม) ...
     def __init__(self):
@@ -2128,6 +2150,13 @@ class MainWindow(QMainWindow):
         self.hsv_target_locked = False
         self.center_marker_enabled = True
         self.video_window = VideoWindow(self)
+        self.monitor_window = MonitorWindow(self)
+        self.monitor_video_thread = None
+        self.is_monitor_running = False
+        self.monitor_resolution = (1280, 720)
+        self.monitor_fps_limit = 30
+        self.monitor_exposure_value = 0
+        self.monitor_preferred_fourcc = 'MJPG'
         self.video_window.video_label.clicked.connect(self._handle_video_click)
         self.video_window.video_label.wheel.connect(self._handle_zoom)
         self.video_window.video_label.pan.connect(self._handle_pan)
@@ -2567,6 +2596,22 @@ class MainWindow(QMainWindow):
         cr.addWidget(QLabel('Resolution:'))
         self.res_combo = QComboBox(); self.resolution_options = ['Source/Native','2592x1944','2592x1440','2560x1440','2048x1536','2304x1296','1920x1080','1600x1200','1600x900','1280X960','1280x720','1024x768','960X720','1024x576','960x540','800x600','848x480','800x450','640x480','640x360']; self.res_combo.addItems(self.resolution_options); cr.addWidget(self.res_combo)
         left.addLayout(cr)
+        monitor_row = QHBoxLayout()
+        monitor_row.addWidget(QLabel('Monitor Camera:'))
+        self.monitor_cam_combo = QComboBox()
+        monitor_row.addWidget(self.monitor_cam_combo)
+        self.start_monitor_btn = QPushButton('Start Monitor')
+        self.start_monitor_btn.clicked.connect(self._start_monitor)
+        self.stop_monitor_btn = QPushButton('Stop Monitor')
+        self.stop_monitor_btn.clicked.connect(self._stop_monitor)
+        self.stop_monitor_btn.setDisabled(True)
+        self.monitor_fourcc_status_label = QLabel('Monitor: 1280x720 @ 30fps | Exp 0 | MJPG')
+        self.monitor_fourcc_status_label.setStyleSheet('color: #bdc3c7;')
+        monitor_row.addWidget(self.start_monitor_btn)
+        monitor_row.addWidget(self.stop_monitor_btn)
+        monitor_row.addWidget(self.monitor_fourcc_status_label)
+        monitor_row.addStretch()
+        left.addLayout(monitor_row)
         exposure_row = QHBoxLayout()
         exposure_row.addWidget(QLabel('Exposure:'))
         self.exposure_slider = QSlider(Qt.Orientation.Horizontal)
@@ -3274,20 +3319,40 @@ class MainWindow(QMainWindow):
             )
 
     def _list_cameras(self):
+        if getattr(self, 'is_monitor_running', False):
+            if hasattr(self, 'status_bar'):
+                self.status_bar.showMessage('Stop monitor before refreshing the camera list.', 3000)
+            return
+        previous_detect_index = self.cam_combo.currentIndex() if hasattr(self, 'cam_combo') else -1
+        previous_monitor_index = self.monitor_cam_combo.currentIndex() if hasattr(self, 'monitor_cam_combo') else -1
         self.cam_combo.clear()
+        if hasattr(self, 'monitor_cam_combo'):
+            self.monitor_cam_combo.clear()
         prefer_backend = getattr(self, 'backend_combo', None)
         backend_label = prefer_backend.currentText() if prefer_backend else 'Auto'
         available_cameras = QMediaDevices.videoInputs()
         if not available_cameras:
             self.cam_combo.addItem('No Camera Found')
+            if hasattr(self, 'monitor_cam_combo'):
+                self.monitor_cam_combo.addItem('No Camera Found')
             if hasattr(self, 'status_bar'):
                 self.status_bar.showMessage(f'No cameras found. Selected backend: {backend_label}.', 3000)
+            if hasattr(self, 'start_monitor_btn'):
+                self._toggle_monitor_controls()
             return
         for idx, camera_device in enumerate(available_cameras):
             description = camera_device.description() or f'Camera {idx}'
             self.cam_combo.addItem(description)
+            if hasattr(self, 'monitor_cam_combo'):
+                self.monitor_cam_combo.addItem(description)
+        if 0 <= previous_detect_index < self.cam_combo.count():
+            self.cam_combo.setCurrentIndex(previous_detect_index)
+        if hasattr(self, 'monitor_cam_combo') and 0 <= previous_monitor_index < self.monitor_cam_combo.count():
+            self.monitor_cam_combo.setCurrentIndex(previous_monitor_index)
         if hasattr(self, 'status_bar'):
             self.status_bar.showMessage(f'Detected {len(available_cameras)} camera(s). Backend: {backend_label}.', 3000)
+        if hasattr(self, 'start_monitor_btn'):
+            self._toggle_monitor_controls()
 
     def _format_exposure_label(self, value):
         if value <= -10:
@@ -3828,6 +3893,8 @@ class MainWindow(QMainWindow):
 
         if self.cam_combo.currentText() == 'No Camera Found':
             self.status_bar.showMessage('Error: No camera selected or found.'); return
+        if self.is_monitor_running and hasattr(self, 'monitor_cam_combo') and self.cam_combo.currentIndex() == self.monitor_cam_combo.currentIndex():
+            self.status_bar.showMessage('Detection camera must be different from the running monitor camera.', 5000); return
         runtime_device_message = self.detector.get_detection_runtime_message()
         self.last_tested_image = None
         self.status_bar.showMessage(f'Starting detection... Running on {runtime_device_message}')
@@ -3946,6 +4013,110 @@ class MainWindow(QMainWindow):
     def _update_fourcc_label(self, mode_text):
         if hasattr(self, 'fourcc_status_label'):
             self.fourcc_status_label.setText(f'Active FourCC: {mode_text}')
+
+    @pyqtSlot(str)
+    def _update_monitor_fourcc_label(self, mode_text):
+        if hasattr(self, 'monitor_fourcc_status_label'):
+            if mode_text and mode_text != '-':
+                self.monitor_fourcc_status_label.setText(
+                    f'Monitor: 1280x720 @ 30fps | Exp 0 | {mode_text}'
+                )
+            else:
+                self.monitor_fourcc_status_label.setText(
+                    'Monitor: 1280x720 @ 30fps | Exp 0 | MJPG'
+                )
+
+    def _toggle_monitor_controls(self):
+        running = bool(getattr(self, 'is_monitor_running', False))
+        has_camera = (
+            hasattr(self, 'monitor_cam_combo')
+            and self.monitor_cam_combo.count() > 0
+            and self.monitor_cam_combo.currentText() != 'No Camera Found'
+        )
+        if hasattr(self, 'start_monitor_btn'):
+            self.start_monitor_btn.setDisabled(running or not has_camera)
+        if hasattr(self, 'stop_monitor_btn'):
+            self.stop_monitor_btn.setDisabled(not running)
+        if hasattr(self, 'monitor_cam_combo'):
+            self.monitor_cam_combo.setDisabled(running)
+
+    def _start_monitor(self):
+        if self.is_monitor_running:
+            return
+        if not hasattr(self, 'monitor_cam_combo') or self.monitor_cam_combo.currentText() == 'No Camera Found':
+            self.status_bar.showMessage('Error: No monitor camera selected or found.', 3000)
+            return
+        monitor_index = self.monitor_cam_combo.currentIndex()
+        if self.is_detection_running and monitor_index == self.cam_combo.currentIndex():
+            self.status_bar.showMessage('Monitor camera must be different from the detection camera while detection is running.', 5000)
+            return
+        resolution = self.monitor_resolution
+        fps_limit = self.monitor_fps_limit
+        backend_choice = self.backend_combo.currentText() if hasattr(self, 'backend_combo') else 'Auto'
+        preferred_fourcc = self.monitor_preferred_fourcc
+        exposure_value = self.monitor_exposure_value
+
+        self.monitor_window.show()
+        self.monitor_window.raise_()
+        self.monitor_window.activateWindow()
+        self.monitor_window.video_label.setText('Connecting monitor camera: 1280x720 @ 30fps, exposure 0, MJPG...')
+        self._update_monitor_fourcc_label('Connecting: 1280x720 @ 30fps | Exp 0 | MJPG')
+        print(
+            f"[LOG {time.time():.2f}] Starting monitor camera {monitor_index} "
+            "with fixed 1280x720 @ 30fps, exposure 0, MJPG FourCC."
+        )
+
+        self.monitor_video_thread = VideoThread(
+            camera_index=monitor_index,
+            resolution=resolution,
+            fps_limit=fps_limit,
+            prefer_backend=backend_choice,
+            preferred_fourcc=preferred_fourcc,
+            exposure_value=exposure_value
+        )
+        self.monitor_video_thread.change_pixmap_signal.connect(self.display_monitor_frame)
+        self.monitor_video_thread.fourcc_signal.connect(self._update_monitor_fourcc_label)
+        self.monitor_video_thread.finished.connect(self._handle_monitor_thread_finished)
+        self.is_monitor_running = True
+        self._toggle_monitor_controls()
+        self.monitor_video_thread.start()
+        self.status_bar.showMessage('Monitor live view started.', 3000)
+
+    def _stop_monitor(self, *args, notify=True):
+        was_running = bool(getattr(self, 'is_monitor_running', False))
+        thread = getattr(self, 'monitor_video_thread', None)
+        if thread is not None and thread.isRunning():
+            thread.stop()
+        self.monitor_video_thread = None
+        self.is_monitor_running = False
+        if hasattr(self, 'monitor_window'):
+            self.monitor_window.video_label.setText("Press 'Start Monitor' to begin")
+        self._update_monitor_fourcc_label('-')
+        self._toggle_monitor_controls()
+        if notify and was_running and hasattr(self, 'status_bar'):
+            self.status_bar.showMessage('Monitor live view stopped.', 3000)
+
+    @pyqtSlot()
+    def _handle_monitor_thread_finished(self):
+        if self.is_monitor_running:
+            self.monitor_video_thread = None
+            self.is_monitor_running = False
+            if hasattr(self, 'monitor_window'):
+                self.monitor_window.video_label.setText("Press 'Start Monitor' to begin")
+            self._update_monitor_fourcc_label('Unavailable')
+            self._toggle_monitor_controls()
+
+    @pyqtSlot(np.ndarray)
+    def display_monitor_frame(self, frame):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimg)
+        target_size = self.monitor_window.video_label.size()
+        if target_size.width() <= 1 or target_size.height() <= 1:
+            target_size = self.monitor_window.size()
+        pixmap = pixmap.scaled(target_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        self.monitor_window.video_label.setPixmap(pixmap)
 
     def _capture_image(self):
         if not self.is_detection_running or self.is_paused or self.current_frame is None:
@@ -4203,6 +4374,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'hue3_enable_check'):
             s.setValue('hue3_enabled', self.hue3_enable_check.isChecked())
         s.setValue('camera_index', self.cam_combo.currentIndex())
+        if hasattr(self, 'monitor_cam_combo'):
+            s.setValue('monitor_camera_index', self.monitor_cam_combo.currentIndex())
         s.setValue('resolution_text', self.res_combo.currentText())
         s.setValue('fps_limit_text', self.fps_combo.currentText())
         if hasattr(self, 'exposure_slider'):
@@ -4304,6 +4477,10 @@ class MainWindow(QMainWindow):
         if self.cam_combo.count()>0:
             idx = s.value('camera_index',0,type=int)
             if idx < self.cam_combo.count(): self.cam_combo.setCurrentIndex(idx)
+        if hasattr(self, 'monitor_cam_combo') and self.monitor_cam_combo.count()>0:
+            monitor_idx = s.value('monitor_camera_index',1,type=int)
+            if 0 <= monitor_idx < self.monitor_cam_combo.count():
+                self.monitor_cam_combo.setCurrentIndex(monitor_idx)
         res_text = s.value('resolution_text','1280x720');
         if res_text in self.resolution_options: self.res_combo.setCurrentText(res_text)
         fps_text = s.value('fps_limit_text','Uncapped');
@@ -4446,7 +4623,14 @@ class MainWindow(QMainWindow):
             self.start_btn.setDisabled(False); self.test_image_btn.setDisabled(False)
 
     def closeEvent(self, event):
-        self._save_settings(); self._stop_detection(show_summary=False); self.video_window.close(); self.detection_thread.quit(); self.detection_thread.wait(); event.accept()
+        self._save_settings()
+        self._stop_monitor(notify=False)
+        self._stop_detection(show_summary=False)
+        self.monitor_window.close()
+        self.video_window.close()
+        self.detection_thread.quit()
+        self.detection_thread.wait()
+        event.accept()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

@@ -1483,8 +1483,6 @@ class DetectionWorker(QObject):
         self._last_detection_label_text = label_text
         dangerous_hits = self._get_dangerous_yolo_hits(yolo_labels, yolo_ids)
         dangerous_hit = bool(dangerous_hits)
-        if not dangerous_hit and self._danger_alarm_active:
-            self._danger_alarm_active = False
         danger_event_started = dangerous_hit and not self._danger_alarm_active
         servo_detection_active = bool(is_anomaly_present or dangerous_hit)
         is_new_anomaly_found = False
@@ -2114,7 +2112,6 @@ class MainWindow(QMainWindow):
         self._detection_popup_path_label = None
         self._summary_dialog = None
         self._summary_text_edit = None
-        self.danger_fan_start_delay_ms = 3000
         self.danger_fan_clear_ms = 20000
         self.danger_feeder_resume_delay_ms = 5000
         self._danger_clear_sequence_id = 0
@@ -2194,9 +2191,6 @@ class MainWindow(QMainWindow):
     def _handle_dangerous_detection(self, message):
         if not self.is_detection_running:
             return
-        if self._danger_clear_sequence_active:
-            self.status_bar.showMessage('Danger detected during active auto-clear; waiting for current sequence.', 3000)
-            return
         self._pause_detection()
         if self._start_danger_auto_fan_clear_sequence(message):
             return
@@ -2235,33 +2229,16 @@ class MainWindow(QMainWindow):
         self._danger_clear_sequence_active = True
 
         self.detection_worker.send_arduino_feed_off()
-        self.status_bar.showMessage(
-            f"{message}. Feeder OFF. Fan starts in {self.danger_fan_start_delay_ms // 1000}s.",
-            8000,
-        )
-        QTimer.singleShot(
-            self.danger_fan_start_delay_ms,
-            lambda sid=sequence_id: self._start_danger_fan_clear(sid),
-        )
-        return True
-
-    def _start_danger_fan_clear(self, sequence_id):
-        if sequence_id != self._danger_clear_sequence_id or not self._danger_clear_sequence_active:
-            return
-        if serial is None or not self.arduino_manager.is_connected():
-            self._danger_clear_sequence_active = False
-            self.status_bar.showMessage('Danger fan auto-clear stopped: Arduino disconnected before fan ON. Detection remains paused.', 8000)
-            return
-
         self.detection_worker.send_arduino_fan_on()
         self.status_bar.showMessage(
-            f'Danger fan clearing rail for {self.danger_fan_clear_ms // 1000}s.',
+            f"{message}. Fan clearing rail for {self.danger_fan_clear_ms // 1000}s.",
             8000,
         )
         QTimer.singleShot(
             self.danger_fan_clear_ms,
             lambda sid=sequence_id: self._finish_danger_fan_clear(sid),
         )
+        return True
 
     def _finish_danger_fan_clear(self, sequence_id):
         if sequence_id != self._danger_clear_sequence_id or not self._danger_clear_sequence_active:
@@ -2276,7 +2253,7 @@ class MainWindow(QMainWindow):
             self._danger_clear_sequence_active = False
             return
         if self.is_paused:
-            self._resume_detection(reset_danger_alarm=False)
+            self._resume_detection()
 
         self.status_bar.showMessage(
             f'Danger fan clear complete. Feeder ON in {self.danger_feeder_resume_delay_ms // 1000}s.',
@@ -2612,7 +2589,7 @@ class MainWindow(QMainWindow):
         auto_beep_row.addWidget(self.service_breaker_check)
         auto_beep_row.addSpacing(24)
         self.danger_auto_fan_clear_check = QCheckBox('Auto cleansing')
-        self.danger_auto_fan_clear_check.setToolTip('When a dangerous YOLO class pauses detection, turn feeder off, wait 3s, run the fan for 20s, resume detection, then turn the feeder on after 5s.')
+        self.danger_auto_fan_clear_check.setToolTip('When a dangerous YOLO class pauses detection, run the fan for 20s, resume detection, then turn the feeder on after 5s.')
         self.danger_auto_fan_clear_check.toggled.connect(self._handle_danger_auto_fan_clear_toggled)
         auto_beep_row.addWidget(self.danger_auto_fan_clear_check)
         auto_beep_row.addSpacing(24)
@@ -3882,13 +3859,12 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage('Detection paused.')
         self._toggle_controls(False)
 
-    def _resume_detection(self, *args, reset_danger_alarm=True):
+    def _resume_detection(self):
         if not self.is_detection_running or not self.is_paused:
             return
         if hasattr(self, 'detection_worker'):
             self.detection_worker.reset_service_breaker()
-            if reset_danger_alarm:
-                self.detection_worker.reset_danger_alarm()
+            self.detection_worker.reset_danger_alarm()
         if hasattr(self, 'video_thread') and self.video_thread.isRunning():
             self.video_thread.resume()
         self.is_paused = False
