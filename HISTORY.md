@@ -1,5 +1,27 @@
 แกหแกห
 
+## 2026-07-23
+
+- Updated `onefileV15.py` paused live-view overlay placement so `LIVE VIEW ONLY - DETECTION PAUSED` is right-aligned near the top of the frame instead of the top-left corner.
+- Moved focus overlay drawing before the paused label so it does not cover the paused status text.
+- Files modified: `onefileV15.py`, `HISTORY.md`.
+- Verified syntax with `python3 -m py_compile onefileV15.py`.
+
+## 2026-07-23
+
+- Updated `onefileV15.py` paused live-view overlay color from yellow to green for better readability.
+- Files modified: `onefileV15.py`, `HISTORY.md`.
+- Verified syntax with `python3 -m py_compile onefileV15.py`.
+
+## 2026-07-22
+
+- Updated `onefileV15.py` so pausing detection no longer pauses the detection camera capture thread.
+- Added a `MainWindow.detection_frame_ready` routing signal so live camera frames are sent to `DetectionWorker` only when detection is not paused.
+- During pause/auto-cleansing, the main Live Feed now shows raw real-time camera video with a `LIVE VIEW ONLY - DETECTION PAUSED` overlay, allowing the operator to watch the fan clear the foreign object without running model/YOLO/HSV detection.
+- Throttled paused live display to about 30 FPS to avoid unnecessary UI load.
+- Files modified: `onefileV15.py`, `HISTORY.md`.
+- Verified syntax with `python3 -m py_compile onefileV15.py`.
+
 ## 2026-07-01
 
 - Updated `readme.txt` to be bilingual with the English guide first, followed by the Thai guide.

@@ -678,15 +678,31 @@ class AnomalyDetector:
         )
         return annotated_frame, mse, (is_anom or bool(yolo_detections)), combined_contours
 
-    def _compute_hsv_cpu(self, frame):
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-    def _mask_color_from_hsv(self, hsv, h_low, h_high, s_min, v_min, enabled=True):
-        if not enabled or hsv is None:
-            return None
+    def _mask_color(self, frame):
+        if not self.primary_hue_enabled:
+            return np.zeros(frame.shape[:2], dtype=np.uint8)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         tolerance = self.hue_tolerance
-        lower = np.array([max(h_low - tolerance, 0), s_min, v_min], dtype=np.uint8)
-        upper = np.array([min(h_high + tolerance, 179), 255, 255], dtype=np.uint8)
+        lower = np.array([max(self.h_low - tolerance, 0), self.s_min, self.v_min], dtype=np.uint8)
+        upper = np.array([min(self.h_high + tolerance, 179), 255, 255], dtype=np.uint8)
+        return cv2.inRange(hsv, lower, upper)
+
+    def _mask_color_secondary(self, frame):
+        if not self.secondary_hue_enabled:
+            return np.zeros(frame.shape[:2], dtype=np.uint8)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        tolerance = self.hue_tolerance
+        lower = np.array([max(self.h2_low - tolerance, 0), self.s2_min, self.v2_min], dtype=np.uint8)
+        upper = np.array([min(self.h2_high + tolerance, 179), 255, 255], dtype=np.uint8)
+        return cv2.inRange(hsv, lower, upper)
+
+    def _mask_color_tertiary(self, frame):
+        if not self.tertiary_hue_enabled:
+            return np.zeros(frame.shape[:2], dtype=np.uint8)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        tolerance = self.hue_tolerance
+        lower = np.array([max(self.h3_low - tolerance, 0), self.s3_min, self.v3_min], dtype=np.uint8)
+        upper = np.array([min(self.h3_high + tolerance, 179), 255, 255], dtype=np.uint8)
         return cv2.inRange(hsv, lower, upper)
 
     def _hsv_from_bgr_torch(self, frame):
@@ -846,8 +862,7 @@ class AnomalyDetector:
             out = frame.copy()
             return self._apply_yolo_results(frame, out, 0.0, False, [])
         if self.mode == 'color':
-            any_hue_enabled = self.primary_hue_enabled or self.secondary_hue_enabled or self.tertiary_hue_enabled
-            hsv_gpu = self._hsv_from_bgr_torch(frame) if any_hue_enabled else None
+            hsv_gpu = self._hsv_from_bgr_torch(frame)
             if hsv_gpu is not None:
                 mask_primary = self._mask_from_hsv_torch(
                     hsv_gpu, self.h_low, self.h_high, self.s_min, self.v_min, self.primary_hue_enabled
@@ -858,20 +873,19 @@ class AnomalyDetector:
                 mask_tertiary = self._mask_from_hsv_torch(
                     hsv_gpu, self.h3_low, self.h3_high, self.s3_min, self.v3_min, self.tertiary_hue_enabled
                 )
+                if mask_primary is None:
+                    mask_primary = np.zeros(frame.shape[:2], dtype=np.uint8)
+                if mask_secondary is None:
+                    mask_secondary = np.zeros(frame.shape[:2], dtype=np.uint8)
+                if mask_tertiary is None:
+                    mask_tertiary = np.zeros(frame.shape[:2], dtype=np.uint8)
             else:
-                hsv_cpu = self._compute_hsv_cpu(frame) if any_hue_enabled else None
-                mask_primary = self._mask_color_from_hsv(
-                    hsv_cpu, self.h_low, self.h_high, self.s_min, self.v_min, self.primary_hue_enabled
-                )
-                mask_secondary = self._mask_color_from_hsv(
-                    hsv_cpu, self.h2_low, self.h2_high, self.s2_min, self.v2_min, self.secondary_hue_enabled
-                )
-                mask_tertiary = self._mask_color_from_hsv(
-                    hsv_cpu, self.h3_low, self.h3_high, self.s3_min, self.v3_min, self.tertiary_hue_enabled
-                )
-            contours_primary = self._contours_from_mask(mask_primary) if mask_primary is not None else []
-            contours_secondary = self._contours_from_mask(mask_secondary) if mask_secondary is not None else []
-            contours_tertiary = self._contours_from_mask(mask_tertiary) if mask_tertiary is not None else []
+                mask_primary = self._mask_color(frame)
+                mask_secondary = self._mask_color_secondary(frame)
+                mask_tertiary = self._mask_color_tertiary(frame)
+            contours_primary = self._contours_from_mask(mask_primary)
+            contours_secondary = self._contours_from_mask(mask_secondary)
+            contours_tertiary = self._contours_from_mask(mask_tertiary)
             out = frame.copy()
             for c in contours_primary:
                 x,y,w,h = cv2.boundingRect(c)
@@ -887,11 +901,7 @@ class AnomalyDetector:
             if is_anom:
                 self.last_detection_sources.append("Color")
                 cv2.putText(out, 'Color Anomaly (Hue1/Hue2/Hue3)', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,255,0), 3)
-            mask_means = [
-                float(mask_primary.mean()) if mask_primary is not None else 0.0,
-                float(mask_secondary.mean()) if mask_secondary is not None else 0.0,
-                float(mask_tertiary.mean()) if mask_tertiary is not None else 0.0,
-            ]
+            mask_means = [mask_primary.mean(), mask_secondary.mean(), mask_tertiary.mean()]
             mse = float(sum(mask_means)/(len(mask_means)*255.0))
             return self._apply_yolo_results(frame, out, mse, is_anom, all_contours)
 
@@ -923,9 +933,9 @@ class AnomalyDetector:
                     "hybrid:color-only",
                     "Hybrid is running in color-only mode because the reconstruction model is unavailable.",
                 )
+            mask_recon = np.zeros(frame.shape[:2], dtype=np.uint8)
             mse = 0.0
-        any_hue_enabled = self.primary_hue_enabled or self.secondary_hue_enabled or self.tertiary_hue_enabled
-        hsv_gpu = self._hsv_from_bgr_torch(frame) if any_hue_enabled else None
+        hsv_gpu = self._hsv_from_bgr_torch(frame)
         if hsv_gpu is not None:
             mask_color_primary = self._mask_from_hsv_torch(
                 hsv_gpu, self.h_low, self.h_high, self.s_min, self.v_min, self.primary_hue_enabled
@@ -936,23 +946,22 @@ class AnomalyDetector:
             mask_color_tertiary = self._mask_from_hsv_torch(
                 hsv_gpu, self.h3_low, self.h3_high, self.s3_min, self.v3_min, self.tertiary_hue_enabled
             )
+            if mask_color_primary is None:
+                mask_color_primary = np.zeros(frame.shape[:2], dtype=np.uint8)
+            if mask_color_secondary is None:
+                mask_color_secondary = np.zeros(frame.shape[:2], dtype=np.uint8)
+            if mask_color_tertiary is None:
+                mask_color_tertiary = np.zeros(frame.shape[:2], dtype=np.uint8)
         else:
-            hsv_cpu = self._compute_hsv_cpu(frame) if any_hue_enabled else None
-            mask_color_primary = self._mask_color_from_hsv(
-                hsv_cpu, self.h_low, self.h_high, self.s_min, self.v_min, self.primary_hue_enabled
-            )
-            mask_color_secondary = self._mask_color_from_hsv(
-                hsv_cpu, self.h2_low, self.h2_high, self.s2_min, self.v2_min, self.secondary_hue_enabled
-            )
-            mask_color_tertiary = self._mask_color_from_hsv(
-                hsv_cpu, self.h3_low, self.h3_high, self.s3_min, self.v3_min, self.tertiary_hue_enabled
-            )
-        contours_recon = self._contours_from_mask(mask_recon) if recon_available else []
+            mask_color_primary = self._mask_color(frame)
+            mask_color_secondary = self._mask_color_secondary(frame)
+            mask_color_tertiary = self._mask_color_tertiary(frame)
+        contours_recon = self._contours_from_mask(mask_recon)
         recon_mse_passed = recon_available and mse >= self.mse_threshold
         active_recon_contours = contours_recon if recon_mse_passed else []
-        contours_color_primary = self._contours_from_mask(mask_color_primary) if mask_color_primary is not None else []
-        contours_color_secondary = self._contours_from_mask(mask_color_secondary) if mask_color_secondary is not None else []
-        contours_color_tertiary = self._contours_from_mask(mask_color_tertiary) if mask_color_tertiary is not None else []
+        contours_color_primary = self._contours_from_mask(mask_color_primary)
+        contours_color_secondary = self._contours_from_mask(mask_color_secondary)
+        contours_color_tertiary = self._contours_from_mask(mask_color_tertiary)
         out = frame.copy()
         for c in active_recon_contours:
             x,y,w,h = cv2.boundingRect(c)
@@ -977,11 +986,7 @@ class AnomalyDetector:
             cv2.putText(out, status_text, (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255,255,255), 3)
         elif not recon_available:
             cv2.putText(out, 'HYBRID: Color only', (10,50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,255), 3)
-        mask_mean_component = (
-            (float(mask_color_primary.mean()) if mask_color_primary is not None else 0.0)
-            + (float(mask_color_secondary.mean()) if mask_color_secondary is not None else 0.0)
-            + (float(mask_color_tertiary.mean()) if mask_color_tertiary is not None else 0.0)
-        ) / (3*255.0)
+        mask_mean_component = (mask_color_primary.mean() + mask_color_secondary.mean() + mask_color_tertiary.mean())/(3*255.0)
         mse_hybrid = 0.5*mse + 0.5*mask_mean_component
         return self._apply_yolo_results(frame, out, float(mse_hybrid), is_anom, all_contours)
 
@@ -2102,8 +2107,6 @@ class MonitorWindow(QWidget):
 
 
 class MainWindow(QMainWindow):
-    detection_frame_ready = pyqtSignal(np.ndarray)
-
     # ... (ส่วน __init__ และอื่นๆ เหมือนเดิม) ...
     def __init__(self):
         super().__init__()
@@ -2124,7 +2127,6 @@ class MainWindow(QMainWindow):
         self.detection_timer_start = None
         self.detection_elapsed_total = 0.0
         self._last_pixmap_size = (0, 0)
-        self._last_paused_live_display_time = 0.0
         self.focus_measure = 0.0
         self.show_video_labels = True
         self.zoom_level = 1.0
@@ -2190,7 +2192,6 @@ class MainWindow(QMainWindow):
         self.detection_worker.service_breaker_triggered.connect(self._handle_service_breaker_trigger)
         self.detection_worker.stop_detection_requested.connect(self._handle_stop_detection_request)
         self.detection_worker.dangerous_detection_triggered.connect(self._handle_dangerous_detection)
-        self.detection_frame_ready.connect(self.detection_worker.process_frame)
         if hasattr(self, 'service_breaker_check'):
             self.service_breaker_check.toggled.connect(self.detection_worker.set_service_breaker_enabled)
         self.auto_save_check.toggled.connect(self.detection_worker.set_auto_save)
@@ -3957,7 +3958,7 @@ class MainWindow(QMainWindow):
             preferred_fourcc=preferred_fourcc,
             exposure_value=exposure_value
         )
-        self.video_thread.change_pixmap_signal.connect(self._handle_detection_camera_frame)
+        self.video_thread.change_pixmap_signal.connect(self.detection_worker.process_frame)
         self.video_thread.fourcc_signal.connect(self._update_fourcc_label)
         
         print(f"[LOG {time.time():.2f}] Starting VideoThread...")
@@ -3973,8 +3974,9 @@ class MainWindow(QMainWindow):
     def _pause_detection(self):
         if not self.is_detection_running or self.is_paused:
             return
+        if hasattr(self, 'video_thread') and self.video_thread.isRunning():
+            self.video_thread.pause()
         self.is_paused = True
-        self._last_paused_live_display_time = 0.0
         if self.detection_timer_start:
             self.detection_elapsed_total += time.time() - self.detection_timer_start
             self.detection_timer_start = None
@@ -3993,7 +3995,6 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'video_thread') and self.video_thread.isRunning():
             self.video_thread.resume()
         self.is_paused = False
-        self._last_paused_live_display_time = 0.0
         self.detection_timer_start = time.time()
         self.frame_count = 0
         self.start_time = time.time()
@@ -4340,63 +4341,8 @@ class MainWindow(QMainWindow):
             self._reprocess_image()
 
 
-    @pyqtSlot(np.ndarray)
-    def _handle_detection_camera_frame(self, frame):
-        if not self.is_detection_running:
-            return
-        if self.is_paused:
-            self.display_paused_live_frame(frame)
-            return
-        self.detection_frame_ready.emit(frame)
-
-    def display_paused_live_frame(self, frame):
-        now = time.time()
-        if now - self._last_paused_live_display_time < (1.0 / 30.0):
-            return
-        self._last_paused_live_display_time = now
-        live_frame = frame.copy()
-        self.current_frame = live_frame.copy()
-        focus_value, roi_rect = self._compute_focus_measure(live_frame)
-        self.focus_measure = focus_value
-        self._apply_visual_guides(live_frame)
-        if getattr(self, 'show_video_labels', True):
-            h, w = live_frame.shape[:2]
-            self._draw_focus_overlay(live_frame, focus_value, None)
-            paused_text = 'LIVE VIEW ONLY - DETECTION PAUSED'
-            paused_font = cv2.FONT_HERSHEY_SIMPLEX
-            paused_scale = 1.0
-            paused_thickness = 2
-            (paused_w, paused_h), _ = cv2.getTextSize(paused_text, paused_font, paused_scale, paused_thickness)
-            paused_x = max(10, w - paused_w - 20)
-            paused_y = max(42, paused_h + 12)
-            cv2.putText(
-                live_frame,
-                paused_text,
-                (paused_x, paused_y),
-                paused_font,
-                paused_scale,
-                (0, 255, 0),
-                paused_thickness,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                live_frame,
-                f'{w}x{h}',
-                (10, h - 14),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
-        pixmap = self.convert_cv_qt(live_frame)
-        self.video_window.video_label.setPixmap(pixmap)
-        self._last_pixmap_size = (pixmap.width(), pixmap.height())
-
     @pyqtSlot(np.ndarray, np.ndarray, float, bool, int)
     def display_processed_frame(self, processed_frame, original_frame, mse, is_anomaly, anomaly_count):
-        if self.is_paused:
-            return
         self.current_frame = original_frame
         self.frame_count += 1; elapsed = time.time() - self.start_time
         if elapsed > 1.0:
