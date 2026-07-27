@@ -1,5 +1,16 @@
 แกหแกห
 
+## 2026-07-24
+
+- Created and updated `onefileV16.py` based on `onefileV15.py`.
+- Cleaned up dead code including commented-out `open_camera_by_index` blocks and placeholder comments.
+- Added visual status LED indicators and labels for Feeder Relay (ON/OFF) and Fan Relay Pin 8 (ON/OFF) in the Arduino Integration panel.
+- Added explicit Arduino Pin labels across UI hardware indicators and control buttons: `Servo (Pin 9)`, `Feeder (Pin 7)`, and `Fan (Pin 8)`.
+- Connected `DetectionWorker` signals `feeder_state_changed` and `fan_state_changed` to update hardware status indicators in real time when Feeder or Fan commands are sent.
+- Implemented `stop_save_worker()` in `DetectionWorker` and integrated it into `MainWindow.closeEvent()` to gracefully flush the save queue and join `_save_thread` on exit.
+- Files modified: `onefileV16.py`, `HISTORY.md`.
+- Verified syntax with `python -m py_compile onefileV16.py`.
+
 ## 2026-07-23
 
 - Updated `onefileV15.py` paused live-view overlay placement so `LIVE VIEW ONLY - DETECTION PAUSED` is right-aligned near the top of the frame instead of the top-left corner.
