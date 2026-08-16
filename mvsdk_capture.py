@@ -102,6 +102,17 @@ class MvsdkCapture:
         exposure_us = _slider_value_to_exposure_us(exposure_value) if exposure_value is not None else 30 * 1000
         mvsdk.CameraSetExposureTime(hcamera, exposure_us)
 
+        if not self._mono:
+            # Keep white balance fixed/manual so hue-based thresholds stay
+            # stable frame-to-frame; color is corrected on demand via
+            # set_white_balance_once() (one-shot calibration against a
+            # neutral gray/white target) instead of continuous auto-WB,
+            # which would drift the hue readings while detection is running.
+            try:
+                mvsdk.CameraSetWbMode(hcamera, 0)
+            except mvsdk.CameraException as err:
+                print(f"[WARN {time.time():.2f}] Unable to disable auto white balance({err.error_code}): {err.message}")
+
         mvsdk.CameraPlay(hcamera)
 
         buffer_size = cap.sResolutionRange.iWidthMax * cap.sResolutionRange.iHeightMax * (1 if self._mono else 3)
@@ -136,6 +147,18 @@ class MvsdkCapture:
             if err.error_code != mvsdk.CAMERA_STATUS_TIME_OUT:
                 print(f"[WARN {time.time():.2f}] mvsdk CameraGetImageBuffer failed({err.error_code}): {err.message}")
             return False, None
+
+    def set_white_balance_once(self):
+        """Trigger a single white-balance calibration against whatever the
+        camera currently sees. Point it at a neutral gray/white area first."""
+        if not self._opened or self._mono:
+            return False
+        try:
+            mvsdk.CameraSetOnceWB(self._hcamera)
+            return True
+        except mvsdk.CameraException as err:
+            print(f"[WARN {time.time():.2f}] CameraSetOnceWB failed({err.error_code}): {err.message}")
+            return False
 
     def set(self, prop_id, value):
         if prop_id == cv2.CAP_PROP_EXPOSURE and self._opened:

@@ -972,6 +972,7 @@ class VideoThread(QThread):
         self.active_fourcc = None
         self._pending_exposure = exposure_value
         self._applied_exposure = exposure_value
+        self._wb_requested = False
         self._setting_lock = threading.Lock()
     def run(self):
         print(f"[LOG {time.time():.2f}] VideoThread entered run() method.")
@@ -1009,6 +1010,18 @@ class VideoThread(QThread):
                 _apply_manual_exposure(cap, pending_exposure)
                 with self._setting_lock:
                     self._applied_exposure = pending_exposure
+            wb_requested = False
+            with self._setting_lock:
+                if self._wb_requested:
+                    wb_requested = True
+                    self._wb_requested = False
+            if wb_requested:
+                setter = getattr(cap, 'set_white_balance_once', None)
+                if setter is not None:
+                    ok = setter()
+                    print(f"[LOG {time.time():.2f}] White balance (once) requested (ok={ok}).")
+                else:
+                    print(f"[WARN {time.time():.2f}] White balance (once) not supported by this camera backend.")
             ret, frame = cap.read()
             if ret:
                 self.change_pixmap_signal.emit(frame)
@@ -1037,6 +1050,10 @@ class VideoThread(QThread):
             return
         with self._setting_lock:
             self._pending_exposure = requested_value
+
+    def trigger_white_balance(self):
+        with self._setting_lock:
+            self._wb_requested = True
 
 class DetectionWorker(QObject):
     result_ready = pyqtSignal(np.ndarray, np.ndarray, float, bool, int)
@@ -2637,6 +2654,16 @@ class MainWindow(QMainWindow):
         self.exposure_hint_label = QLabel('-13 = Fast/Dark, 0 = Slow/Bright')
         self.exposure_hint_label.setStyleSheet('color: #bdc3c7; font-size: 9pt;')
         left.addWidget(self.exposure_hint_label)
+        wb_row = QHBoxLayout()
+        self.wb_once_btn = QPushButton('White Balance (Once)')
+        self.wb_once_btn.setToolTip('Point the camera at an empty/neutral part of the rail first, then click. HuaTeng SDK cameras only.')
+        self.wb_once_btn.clicked.connect(self._trigger_white_balance_once)
+        wb_row.addWidget(self.wb_once_btn)
+        wb_hint = QLabel('Aim at empty rail (no grain) before clicking, then re-sample Hue1/2/3.')
+        wb_hint.setStyleSheet('color: #bdc3c7; font-size: 9pt;')
+        wb_row.addWidget(wb_hint)
+        wb_row.addStretch()
+        left.addLayout(wb_row)
         left.addStretch()
 
         # right panel
@@ -3416,6 +3443,18 @@ class MainWindow(QMainWindow):
         else:
             hint = 'Slow/Bright'
         return f'{value} ({hint})'
+
+    def _trigger_white_balance_once(self):
+        backend_choice = self.backend_combo.currentText() if hasattr(self, 'backend_combo') else 'Auto'
+        if backend_choice != 'HuaTeng SDK':
+            self.status_bar.showMessage('White balance is only available on the HuaTeng SDK camera backend.', 4000)
+            return
+        thread = getattr(self, 'video_thread', None)
+        if thread is None or not thread.isRunning():
+            self.status_bar.showMessage('Start detection first, then aim at empty rail and set white balance.', 4000)
+            return
+        thread.trigger_white_balance()
+        self.status_bar.showMessage('White balance calibration requested — re-sample Hue1/2/3 afterwards.', 5000)
 
     def _update_mse_threshold(self, value):
         threshold = value / 10000.0
