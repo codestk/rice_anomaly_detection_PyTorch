@@ -1,5 +1,24 @@
 แกหแกห
 
+## 2026-08-22
+
+- Briefly changed `onefileV18.py` YOLO capture-only saving to combine multiple matched classes into one image set per frame.
+- Rolled that combined-per-frame behavior back because it made output grouping unclear.
+- Current behavior is restored to one image set per matched `YOLO Capture Classes` class, with a same-filename original copy under `output/yolo_captures_original`.
+- Capture-only detections still do not contribute anomaly contours/triggers when they only pass because of `YOLO Capture Classes`.
+- Files modified: `onefileV18.py`, `HISTORY.md`.
+- Verified syntax with `python3 -m py_compile onefileV18.py`.
+
+## 2026-08-21
+
+- Investigated why `YOLO Capture Classes` in `onefileV18.py` did not save images to `output`.
+- Found that capture-only classes were being removed by the active `YOLO Class Filter` before the capture save logic could see them.
+- Updated YOLO filtering so classes listed in `YOLO Capture Classes` can pass through for capture saving even when they are not in `YOLO Class Filter`.
+- Kept capture-only YOLO detections from contributing anomaly contours/triggers when they only passed because of `YOLO Capture Classes`.
+- Added paired original-frame saving for YOLO capture classes under `output/yolo_captures_original` using the same filename as `output/yolo_captures`.
+- Files modified: `onefileV18.py`, `HISTORY.md`.
+- Verified syntax with `python3 -m py_compile onefileV18.py`.
+
 ## 2026-07-24
 
 - Created and updated `onefileV16.py` based on `onefileV15.py`.
