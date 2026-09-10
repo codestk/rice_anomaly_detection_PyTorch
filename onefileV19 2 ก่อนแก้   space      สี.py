@@ -3170,17 +3170,13 @@ class MainWindow(QMainWindow):
         self.hsv_sample2_label = QLabel('Sample 2: -')
         self.hsv_sample_avg_label = QLabel('Combined: -')
 
-        # All three sample labels share one row instead of one row each.
-        sample_row = QHBoxLayout()
+        # Create a separate row for each sample label
         for lbl in (self.hsv_sample1_label, self.hsv_sample2_label, self.hsv_sample_avg_label):
             lbl.setStyleSheet('padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background-color: #222; color: #f0f0f0;')
-            sample_row.addWidget(lbl, 1)
-        right.addLayout(sample_row)
-
-        # Soak up any leftover vertical space here instead of letting Qt
-        # distribute it into the Hue group boxes above (which would puff
-        # them out with dead space to match the left column's height).
-        right.addStretch()
+            row = QHBoxLayout()
+            row.addWidget(lbl)
+            row.addStretch()
+            right.addLayout(row)
 
         # buttons row
         self.start_btn = QPushButton('Start Detection'); self.start_btn.clicked.connect(self._start_detection); self.start_btn.setDisabled(True)
