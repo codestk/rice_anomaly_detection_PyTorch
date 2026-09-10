@@ -1,5 +1,25 @@
 แกหแกห
 
+## 2026-08-24
+
+- Updated `onefileV18.py` dangerous YOLO class handling so after a danger class triggers feeder OFF and detection pause, the app waits 1 second then saves the latest live camera frame.
+- Added a separate `output/danger_delayed` folder for these delayed danger-class snapshots.
+- Removed the delayed snapshot hook from service breaker handling; service breaker now keeps its previous popup/snapshot behavior only.
+- Updated Clear ALL output recreation to include the new delayed danger snapshot folder.
+- Files modified: `onefileV18.py`, `HISTORY.md`.
+- Verified syntax with `python3 -m py_compile onefileV18.py`.
+
+## 2026-08-23
+
+- Updated `onefileV18.py` monitor camera handling so the monitor camera always uses normal OS/OpenCV camera enumeration instead of the HuaTeng SDK camera list.
+- Monitor live view now starts with the normal `DSHOW` backend and fixed `NV12` settings, independent of the detection camera backend selection.
+- Changed the fixed monitor FourCC from `MJPG` to `NV12`.
+- Adjusted same-index camera conflict checks so a HuaTeng SDK detection camera does not block a normal monitor camera with the same combo index.
+- Rolled back a short-lived `Auto White Balance` checkbox experiment for the detection camera; the existing `White Balance (Once)` button remains.
+- Added `20` FPS to the Frame Rate dropdown in `onefileV18.py`.
+- Files modified: `onefileV18.py`, `HISTORY.md`.
+- Verified syntax with `python3 -m py_compile onefileV18.py mvsdk_capture.py`.
+
 ## 2026-08-22
 
 - Briefly changed `onefileV18.py` YOLO capture-only saving to combine multiple matched classes into one image set per frame.

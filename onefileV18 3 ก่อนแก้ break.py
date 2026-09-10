@@ -2177,7 +2177,6 @@ class MainWindow(QMainWindow):
         self._detection_popup_path_label = None
         self._summary_dialog = None
         self._summary_text_edit = None
-        self._danger_delayed_snapshot_pending = False
         self.danger_fan_start_delay_ms = 3000
         self.danger_fan_clear_ms = 20000
         self.danger_feeder_resume_delay_ms = 5000
@@ -2280,7 +2279,6 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage('Danger detected during active auto-clear; waiting for current sequence.', 3000)
             return
         self._pause_detection()
-        self._schedule_danger_delayed_snapshot()
         if self._start_danger_auto_fan_clear_sequence(message):
             return
         self.status_bar.showMessage(f"{message}. Detection paused.", 8000)
@@ -2558,31 +2556,6 @@ class MainWindow(QMainWindow):
         self._pause_detection()
         if image_path:
             self._handle_stop_feed_detection_popup(image_path)
-
-    def _schedule_danger_delayed_snapshot(self):
-        if self._danger_delayed_snapshot_pending:
-            return
-        self._danger_delayed_snapshot_pending = True
-        QTimer.singleShot(1000, self._save_danger_delayed_snapshot)
-
-    def _save_danger_delayed_snapshot(self):
-        self._danger_delayed_snapshot_pending = False
-        if not self.is_detection_running or self.current_frame is None:
-            self.status_bar.showMessage('Danger delayed snapshot skipped: no live frame available.', 4000)
-            return
-        frame = self.current_frame.copy()
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-        fname = f'danger_delayed_{ts}.png'
-        out_dir = os.path.join('output', 'danger_delayed')
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-            path = os.path.join(out_dir, fname)
-            if cv2.imwrite(path, frame):
-                self.status_bar.showMessage(f'Danger delayed snapshot saved as {fname}', 5000)
-            else:
-                self.status_bar.showMessage('Failed to save danger delayed snapshot.', 5000)
-        except Exception as err:
-            self.status_bar.showMessage(f'Failed to save danger delayed snapshot: {err}', 5000)
 
     def _create_top_bar(self):
         top = QHBoxLayout()
@@ -4405,7 +4378,6 @@ class MainWindow(QMainWindow):
             os.makedirs(os.path.join(out_dir, 'original'), exist_ok=True)
             os.makedirs(os.path.join(out_dir, 'captures_detected'), exist_ok=True)
             os.makedirs(os.path.join(out_dir, 'captures_original'), exist_ok=True)
-            os.makedirs(os.path.join(out_dir, 'danger_delayed'), exist_ok=True)
             self.status_bar.showMessage('Cleared ENTIRE output folder.', 3000)
         except Exception as e:
             self.status_bar.showMessage(f'Failed to clear output: {e}', 5000)

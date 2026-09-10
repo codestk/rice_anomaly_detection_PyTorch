@@ -2177,7 +2177,6 @@ class MainWindow(QMainWindow):
         self._detection_popup_path_label = None
         self._summary_dialog = None
         self._summary_text_edit = None
-        self._danger_delayed_snapshot_pending = False
         self.danger_fan_start_delay_ms = 3000
         self.danger_fan_clear_ms = 20000
         self.danger_feeder_resume_delay_ms = 5000
@@ -2198,7 +2197,7 @@ class MainWindow(QMainWindow):
         self.monitor_resolution = (1280, 720)
         self.monitor_fps_limit = 30
         self.monitor_exposure_value = 0
-        self.monitor_preferred_fourcc = 'NV12'
+        self.monitor_preferred_fourcc = 'MJPG'
         self.monitor_active_fourcc_text = self.monitor_preferred_fourcc
         self.video_window.video_label.clicked.connect(self._handle_video_click)
         self.video_window.video_label.wheel.connect(self._handle_zoom)
@@ -2280,7 +2279,6 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage('Danger detected during active auto-clear; waiting for current sequence.', 3000)
             return
         self._pause_detection()
-        self._schedule_danger_delayed_snapshot()
         if self._start_danger_auto_fan_clear_sequence(message):
             return
         self.status_bar.showMessage(f"{message}. Detection paused.", 8000)
@@ -2559,31 +2557,6 @@ class MainWindow(QMainWindow):
         if image_path:
             self._handle_stop_feed_detection_popup(image_path)
 
-    def _schedule_danger_delayed_snapshot(self):
-        if self._danger_delayed_snapshot_pending:
-            return
-        self._danger_delayed_snapshot_pending = True
-        QTimer.singleShot(1000, self._save_danger_delayed_snapshot)
-
-    def _save_danger_delayed_snapshot(self):
-        self._danger_delayed_snapshot_pending = False
-        if not self.is_detection_running or self.current_frame is None:
-            self.status_bar.showMessage('Danger delayed snapshot skipped: no live frame available.', 4000)
-            return
-        frame = self.current_frame.copy()
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-        fname = f'danger_delayed_{ts}.png'
-        out_dir = os.path.join('output', 'danger_delayed')
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-            path = os.path.join(out_dir, fname)
-            if cv2.imwrite(path, frame):
-                self.status_bar.showMessage(f'Danger delayed snapshot saved as {fname}', 5000)
-            else:
-                self.status_bar.showMessage('Failed to save danger delayed snapshot.', 5000)
-        except Exception as err:
-            self.status_bar.showMessage(f'Failed to save danger delayed snapshot: {err}', 5000)
-
     def _create_top_bar(self):
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
@@ -2724,7 +2697,7 @@ class MainWindow(QMainWindow):
         self.fourcc_combo.addItems(self.fourcc_options)
         cr.addWidget(self.fourcc_combo)
         cr.addWidget(QLabel('Frame Rate:'))
-        self.fps_combo = QComboBox(); self.fps_options = ['Uncapped','120','60','50','30','20','15','5','2']; self.fps_combo.addItems(self.fps_options); cr.addWidget(self.fps_combo)
+        self.fps_combo = QComboBox(); self.fps_options = ['Uncapped','120','60','50','30','15','5','2']; self.fps_combo.addItems(self.fps_options); cr.addWidget(self.fps_combo)
         cr.addWidget(QLabel('Resolution:'))
         self.res_combo = QComboBox(); self.resolution_options = ['Source/Native','2592x1944','2592x1440','2560x1440','2048x1536','2304x1296','1920x1080','1600x1200','1600x900','1280x1024','1280X960','1280x720','1024x768','960X720','1024x576','960x540','800x600','848x480','800x450','640x480','640x360']; self.res_combo.addItems(self.resolution_options); cr.addWidget(self.res_combo)
         left.addLayout(cr)
@@ -2737,7 +2710,7 @@ class MainWindow(QMainWindow):
         self.stop_monitor_btn = QPushButton('Stop Monitor')
         self.stop_monitor_btn.clicked.connect(self._stop_monitor)
         self.stop_monitor_btn.setDisabled(True)
-        self.monitor_fourcc_status_label = QLabel('Monitor: 1280x720 @ 30fps | Exp 0 | NV12')
+        self.monitor_fourcc_status_label = QLabel('Monitor: 1280x720 @ 30fps | Exp 0 | MJPG')
         self.monitor_fourcc_status_label.setStyleSheet('color: #bdc3c7;')
         monitor_row.addWidget(self.start_monitor_btn)
         monitor_row.addWidget(self.stop_monitor_btn)
@@ -3509,31 +3482,28 @@ class MainWindow(QMainWindow):
             # Industrial camera driven via mvsdk; it never registers as an
             # OS multimedia device, so QMediaDevices can't see it.
             devices = mvsdk_capture.list_devices() if mvsdk_capture else []
-            detection_cameras = [name for _, name in devices]
+            available_cameras = [name for _, name in devices]
         else:
-            detection_cameras = [d.description() or f'Camera {i}' for i, d in enumerate(QMediaDevices.videoInputs())]
-        monitor_cameras = [d.description() or f'Camera {i}' for i, d in enumerate(QMediaDevices.videoInputs())]
-        if not detection_cameras:
+            available_cameras = [d.description() or f'Camera {i}' for i, d in enumerate(QMediaDevices.videoInputs())]
+        if not available_cameras:
             self.cam_combo.addItem('No Camera Found')
-        else:
-            for description in detection_cameras:
-                self.cam_combo.addItem(description)
-        if hasattr(self, 'monitor_cam_combo'):
-            if monitor_cameras:
-                for description in monitor_cameras:
-                    self.monitor_cam_combo.addItem(description)
-            else:
+            if hasattr(self, 'monitor_cam_combo'):
                 self.monitor_cam_combo.addItem('No Camera Found')
+            if hasattr(self, 'status_bar'):
+                self.status_bar.showMessage(f'No cameras found. Selected backend: {backend_label}.', 3000)
+            if hasattr(self, 'start_monitor_btn'):
+                self._toggle_monitor_controls()
+            return
+        for idx, description in enumerate(available_cameras):
+            self.cam_combo.addItem(description)
+            if hasattr(self, 'monitor_cam_combo'):
+                self.monitor_cam_combo.addItem(description)
         if 0 <= previous_detect_index < self.cam_combo.count():
             self.cam_combo.setCurrentIndex(previous_detect_index)
         if hasattr(self, 'monitor_cam_combo') and 0 <= previous_monitor_index < self.monitor_cam_combo.count():
             self.monitor_cam_combo.setCurrentIndex(previous_monitor_index)
         if hasattr(self, 'status_bar'):
-            self.status_bar.showMessage(
-                f'Detection cameras: {len(detection_cameras)} ({backend_label}); '
-                f'Monitor cameras: {len(monitor_cameras)} (normal).',
-                3000,
-            )
+            self.status_bar.showMessage(f'Detected {len(available_cameras)} camera(s). Backend: {backend_label}.', 3000)
         if hasattr(self, 'start_monitor_btn'):
             self._toggle_monitor_controls()
 
@@ -4129,14 +4099,7 @@ class MainWindow(QMainWindow):
 
         if self.cam_combo.currentText() == 'No Camera Found':
             self.status_bar.showMessage('Error: No camera selected or found.'); return
-        backend_choice = self.backend_combo.currentText() if hasattr(self, 'backend_combo') else 'Auto'
-        detection_uses_normal_camera = backend_choice != 'HuaTeng SDK'
-        if (
-            detection_uses_normal_camera
-            and self.is_monitor_running
-            and hasattr(self, 'monitor_cam_combo')
-            and self.cam_combo.currentIndex() == self.monitor_cam_combo.currentIndex()
-        ):
+        if self.is_monitor_running and hasattr(self, 'monitor_cam_combo') and self.cam_combo.currentIndex() == self.monitor_cam_combo.currentIndex():
             self.status_bar.showMessage('Detection camera must be different from the running monitor camera.', 5000); return
         runtime_device_message = self.detector.get_detection_runtime_message()
         self.last_tested_image = None
@@ -4148,6 +4111,7 @@ class MainWindow(QMainWindow):
         res_text = self.res_combo.currentText()
         resolution = tuple(map(int, res_text.lower().split('x'))) if res_text != 'Source/Native' else None
         fps_text = self.fps_combo.currentText(); fps_limit = int(fps_text) if fps_text != 'Uncapped' else None
+        backend_choice = self.backend_combo.currentText() if hasattr(self, 'backend_combo') else 'Auto'
         fourcc_choice = self.fourcc_combo.currentText() if hasattr(self, 'fourcc_combo') else 'Auto'
         preferred_fourcc = None if not fourcc_choice or fourcc_choice == 'Auto' else fourcc_choice
         exposure_value = self.exposure_slider.value() if hasattr(self, 'exposure_slider') else None
@@ -4291,14 +4255,12 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage('Error: No monitor camera selected or found.', 3000)
             return
         monitor_index = self.monitor_cam_combo.currentIndex()
-        detection_backend = self.backend_combo.currentText() if hasattr(self, 'backend_combo') else 'Auto'
-        detection_uses_normal_camera = detection_backend != 'HuaTeng SDK'
-        if self.is_detection_running and detection_uses_normal_camera and monitor_index == self.cam_combo.currentIndex():
+        if self.is_detection_running and monitor_index == self.cam_combo.currentIndex():
             self.status_bar.showMessage('Monitor camera must be different from the detection camera while detection is running.', 5000)
             return
         resolution = self.monitor_resolution
         fps_limit = self.monitor_fps_limit
-        backend_choice = 'DSHOW'
+        backend_choice = self.backend_combo.currentText() if hasattr(self, 'backend_combo') else 'Auto'
         preferred_fourcc = self.monitor_preferred_fourcc
         exposure_value = self.monitor_exposure_value
 
@@ -4306,12 +4268,12 @@ class MainWindow(QMainWindow):
         self.monitor_window.raise_()
         self.monitor_window.activateWindow()
         self.monitor_window.video_label.setText(
-            f'Connecting monitor camera: 1280x720 @ 30fps, exposure {exposure_value}, NV12...'
+            f'Connecting monitor camera: 1280x720 @ 30fps, exposure {exposure_value}, MJPG...'
         )
-        self._update_monitor_fourcc_label('Connecting NV12')
+        self._update_monitor_fourcc_label('Connecting MJPG')
         print(
             f"[LOG {time.time():.2f}] Starting monitor camera {monitor_index} "
-            f"with fixed 1280x720 @ 30fps, exposure {exposure_value}, NV12 FourCC."
+            f"with fixed 1280x720 @ 30fps, exposure {exposure_value}, MJPG FourCC."
         )
 
         self.monitor_video_thread = VideoThread(
@@ -4405,7 +4367,6 @@ class MainWindow(QMainWindow):
             os.makedirs(os.path.join(out_dir, 'original'), exist_ok=True)
             os.makedirs(os.path.join(out_dir, 'captures_detected'), exist_ok=True)
             os.makedirs(os.path.join(out_dir, 'captures_original'), exist_ok=True)
-            os.makedirs(os.path.join(out_dir, 'danger_delayed'), exist_ok=True)
             self.status_bar.showMessage('Cleared ENTIRE output folder.', 3000)
         except Exception as e:
             self.status_bar.showMessage(f'Failed to clear output: {e}', 5000)
@@ -4955,3 +4916,5 @@ if __name__ == '__main__':
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
+
+

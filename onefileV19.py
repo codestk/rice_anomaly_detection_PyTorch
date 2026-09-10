@@ -289,6 +289,7 @@ class AnomalyDetector:
         self.yolo_class_filter = set()
         self.yolo_dangerous_classes = set()
         self.yolo_capture_classes = set()
+        self.yolo_relay_classes = set()
         self.yolo_device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self._last_yolo_infer_ms = 0.0
         self._last_yolo_draw_ms = 0.0
@@ -439,6 +440,10 @@ class AnomalyDetector:
     def set_yolo_capture_classes(self, items):
         """Accept comma/newline separated labels or class ids; empty disables capture-only saving."""
         self.yolo_capture_classes = self._normalize_yolo_class_items(items)
+
+    def set_yolo_relay_classes(self, items):
+        """Accept comma/newline separated labels or class ids; empty means the relay fires on any anomaly."""
+        self.yolo_relay_classes = self._normalize_yolo_class_items(items)
     def set_primary_hue_enabled(self, enabled: bool):
         self.primary_hue_enabled = bool(enabled)
     def set_secondary_hue_enabled(self, enabled: bool):
@@ -574,6 +579,7 @@ class AnomalyDetector:
         detections = []
         class_filter = self.yolo_class_filter
         capture_set = self.yolo_capture_classes
+        relay_set = self.yolo_relay_classes
         filter_active = bool(class_filter)
         for idx, box in enumerate(xyxy):
             conf = float(confs[idx])
@@ -585,10 +591,12 @@ class AnomalyDetector:
             cls_key = str(cls_id)
             normal_detection = True
             capture_only_detection = False
+            relay_only_detection = False
             if filter_active:
                 normal_detection = label_key in class_filter or cls_key in class_filter
                 capture_only_detection = label_key in capture_set or cls_key in capture_set
-                if not normal_detection and not capture_only_detection:
+                relay_only_detection = label_key in relay_set or cls_key in relay_set
+                if not normal_detection and not capture_only_detection and not relay_only_detection:
                     continue
             x1 = int(max(0, min(box[0], frame_w - 1)))
             y1 = int(max(0, min(box[1], frame_h - 1)))
@@ -600,6 +608,7 @@ class AnomalyDetector:
                 'conf': conf,
                 'cls_id': cls_id,
                 'capture_only': capture_only_detection and not normal_detection,
+                'relay_only': relay_only_detection and not normal_detection,
             })
         self._last_yolo_count = len(detections)
         return detections
@@ -633,7 +642,7 @@ class AnomalyDetector:
                 (0, 0, 0),
                 2
             )
-            if not det.get('capture_only'):
+            if not det.get('capture_only') and not det.get('relay_only'):
                 combined_contours.append(self._bbox_to_contour(det['bbox']))
         self._last_yolo_draw_ms = (time.perf_counter() - draw_start) * 1000.0
         cv2.putText(
@@ -645,7 +654,9 @@ class AnomalyDetector:
             (0, 0, 0),
             2
         )
-        has_normal_yolo_detection = any(not det.get('capture_only') for det in yolo_detections)
+        has_normal_yolo_detection = any(
+            not det.get('capture_only') and not det.get('relay_only') for det in yolo_detections
+        )
         return annotated_frame, mse, (is_anom or has_normal_yolo_detection), combined_contours
 
     def _compute_hsv_cpu(self, frame):
@@ -1076,6 +1087,7 @@ class DetectionWorker(QObject):
     arduino_state_changed = pyqtSignal(str)
     feeder_state_changed = pyqtSignal(str)
     fan_state_changed = pyqtSignal(str)
+    relay_state_changed = pyqtSignal(str)
     detection_saved = pyqtSignal(str)
     service_breaker_triggered = pyqtSignal(str)
     stop_detection_requested = pyqtSignal()
@@ -1118,6 +1130,16 @@ class DetectionWorker(QObject):
         self._arduino_last_trigger_time = 0.0
         self._last_anomaly_seen_time = 0.0
         self._arduino_trigger_timer = None
+        self.relay_enabled = False
+        self.relay_trigger_command = "R1"
+        self.relay_clear_command = "R0"
+        self.relay_clear_enabled = False
+        self.relay_clear_delay = 1.0
+        self.relay_trigger_delay = 0.0
+        self._relay_last_signal = "clear"
+        self._relay_last_trigger_time = 0.0
+        self._relay_last_anomaly_seen_time = 0.0
+        self._relay_trigger_timer = None
         self.last_saved_detection_path = ""
         self.class_capture_min_interval = 0.8
         self._class_capture_last_save_time = {}
@@ -1220,6 +1242,24 @@ class DetectionWorker(QObject):
             except (TypeError, ValueError):
                 continue
             if cls_key in capture_set and cls_key not in hits:
+                hits.append(cls_key)
+        return hits
+
+    def _get_relay_yolo_hits(self, labels, class_ids):
+        relay_set = getattr(self.detector, 'yolo_relay_classes', set()) or set()
+        if not relay_set:
+            return []
+        hits = []
+        for label in labels or []:
+            key = str(label).strip().lower()
+            if key and key in relay_set:
+                hits.append(str(label).strip())
+        for cls_id in class_ids or []:
+            try:
+                cls_key = str(int(cls_id))
+            except (TypeError, ValueError):
+                continue
+            if cls_key in relay_set and cls_key not in hits:
                 hits.append(cls_key)
         return hits
 
@@ -1513,6 +1553,65 @@ class DetectionWorker(QObject):
         self._arduino_trigger_timer = timer
         timer.start()
 
+    def _send_relay_command(self, command, state_label=None, require_enabled=True):
+        if not command or self.arduino_manager is None:
+            return False
+        if require_enabled and not self.relay_enabled:
+            return False
+        formatted_command = str(command).strip()
+        if not formatted_command:
+            return False
+        if not self.arduino_manager.is_connected():
+            if require_enabled:
+                self.status_update.emit("Arduino not connected.")
+            return False
+        try:
+            self.arduino_manager.send_command(formatted_command)
+        except Exception as err:
+            self.status_update.emit(f"Arduino error: {err}")
+            return False
+        if state_label:
+            self._relay_last_signal = state_label
+            self.relay_state_changed.emit(state_label)
+        return True
+
+    def _send_relay_trigger(self, require_enabled=True):
+        sent = self._send_relay_command(self.relay_trigger_command, "trigger", require_enabled=require_enabled)
+        if sent:
+            if require_enabled and self.relay_enabled:
+                self._relay_last_trigger_time = time.time()
+        return sent
+
+    def _send_relay_clear(self, require_enabled=True):
+        self._cancel_relay_trigger_timer()
+        return self._send_relay_command(self.relay_clear_command, "clear", require_enabled=require_enabled)
+
+    def _cancel_relay_trigger_timer(self):
+        timer = self._relay_trigger_timer
+        if timer is not None:
+            try:
+                if timer.is_alive():
+                    timer.cancel()
+            finally:
+                self._relay_trigger_timer = None
+
+    def _delayed_relay_trigger_fire(self):
+        self._relay_trigger_timer = None
+        self._send_relay_trigger(require_enabled=True)
+
+    def _schedule_relay_trigger(self):
+        if not self.relay_enabled:
+            return
+        delay = max(0.0, float(self.relay_trigger_delay or 0.0))
+        self._cancel_relay_trigger_timer()
+        if delay <= 0.0:
+            self._send_relay_trigger()
+            return
+        timer = threading.Timer(delay, self._delayed_relay_trigger_fire)
+        timer.daemon = True
+        self._relay_trigger_timer = timer
+        timer.start()
+
     @pyqtSlot(np.ndarray)
     def process_frame(self, cv_img):
         if self.is_busy:
@@ -1553,6 +1652,8 @@ class DetectionWorker(QObject):
         capture_only_hits = self._get_capture_only_yolo_hits(yolo_labels, yolo_ids)
         if capture_only_hits:
             self._enqueue_class_capture(processed_frame, original_frame, capture_only_hits, now_ts)
+        relay_class_filter_active = bool(getattr(self.detector, 'yolo_relay_classes', set()))
+        relay_class_ok = bool(self._get_relay_yolo_hits(yolo_labels, yolo_ids)) if relay_class_filter_active else True
         label_text = self._build_detection_label_text(yolo_labels, detection_sources)
         self._last_detection_label_text = label_text
         dangerous_hits = self._get_dangerous_yolo_hits(yolo_labels, yolo_ids)
@@ -1621,6 +1722,26 @@ class DetectionWorker(QObject):
                 last_active_ts = max(self._arduino_last_trigger_time, self._last_anomaly_seen_time)
                 if now_ts - last_active_ts >= self.arduino_clear_delay:
                     self._send_arduino_clear()
+
+        # The ejector decides on its own, independent of Servo/Danger/Color/Recon:
+        # it only cares whether one of the listed YOLO classes showed up this
+        # frame. Blank list = disabled (never fires), matching the "blank =
+        # none" convention used by Dangerous/Capture Classes.
+        relay_detection_active = relay_class_ok if relay_class_filter_active else False
+        if relay_detection_active:
+            self._relay_last_anomaly_seen_time = now_ts
+        if (
+            self.relay_enabled
+            and relay_detection_active
+            and self._relay_last_signal != "trigger"
+            and self._relay_trigger_timer is None
+        ):
+            self._schedule_relay_trigger()
+        elif self.relay_enabled and self.relay_clear_enabled and not relay_detection_active:
+            if self._relay_last_signal == "trigger" and self._relay_last_trigger_time > 0:
+                last_active_ts = max(self._relay_last_trigger_time, self._relay_last_anomaly_seen_time)
+                if now_ts - last_active_ts >= self.relay_clear_delay:
+                    self._send_relay_clear()
 
         should_auto_save = self.auto_save and is_anomaly_present
         save_due = (now_ts - self.last_save_time) >= self.auto_save_min_interval
@@ -1812,6 +1933,33 @@ class DetectionWorker(QObject):
         if not self.arduino_enabled:
             self._cancel_arduino_trigger_timer()
 
+    @pyqtSlot(bool, str, str, bool, float, float)
+    def configure_relay(
+        self,
+        enabled,
+        trigger_command,
+        clear_command,
+        clear_enabled,
+        clear_delay,
+        trigger_delay,
+    ):
+        self.relay_enabled = bool(enabled)
+        self.relay_trigger_command = (trigger_command or "").strip()
+        self.relay_clear_command = (clear_command or "").strip()
+        self.relay_clear_enabled = bool(clear_enabled)
+        try:
+            delay = float(clear_delay)
+        except (TypeError, ValueError):
+            delay = 0.0
+        self.relay_clear_delay = max(0.0, delay)
+        try:
+            trig_delay = float(trigger_delay)
+        except (TypeError, ValueError):
+            trig_delay = 0.0
+        self.relay_trigger_delay = max(0.0, trig_delay)
+        if not self.relay_enabled:
+            self._cancel_relay_trigger_timer()
+
     @pyqtSlot()
     def send_arduino_trigger_test(self):
         self._send_arduino_trigger(require_enabled=False)
@@ -1819,6 +1967,14 @@ class DetectionWorker(QObject):
     @pyqtSlot()
     def send_arduino_clear_now(self):
         self._send_arduino_clear(require_enabled=False)
+
+    @pyqtSlot()
+    def send_relay_trigger_test(self):
+        self._send_relay_trigger(require_enabled=False)
+
+    @pyqtSlot()
+    def send_relay_clear_now(self):
+        self._send_relay_clear(require_enabled=False)
 
     @pyqtSlot()
     def send_arduino_feed_on(self):
@@ -1866,6 +2022,7 @@ class DetectionWorker(QObject):
         self._reset_service_breaker_state()
         self.detector.first_inference = True
         self._last_anomaly_seen_time = 0.0
+        self._relay_last_anomaly_seen_time = 0.0
         self._danger_alarm_active = False
         if hasattr(self.detector, 'last_yolo_detections'):
             self.detector.last_yolo_detections = []
@@ -1876,6 +2033,9 @@ class DetectionWorker(QObject):
         self._cancel_arduino_trigger_timer()
         if self.arduino_enabled and (self.arduino_clear_enabled or force_clear):
             self._send_arduino_clear()
+        self._cancel_relay_trigger_timer()
+        if self.relay_enabled and (self.relay_clear_enabled or force_clear):
+            self._send_relay_clear()
         self._stop_stop_feed_beep()
 
 class ClickableLabel(QLabel):
@@ -2198,7 +2358,7 @@ class MainWindow(QMainWindow):
         self.monitor_resolution = (1280, 720)
         self.monitor_fps_limit = 30
         self.monitor_exposure_value = 0
-        self.monitor_preferred_fourcc = 'NV12'
+        self.monitor_preferred_fourcc = 'MJPG'
         self.monitor_active_fourcc_text = self.monitor_preferred_fourcc
         self.video_window.video_label.clicked.connect(self._handle_video_click)
         self.video_window.video_label.wheel.connect(self._handle_zoom)
@@ -2232,6 +2392,7 @@ class MainWindow(QMainWindow):
         self.detection_worker.arduino_state_changed.connect(self._handle_servo_state_changed)
         self.detection_worker.feeder_state_changed.connect(self._handle_feeder_state_changed)
         self.detection_worker.fan_state_changed.connect(self._handle_fan_state_changed)
+        self.detection_worker.relay_state_changed.connect(self._handle_relay_state_changed)
         self.detection_worker.detection_saved.connect(self._handle_stop_feed_detection_popup)
         self.detection_worker.service_breaker_triggered.connect(self._handle_service_breaker_trigger)
         self.detection_worker.stop_detection_requested.connect(self._handle_stop_detection_request)
@@ -2251,7 +2412,9 @@ class MainWindow(QMainWindow):
             self.detection_worker.set_service_breaker_enabled(self.service_breaker_check.isChecked())
         self._update_random_save_status(self.random_save_check.isChecked())
         self._push_arduino_config()
+        self._push_relay_config()
         self._handle_servo_state_changed(self.detection_worker._arduino_last_signal)
+        self._handle_relay_state_changed(self.detection_worker._relay_last_signal)
 
     @pyqtSlot(str)
     def _handle_servo_state_changed(self, state):
@@ -2264,6 +2427,10 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str)
     def _handle_fan_state_changed(self, state):
         self._apply_fan_state_to_indicator(state)
+
+    @pyqtSlot(str)
+    def _handle_relay_state_changed(self, state):
+        self._apply_relay_state_to_indicator(state)
 
     @pyqtSlot()
     def _handle_stop_detection_request(self):
@@ -2395,6 +2562,26 @@ class MainWindow(QMainWindow):
         elif normalized == "clear":
             color = "#e74c3c"
             text = "Closed"
+        else:
+            color = "#7f8c8d"
+            text = "Unknown"
+        light.setStyleSheet(
+            f"background-color: {color}; border-radius: 9px; border: 1px solid #111;"
+        )
+        label.setText(text)
+
+    def _apply_relay_state_to_indicator(self, state):
+        light = getattr(self, "relay_light", None)
+        label = getattr(self, "relay_status_label", None)
+        if light is None or label is None:
+            return
+        normalized = (state or "").strip().lower()
+        if normalized == "trigger":
+            color = "#2ecc71"
+            text = "Active"
+        elif normalized == "clear":
+            color = "#e74c3c"
+            text = "Idle"
         else:
             color = "#7f8c8d"
             text = "Unknown"
@@ -2705,6 +2892,19 @@ class MainWindow(QMainWindow):
         yolo_capture_row.addStretch()
         thresholds_layout.addLayout(yolo_capture_row)
         self._update_yolo_capture_classes('')
+        yolo_relay_row = QHBoxLayout()
+        yolo_relay_row.addWidget(QLabel('YOLO Air Ejector Classes:'))
+        self.yolo_relay_class_edit = QLineEdit()
+        self.yolo_relay_class_edit.setPlaceholderText('e.g. Stone, rice_worm (blank = none; ejector never fires)')
+        self.yolo_relay_class_edit.setToolTip('Classes listed here always reach the ejector, even if YOLO Class Filter above would otherwise exclude them. Blank = ejector disabled.')
+        self.yolo_relay_class_edit.textChanged.connect(self._update_yolo_relay_classes)
+        yolo_relay_row.addWidget(self.yolo_relay_class_edit)
+        self.yolo_relay_class_status = QLabel('None')
+        self.yolo_relay_class_status.setStyleSheet('color: #bdc3c7;')
+        yolo_relay_row.addWidget(self.yolo_relay_class_status)
+        yolo_relay_row.addStretch()
+        thresholds_layout.addLayout(yolo_relay_row)
+        self._update_yolo_relay_classes('')
         thresholds_layout.addLayout(thr)
         thresholds_layout.addLayout(cvthr)
         thresholds_layout.addLayout(cont)
@@ -3074,6 +3274,15 @@ class MainWindow(QMainWindow):
         hardware_row.addWidget(self.arduino_fan_light)
         self.arduino_fan_status_label = QLabel('Unknown')
         hardware_row.addWidget(self.arduino_fan_status_label)
+        hardware_row.addSpacing(16)
+
+        hardware_row.addWidget(QLabel('Air Ejector:'))
+        self.relay_light = QLabel()
+        self.relay_light.setFixedSize(18, 18)
+        self.relay_light.setStyleSheet('background-color: #7f8c8d; border-radius: 9px; border: 1px solid #111;')
+        hardware_row.addWidget(self.relay_light)
+        self.relay_status_label = QLabel('Unknown')
+        hardware_row.addWidget(self.relay_status_label)
         hardware_row.addStretch()
         layout.addLayout(hardware_row)
 
@@ -3138,6 +3347,51 @@ class MainWindow(QMainWindow):
         feed_row.addStretch()
         layout.addLayout(feed_row)
 
+        relay_enable_row = QHBoxLayout()
+        self.relay_enable_check = QCheckBox('Enable air ejector on anomaly')
+        self.relay_enable_check.toggled.connect(self._relay_config_changed)
+        relay_enable_row.addWidget(self.relay_enable_check)
+        relay_enable_row.addSpacing(12)
+        relay_enable_row.addWidget(QLabel('Trigger delay (s):'))
+        self.relay_trigger_delay_spin = DelayControl(minimum=0.0, maximum=30.0, step=0.1, value=0.0, decimals=1)
+        self.relay_trigger_delay_spin.valueChanged.connect(lambda _: self._relay_config_changed())
+        relay_enable_row.addWidget(self.relay_trigger_delay_spin)
+        relay_enable_row.addSpacing(24)
+        self.relay_auto_clear_check = QCheckBox('Auto-clear')
+        self.relay_auto_clear_check.toggled.connect(self._relay_config_changed)
+        relay_enable_row.addWidget(self.relay_auto_clear_check)
+        relay_enable_row.addSpacing(12)
+        relay_enable_row.addWidget(QLabel('Delay (s):'))
+        self.relay_clear_delay_spin = DelayControl(minimum=0.0, maximum=30.0, step=0.1, value=1.0, decimals=1)
+        self.relay_clear_delay_spin.valueChanged.connect(lambda _: self._relay_config_changed())
+        relay_enable_row.addWidget(self.relay_clear_delay_spin)
+        relay_enable_row.addStretch()
+        layout.addLayout(relay_enable_row)
+
+        relay_command_row = QHBoxLayout()
+        relay_command_row.addWidget(QLabel('Ejector ON cmd:'))
+        self.relay_trigger_edit = QLineEdit('R1')
+        self.relay_trigger_edit.setMaxLength(64)
+        self.relay_trigger_edit.editingFinished.connect(self._relay_config_changed)
+        relay_command_row.addWidget(self.relay_trigger_edit)
+        relay_command_row.addWidget(QLabel('Ejector OFF cmd:'))
+        self.relay_clear_edit = QLineEdit('R0')
+        self.relay_clear_edit.setMaxLength(64)
+        self.relay_clear_edit.editingFinished.connect(self._relay_config_changed)
+        relay_command_row.addWidget(self.relay_clear_edit)
+        relay_command_row.addStretch()
+        layout.addLayout(relay_command_row)
+
+        relay_test_row = QHBoxLayout()
+        self.relay_trigger_test_btn = QPushButton('Test Ejector ON')
+        self.relay_trigger_test_btn.clicked.connect(self._send_relay_test_trigger)
+        relay_test_row.addWidget(self.relay_trigger_test_btn)
+        self.relay_clear_test_btn = QPushButton('Send Ejector OFF')
+        self.relay_clear_test_btn.clicked.connect(self._send_relay_test_clear)
+        relay_test_row.addWidget(self.relay_clear_test_btn)
+        relay_test_row.addStretch()
+        layout.addLayout(relay_test_row)
+
         group.setLayout(layout)
 
         if serial is None:
@@ -3158,6 +3412,14 @@ class MainWindow(QMainWindow):
                 self.arduino_fan_on_btn,
                 self.arduino_fan_off_btn,
                 self.arduino_baud_combo,
+                self.relay_enable_check,
+                self.relay_auto_clear_check,
+                self.relay_trigger_delay_spin,
+                self.relay_clear_delay_spin,
+                self.relay_trigger_edit,
+                self.relay_clear_edit,
+                self.relay_trigger_test_btn,
+                self.relay_clear_test_btn,
             ):
                 widget.setEnabled(False)
         self._update_arduino_ui_state()
@@ -3208,6 +3470,10 @@ class MainWindow(QMainWindow):
                 self.arduino_fan_on_btn.setEnabled(True)
             if hasattr(self, 'arduino_fan_off_btn'):
                 self.arduino_fan_off_btn.setEnabled(True)
+            if hasattr(self, 'relay_trigger_test_btn'):
+                self.relay_trigger_test_btn.setEnabled(True)
+            if hasattr(self, 'relay_clear_test_btn'):
+                self.relay_clear_test_btn.setEnabled(True)
             if hasattr(self, 'detection_worker'):
                 if hasattr(self.detection_worker, '_arduino_last_signal'):
                     self._handle_servo_state_changed(self.detection_worker._arduino_last_signal)
@@ -3215,6 +3481,8 @@ class MainWindow(QMainWindow):
                     self._handle_feeder_state_changed(self.detection_worker._arduino_last_feeder_signal)
                 if hasattr(self.detection_worker, '_arduino_last_fan_signal'):
                     self._handle_fan_state_changed(self.detection_worker._arduino_last_fan_signal)
+                if hasattr(self.detection_worker, '_relay_last_signal'):
+                    self._handle_relay_state_changed(self.detection_worker._relay_last_signal)
         else:
             default_text = 'Not connected' if serial is not None else 'pyserial not installed'
             self.arduino_status_label.setText(default_text)
@@ -3230,9 +3498,14 @@ class MainWindow(QMainWindow):
                 self.arduino_fan_on_btn.setEnabled(False)
             if hasattr(self, 'arduino_fan_off_btn'):
                 self.arduino_fan_off_btn.setEnabled(False)
+            if hasattr(self, 'relay_trigger_test_btn'):
+                self.relay_trigger_test_btn.setEnabled(False)
+            if hasattr(self, 'relay_clear_test_btn'):
+                self.relay_clear_test_btn.setEnabled(False)
             self._apply_servo_state_to_indicator('unknown')
             self._apply_feeder_state_to_indicator('unknown')
             self._apply_fan_state_to_indicator('unknown')
+            self._apply_relay_state_to_indicator('unknown')
         self._update_arduino_delay_spin_states()
 
     def _handle_arduino_connect(self):
@@ -3344,6 +3617,46 @@ class MainWindow(QMainWindow):
         self.detection_worker.send_arduino_fan_off()
         self.status_bar.showMessage('Fan OFF command sent to Arduino (Pin 8).', 2000)
 
+    def _relay_config_changed(self, *_):
+        self._update_arduino_delay_spin_states()
+        self._push_relay_config()
+
+    def _push_relay_config(self):
+        if not hasattr(self, 'detection_worker'):
+            return
+        enabled = self.relay_enable_check.isChecked() if hasattr(self, 'relay_enable_check') else False
+        trigger_cmd = self.relay_trigger_edit.text() if hasattr(self, 'relay_trigger_edit') else ''
+        clear_cmd = self.relay_clear_edit.text() if hasattr(self, 'relay_clear_edit') else ''
+        auto_clear = self.relay_auto_clear_check.isChecked() if hasattr(self, 'relay_auto_clear_check') else False
+        clear_delay = self.relay_clear_delay_spin.value() if hasattr(self, 'relay_clear_delay_spin') else 1.0
+        trigger_delay = self.relay_trigger_delay_spin.value() if hasattr(self, 'relay_trigger_delay_spin') else 0.0
+        self.detection_worker.configure_relay(
+            enabled,
+            trigger_cmd,
+            clear_cmd,
+            auto_clear,
+            clear_delay,
+            trigger_delay,
+        )
+
+    def _send_relay_test_trigger(self):
+        if serial is None:
+            return
+        if not self.arduino_manager.is_connected():
+            self.status_bar.showMessage('Arduino not connected.', 2000)
+            return
+        self.detection_worker.send_relay_trigger_test()
+        self.status_bar.showMessage('Ejector ON command sent.', 2000)
+
+    def _send_relay_test_clear(self):
+        if serial is None:
+            return
+        if not self.arduino_manager.is_connected():
+            self.status_bar.showMessage('Arduino not connected.', 2000)
+            return
+        self.detection_worker.send_relay_clear_now()
+        self.status_bar.showMessage('Ejector OFF command sent.', 2000)
+
     def _update_arduino_delay_spin_states(self):
         trigger_spin = getattr(self, 'arduino_trigger_delay_spin', None)
         if trigger_spin is not None:
@@ -3351,6 +3664,12 @@ class MainWindow(QMainWindow):
         clear_spin = getattr(self, 'arduino_clear_delay_spin', None)
         if clear_spin is not None:
             clear_spin.setEnabled(serial is not None)
+        relay_trigger_spin = getattr(self, 'relay_trigger_delay_spin', None)
+        if relay_trigger_spin is not None:
+            relay_trigger_spin.setEnabled(serial is not None)
+        relay_clear_spin = getattr(self, 'relay_clear_delay_spin', None)
+        if relay_clear_spin is not None:
+            relay_clear_spin.setEnabled(serial is not None)
 
     def _create_status_bar(self):
         self.status_bar = QStatusBar()
@@ -3658,6 +3977,17 @@ class MainWindow(QMainWindow):
                 count = len(self.detector.yolo_capture_classes)
                 status_label.setText(f"Capturing {count} class{'es' if count != 1 else ''}")
                 status_label.setStyleSheet('color: #3498db;')
+            else:
+                status_label.setText('None')
+                status_label.setStyleSheet('color: #bdc3c7;')
+    def _update_yolo_relay_classes(self, text):
+        self.detector.set_yolo_relay_classes(text or "")
+        status_label = getattr(self, 'yolo_relay_class_status', None)
+        if status_label is not None:
+            if self.detector.yolo_relay_classes:
+                count = len(self.detector.yolo_relay_classes)
+                status_label.setText(f"Ejector on {count} class{'es' if count != 1 else ''}")
+                status_label.setStyleSheet('color: #9b59b6;')
             else:
                 status_label.setText('None')
                 status_label.setStyleSheet('color: #bdc3c7;')
@@ -4702,6 +5032,8 @@ class MainWindow(QMainWindow):
             s.setValue('yolo_dangerous_classes', self.yolo_danger_class_edit.text())
         if hasattr(self, 'yolo_capture_class_edit'):
             s.setValue('yolo_capture_classes', self.yolo_capture_class_edit.text())
+        if hasattr(self, 'yolo_relay_class_edit'):
+            s.setValue('yolo_relay_classes', self.yolo_relay_class_edit.text())
         s.setValue('mode_index', self.mode_combo.currentIndex())
         s.setValue('h_low', self.h_low_slider.value())
         s.setValue('h_high', self.h_high_slider.value())
@@ -4733,6 +5065,13 @@ class MainWindow(QMainWindow):
             s.setValue('arduino_baud', self.arduino_baud_combo.currentText())
             if hasattr(self, 'stop_feed_on_detect_check'):
                 s.setValue('stop_feed_on_detect', self.stop_feed_on_detect_check.isChecked())
+        if hasattr(self, 'relay_enable_check'):
+            s.setValue('relay_enabled', self.relay_enable_check.isChecked())
+            s.setValue('relay_auto_clear', self.relay_auto_clear_check.isChecked())
+            s.setValue('relay_clear_delay', self.relay_clear_delay_spin.value())
+            s.setValue('relay_trigger_delay', self.relay_trigger_delay_spin.value())
+            s.setValue('relay_trigger_cmd', self.relay_trigger_edit.text())
+            s.setValue('relay_clear_cmd', self.relay_clear_edit.text())
 
     def _load_settings(self):
         s = QSettings('config.ini', QSettings.Format.IniFormat)
@@ -4775,6 +5114,12 @@ class MainWindow(QMainWindow):
             self.yolo_capture_class_edit.setText(saved_capture)
             self.yolo_capture_class_edit.blockSignals(False)
             self._update_yolo_capture_classes(saved_capture)
+        if hasattr(self, 'yolo_relay_class_edit'):
+            saved_relay = s.value('yolo_relay_classes', '', type=str)
+            self.yolo_relay_class_edit.blockSignals(True)
+            self.yolo_relay_class_edit.setText(saved_relay)
+            self.yolo_relay_class_edit.blockSignals(False)
+            self._update_yolo_relay_classes(saved_relay)
         self.contour_slider.setValue(s.value('contour_area',10,type=int))
         if hasattr(self, 'backend_combo'):
             backend_idx = s.value('backend_index', 0, type=int)
@@ -4874,6 +5219,34 @@ class MainWindow(QMainWindow):
                 self.detection_worker.set_stop_feeder_on_detect(stop_feed)
             self._update_arduino_ui_state()
             self._update_arduino_delay_spin_states()
+        if hasattr(self, 'relay_enable_check'):
+            relay_trigger_cmd = s.value('relay_trigger_cmd', 'R1')
+            relay_clear_cmd = s.value('relay_clear_cmd', 'R0')
+            self.relay_trigger_edit.setText(relay_trigger_cmd)
+            self.relay_clear_edit.setText(relay_clear_cmd)
+            self.relay_enable_check.blockSignals(True)
+            self.relay_enable_check.setChecked(s.value('relay_enabled', False, type=bool))
+            self.relay_enable_check.blockSignals(False)
+            self.relay_auto_clear_check.blockSignals(True)
+            self.relay_auto_clear_check.setChecked(s.value('relay_auto_clear', True, type=bool))
+            self.relay_auto_clear_check.blockSignals(False)
+            relay_trigger_delay_value = s.value('relay_trigger_delay', 0.0)
+            try:
+                relay_trigger_delay_value = float(relay_trigger_delay_value)
+            except (TypeError, ValueError):
+                relay_trigger_delay_value = 0.0
+            self.relay_trigger_delay_spin.blockSignals(True)
+            self.relay_trigger_delay_spin.setValue(max(0.0, relay_trigger_delay_value))
+            self.relay_trigger_delay_spin.blockSignals(False)
+            relay_clear_delay_value = s.value('relay_clear_delay', 1.0)
+            try:
+                relay_clear_delay_value = float(relay_clear_delay_value)
+            except (TypeError, ValueError):
+                relay_clear_delay_value = 1.0
+            self.relay_clear_delay_spin.blockSignals(True)
+            self.relay_clear_delay_spin.setValue(relay_clear_delay_value)
+            self.relay_clear_delay_spin.blockSignals(False)
+            self._update_arduino_delay_spin_states()
         mode_idx = s.value('mode_index',0,type=int); self.mode_combo.setCurrentIndex(mode_idx)
         self.h_low_slider.setValue(s.value('h_low',15,type=int)); self.h_high_slider.setValue(s.value('h_high',35,type=int))
         self.s_min_slider.setValue(s.value('s_min',60,type=int)); self.v_min_slider.setValue(s.value('v_min',120,type=int))
@@ -4934,6 +5307,7 @@ class MainWindow(QMainWindow):
         self.hsv_target_locked = lock_hsv
 
         self._push_arduino_config()
+        self._push_relay_config()
 
         if mode_idx in (1,2) and not model_path:
             self.start_btn.setDisabled(False); self.test_image_btn.setDisabled(False)
