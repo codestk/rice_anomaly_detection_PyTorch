@@ -1,5 +1,49 @@
 แกหแกห
 
+## 2026-09-23 (3)
+
+- Added an "which image caused this ejector shot" trail: whenever the air ejector newly fires (relay transitions from idle to trigger), `DetectionWorker._process_frame_impl` in `onefileV19.py` now saves that frame to `output/ejector_captures/` (annotated) and `output/ejector_captures_original/` (raw), one file per matched class, named `<ClassName>_<timestamp>.png` — e.g. `Stone_20260923_...png`. Mirrors the existing "YOLO Capture Classes" save mechanism.
+- Refactored `DetectionWorker._enqueue_class_capture` into a shared `_enqueue_labeled_capture(..., capture_dir, original_dir, rate_limit_state, min_interval, source)` helper, reused by the existing capture-classes path and the new `_enqueue_relay_capture`. Added `self._relay_capture_last_save_time = {}`.
+- Save-worker log line for this task kind now reads `"{source} '{label}' saved: ..."` (`source` is `"YOLO capture class"` or `"Ejector trigger"`) instead of a hardcoded "YOLO capture class" label, so the console log also distinguishes the two.
+- `_process_frame_impl` now keeps the `relay_hits` list (from `_get_relay_yolo_hits`) around instead of discarding it, so the triggering class name(s) are available to pass into the capture.
+- Files modified: `onefileV19.py`, `HISTORY.md`.
+- Verified syntax with `python -m py_compile onefileV19.py`.
+
+## 2026-09-23 (2)
+
+- Closed a race in the 2026-09-23 ejector/auto-cleansing fix: on the exact frame where a dangerous class is first detected, `DetectionWorker._process_frame_impl` in `onefileV19.py` used to run its ejector trigger logic *before* the (cross-thread, queued) `dangerous_detection_triggered` signal reached `MainWindow._handle_dangerous_detection`, so the ejector could still fire for one frame if that same frame also matched an Ejector class, before being cleared a moment later.
+- Now `dangerous_hit` takes priority over the ejector's own trigger check, synchronously on the worker thread: whenever a dangerous class is present in the frame, any active/pending ejector trigger is force-cleared immediately and no new trigger is scheduled, regardless of Ejector Classes. The `send_relay_clear_now()` call added on 2026-09-23 in `_handle_dangerous_detection` stays as a second, redundant safety net.
+- Files modified: `onefileV19.py`, `HISTORY.md`.
+- Verified syntax with `python -m py_compile onefileV19.py`.
+
+## 2026-09-23
+
+- Fixed: air ejector could stay/latch active during a dangerous-YOLO-class pause + "Auto cleansing" fan-clear sequence, since no frames are processed while detection is paused so nothing sent a clear command. `MainWindow._handle_dangerous_detection` in `onefileV19.py` now calls `DetectionWorker.send_relay_clear_now()` right after pausing (cancels any pending relay trigger timer and force-sends the ejector OFF command), so the ejector stays idle for the whole danger pause/auto-cleansing window.
+- Files modified: `onefileV19.py`, `HISTORY.md`.
+- Verified syntax with `python -m py_compile onefileV19.py`.
+
+## 2026-09-21
+
+- Renamed the "Stop feeder on detection" checkbox label to "Stop feeder on anomaly" in `onefileV19.py` (tooltip and underlying `stop_feed_on_detect_check`/`stop_feeder_on_detect` names unchanged).
+- Removed the always-visible Thai hint label added under that checkbox on 2026-09-20 (2) — user said it took up too much space; the hover tooltip still explains the pause/5-beep/manual-Resume behavior.
+- Files modified: `onefileV19.py`, `HISTORY.md`.
+- Verified syntax with `python -m py_compile onefileV19.py`.
+
+## 2026-09-20 (2)
+
+- Added a visible (always-shown) Thai-language hint label under the "Stop feeder on detection" checkbox in `onefileV19.py`, explaining the pause/5-beep/manual-Resume behavior directly in the UI instead of relying only on the checkbox's hover tooltip.
+- Files modified: `onefileV19.py`, `HISTORY.md`.
+- Verified syntax with `python -m py_compile onefileV19.py`.
+
+## 2026-09-20
+
+- Changed `onefileV19.py` "Stop feeder on detection" behavior: on any new anomaly (including objects the model has never seen before), it now sends FEEDOFF, plays a bounded 5-beep alert, and **pauses** detection instead of fully stopping it, so an operator can remove the item and click Resume Detection to continue without reopening the camera.
+- Replaced `DetectionWorker.stop_detection_requested`/`_handle_stop_detection_request` (full stop) with `pause_detection_requested`/`_handle_pause_detection_request` (pause) in `MainWindow`.
+- Removed the now-dead continuous stop-feed beep machinery (`_start_stop_feed_beep`, `_continuous_beep_loop`, `_stop_stop_feed_beep`, `_stop_feed_beep_active`, `_stop_feed_beep_thread`) and its call sites, replacing it with `_play_pause_on_anomaly_beep` (5 beeps, ~0.55s apart, self-terminating).
+- Updated the "Stop feeder on detection" checkbox tooltip to describe the new pause/beep-5x/manual-resume behavior.
+- Files modified: `onefileV19.py`, `HISTORY.md`.
+- Verified syntax with `python -m py_compile onefileV19.py`.
+
 ## 2026-08-24
 
 - Updated `onefileV18.py` dangerous YOLO class handling so after a danger class triggers feeder OFF and detection pause, the app waits 1 second then saves the latest live camera frame.

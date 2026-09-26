@@ -1090,7 +1090,7 @@ class DetectionWorker(QObject):
     relay_state_changed = pyqtSignal(str)
     detection_saved = pyqtSignal(str)
     service_breaker_triggered = pyqtSignal(str)
-    stop_detection_requested = pyqtSignal()
+    pause_detection_requested = pyqtSignal()
     dangerous_detection_triggered = pyqtSignal(str)
     def __init__(self, detector):
         super().__init__()
@@ -1106,8 +1106,6 @@ class DetectionWorker(QObject):
         self.anomaly_count = 0
         self.beep_enabled = False
         self.stop_feeder_on_detect = False
-        self._stop_feed_beep_active = False
-        self._stop_feed_beep_thread = None
         self._danger_alarm_active = False
         self.service_breaker_enabled = False
         self.service_breaker_limit =18
@@ -1143,6 +1141,7 @@ class DetectionWorker(QObject):
         self.last_saved_detection_path = ""
         self.class_capture_min_interval = 0.8
         self._class_capture_last_save_time = {}
+        self._relay_capture_last_save_time = {}
         self._save_queue = queue.Queue(maxsize=16)
         self._save_thread = threading.Thread(target=self._save_worker, daemon=True)
         self._save_thread.start()
@@ -1161,33 +1160,16 @@ class DetectionWorker(QObject):
             return
         threading.Thread(target=self._beep_thread_target, daemon=True).start()
 
-    def _continuous_beep_loop(self):
-        while self._stop_feed_beep_active:
-            try:
-                winsound.Beep(1200, 600)
-            except Exception as e:
-                print(f"Error playing continuous beep: {e}")
-                break
+    def _pause_on_anomaly_beep_loop(self):
+        try:
+            for _ in range(5):
+                winsound.Beep(1200, 400)
+                time.sleep(0.15)
+        except Exception as e:
+            print(f"Error playing pause-on-anomaly beep sequence: {e}")
 
-    def _start_stop_feed_beep(self):
-        if self._stop_feed_beep_active:
-            return
-        self._stop_feed_beep_active = True
-        thread = threading.Thread(target=self._continuous_beep_loop, daemon=True)
-        self._stop_feed_beep_thread = thread
-        thread.start()
-
-    def _stop_stop_feed_beep(self):
-        if not self._stop_feed_beep_active:
-            return
-        self._stop_feed_beep_active = False
-        thread = self._stop_feed_beep_thread
-        self._stop_feed_beep_thread = None
-        if thread is not None and thread.is_alive():
-            try:
-                thread.join(timeout=0.1)
-            except Exception:
-                pass
+    def _play_pause_on_anomaly_beep(self):
+        threading.Thread(target=self._pause_on_anomaly_beep_loop, daemon=True).start()
 
     def _play_service_breaker_alarm(self):
         def _alarm():
@@ -1263,16 +1245,24 @@ class DetectionWorker(QObject):
                 hits.append(cls_key)
         return hits
 
-    def _enqueue_class_capture(self, processed_frame, original_frame, hits, now_ts):
-        """Save matched YOLO capture classes with annotated and original frames."""
+    def _enqueue_labeled_capture(
+        self,
+        processed_frame,
+        original_frame,
+        hits,
+        now_ts,
+        capture_dir,
+        original_dir,
+        rate_limit_state,
+        min_interval,
+        source,
+    ):
         for label in dict.fromkeys(hits):
-            last_ts = self._class_capture_last_save_time.get(label, 0.0)
-            if (now_ts - last_ts) < self.class_capture_min_interval:
+            last_ts = rate_limit_state.get(label, 0.0)
+            if (now_ts - last_ts) < min_interval:
                 continue
-            self._class_capture_last_save_time[label] = now_ts
+            rate_limit_state[label] = now_ts
             safe_label = re.sub(r'[\\/:*?"<>|]+', '_', label).strip() or 'unknown'
-            capture_dir = os.path.join('output', 'yolo_captures')
-            original_dir = os.path.join('output', 'yolo_captures_original')
             ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
             fname = f"{safe_label}_{ts}.png"
             task = {
@@ -1282,6 +1272,7 @@ class DetectionWorker(QObject):
                 "capture_path": os.path.join(capture_dir, fname),
                 "original_path": os.path.join(original_dir, fname),
                 "label": label,
+                "source": source,
                 "processed_frame": processed_frame,
                 "original_frame": original_frame,
             }
@@ -1289,6 +1280,35 @@ class DetectionWorker(QObject):
                 self._save_queue.put_nowait(task)
             except queue.Full:
                 pass
+
+    def _enqueue_class_capture(self, processed_frame, original_frame, hits, now_ts):
+        """Save matched YOLO capture classes with annotated and original frames."""
+        self._enqueue_labeled_capture(
+            processed_frame,
+            original_frame,
+            hits,
+            now_ts,
+            os.path.join('output', 'yolo_captures'),
+            os.path.join('output', 'yolo_captures_original'),
+            self._class_capture_last_save_time,
+            self.class_capture_min_interval,
+            "YOLO capture class",
+        )
+
+    def _enqueue_relay_capture(self, processed_frame, original_frame, hits, now_ts):
+        """Save the frame(s) that caused the air ejector to fire, labeled by class so
+        the filename shows which detection triggered that shot."""
+        self._enqueue_labeled_capture(
+            processed_frame,
+            original_frame,
+            hits,
+            now_ts,
+            os.path.join('output', 'ejector_captures'),
+            os.path.join('output', 'ejector_captures_original'),
+            self._relay_capture_last_save_time,
+            self.class_capture_min_interval,
+            "Ejector trigger",
+        )
 
     def _reset_service_breaker_state(self):
         self._consecutive_detection_events = 0
@@ -1348,11 +1368,12 @@ class DetectionWorker(QObject):
                     processed_frame = task["processed_frame"]
                     original_frame = task["original_frame"]
                     label = task.get("label", "")
+                    source = task.get("source", "YOLO capture class")
                     os.makedirs(capture_dir, exist_ok=True)
                     os.makedirs(original_dir, exist_ok=True)
                     cv2.imwrite(capture_path, processed_frame)
                     cv2.imwrite(original_path, original_frame)
-                    print(f"[LOG {time.time():.2f}] YOLO capture class '{label}' saved: {os.path.abspath(capture_path)}")
+                    print(f"[LOG {time.time():.2f}] {source} '{label}' saved: {os.path.abspath(capture_path)}")
                 elif kind == "training":
                     ori_dir = task["ori_dir"]
                     ori_path = task["ori_path"]
@@ -1653,7 +1674,8 @@ class DetectionWorker(QObject):
         if capture_only_hits:
             self._enqueue_class_capture(processed_frame, original_frame, capture_only_hits, now_ts)
         relay_class_filter_active = bool(getattr(self.detector, 'yolo_relay_classes', set()))
-        relay_class_ok = bool(self._get_relay_yolo_hits(yolo_labels, yolo_ids)) if relay_class_filter_active else True
+        relay_hits = self._get_relay_yolo_hits(yolo_labels, yolo_ids) if relay_class_filter_active else []
+        relay_class_ok = bool(relay_hits) if relay_class_filter_active else True
         label_text = self._build_detection_label_text(yolo_labels, detection_sources)
         self._last_detection_label_text = label_text
         dangerous_hits = self._get_dangerous_yolo_hits(yolo_labels, yolo_ids)
@@ -1707,8 +1729,8 @@ class DetectionWorker(QObject):
             self._play_beep_async()
             if self.stop_feeder_on_detect and not dangerous_hit:
                 self.send_arduino_feed_off()
-                self._start_stop_feed_beep()
-                self.stop_detection_requested.emit()
+                self._play_pause_on_anomaly_beep()
+                self.pause_detection_requested.emit()
         if (
             self.arduino_enabled
             and is_new_anomaly_found
@@ -1723,19 +1745,34 @@ class DetectionWorker(QObject):
                 if now_ts - last_active_ts >= self.arduino_clear_delay:
                     self._send_arduino_clear()
 
-        # The ejector decides on its own, independent of Servo/Danger/Color/Recon:
+        # The ejector decides on its own, independent of Servo/Color/Recon:
         # it only cares whether one of the listed YOLO classes showed up this
         # frame. Blank list = disabled (never fires), matching the "blank =
         # none" convention used by Dangerous/Capture Classes.
+        #
+        # One deliberate exception: a dangerous-class hit always wins over the
+        # ejector, even on the very same frame that triggers it. Danger pauses
+        # detection (see _handle_dangerous_detection), and no more frames get
+        # processed while paused, so nothing would normally re-issue a clear
+        # command until resume; forcing it off here (on the worker thread,
+        # synchronously) guarantees the ejector stays idle through the whole
+        # danger pause / auto-cleansing window instead of depending on the
+        # cross-thread pause signal winning a race against this same frame's
+        # relay trigger.
         relay_detection_active = relay_class_ok if relay_class_filter_active else False
         if relay_detection_active:
             self._relay_last_anomaly_seen_time = now_ts
-        if (
+        if dangerous_hit:
+            if self._relay_last_signal == "trigger" or self._relay_trigger_timer is not None:
+                self._send_relay_clear()
+        elif (
             self.relay_enabled
             and relay_detection_active
             and self._relay_last_signal != "trigger"
             and self._relay_trigger_timer is None
         ):
+            if relay_hits:
+                self._enqueue_relay_capture(processed_frame, original_frame, relay_hits, now_ts)
             self._schedule_relay_trigger()
         elif self.relay_enabled and self.relay_clear_enabled and not relay_detection_active:
             if self._relay_last_signal == "trigger" and self._relay_last_trigger_time > 0:
@@ -1979,18 +2016,14 @@ class DetectionWorker(QObject):
     @pyqtSlot()
     def send_arduino_feed_on(self):
         if self._send_arduino_command("FEEDON", require_enabled=False):
-            self._stop_stop_feed_beep()
             self._arduino_last_feeder_signal = "ON"
             self.feeder_state_changed.emit("ON")
 
     @pyqtSlot()
     def send_arduino_feed_off(self):
         if self._send_arduino_command("FEEDOFF", require_enabled=False):
-            self._stop_stop_feed_beep()
             self._arduino_last_feeder_signal = "OFF"
             self.feeder_state_changed.emit("OFF")
-        else:
-            self._stop_stop_feed_beep()
 
     @pyqtSlot()
     def send_arduino_fan_on(self):
@@ -2007,8 +2040,6 @@ class DetectionWorker(QObject):
     @pyqtSlot(bool)
     def set_stop_feeder_on_detect(self, status):
         self.stop_feeder_on_detect = bool(status)
-        if not self.stop_feeder_on_detect:
-            self._stop_stop_feed_beep()
     @pyqtSlot(bool)
     def set_service_breaker_enabled(self, status):
         self.service_breaker_enabled = bool(status)
@@ -2036,7 +2067,6 @@ class DetectionWorker(QObject):
         self._cancel_relay_trigger_timer()
         if self.relay_enabled and (self.relay_clear_enabled or force_clear):
             self._send_relay_clear()
-        self._stop_stop_feed_beep()
 
 class ClickableLabel(QLabel):
     clicked = pyqtSignal(int, int)
@@ -2395,7 +2425,7 @@ class MainWindow(QMainWindow):
         self.detection_worker.relay_state_changed.connect(self._handle_relay_state_changed)
         self.detection_worker.detection_saved.connect(self._handle_stop_feed_detection_popup)
         self.detection_worker.service_breaker_triggered.connect(self._handle_service_breaker_trigger)
-        self.detection_worker.stop_detection_requested.connect(self._handle_stop_detection_request)
+        self.detection_worker.pause_detection_requested.connect(self._handle_pause_detection_request)
         self.detection_worker.dangerous_detection_triggered.connect(self._handle_dangerous_detection)
         self.detection_frame_ready.connect(self.detection_worker.process_frame)
         if hasattr(self, 'service_breaker_check'):
@@ -2433,11 +2463,14 @@ class MainWindow(QMainWindow):
         self._apply_relay_state_to_indicator(state)
 
     @pyqtSlot()
-    def _handle_stop_detection_request(self):
+    def _handle_pause_detection_request(self):
         if not self.is_detection_running:
             return
-        self._stop_detection()
-        self.status_bar.showMessage('Detection auto-stopped because feeder stop on detect is enabled.')
+        self._pause_detection()
+        self.status_bar.showMessage(
+            'Anomaly detected — feeder stopped, detection paused. Remove the item, then click Resume Detection.',
+            8000,
+        )
 
     @pyqtSlot(str)
     def _handle_dangerous_detection(self, message):
@@ -2448,6 +2481,12 @@ class MainWindow(QMainWindow):
             return
         self._pause_detection()
         self._schedule_danger_delayed_snapshot()
+        # Force the air ejector idle for the whole danger pause/auto-cleansing
+        # window. No frames are processed while paused, so nothing would
+        # normally turn it back on until detection resumes; this just makes
+        # sure it isn't left blowing if it happened to be active already.
+        if hasattr(self, 'detection_worker'):
+            self.detection_worker.send_relay_clear_now()
         if self._start_danger_auto_fan_clear_sequence(message):
             return
         self.status_bar.showMessage(f"{message}. Detection paused.", 8000)
@@ -2998,8 +3037,11 @@ class MainWindow(QMainWindow):
         auto_beep_row.addWidget(self.auto_save_check)
         auto_beep_row.addWidget(self.auto_save_status_label)
         auto_beep_row.addSpacing(24)
-        self.stop_feed_on_detect_check = QCheckBox('Stop feeder on detection')
-        self.stop_feed_on_detect_check.setToolTip('Automatically send FEEDOFF and stop detection when a new anomaly is detected.')
+        self.stop_feed_on_detect_check = QCheckBox('Stop feeder on anomaly')
+        self.stop_feed_on_detect_check.setToolTip(
+            'On any new anomaly (including ones the model has never seen before): send FEEDOFF, '
+            'beep 5 times, and pause detection. Remove the item, then click Resume Detection manually.'
+        )
         auto_beep_row.addWidget(self.stop_feed_on_detect_check)
         auto_beep_row.addSpacing(24)
         self.service_breaker_check = QCheckBox('Service Breaker')
