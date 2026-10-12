@@ -1139,7 +1139,16 @@ class DetectionWorker(QObject):
         self._relay_last_anomaly_seen_time = 0.0
         self._relay_trigger_timer = None
         self.last_saved_detection_path = ""
-        self.class_capture_min_interval = 0.8
+        # Same cooldown for every class (per-label, in the rate_limit_state
+        # dict passed to _enqueue_labeled_capture) — lowered from 0.8s so an
+        # object crossing the rail gets several captures instead of just one.
+        # How many captures an object actually gets is roughly its dwell
+        # time in frame divided by this cooldown, not the camera's rated
+        # FPS: a camera with a narrower field of view can show an object for
+        # less real time despite a higher max FPS, needing a shorter
+        # cooldown to still land the same number of shots. 0.04s keeps up
+        # with a real achieved throughput of ~30fps (frame interval ~33ms).
+        self.class_capture_min_interval = 0.04
         self._class_capture_last_save_time = {}
         self._relay_capture_last_save_time = {}
         self._save_queue = queue.Queue(maxsize=16)
@@ -1773,6 +1782,13 @@ class DetectionWorker(QObject):
         ):
             if relay_hits:
                 self._enqueue_relay_capture(processed_frame, original_frame, relay_hits, now_ts)
+                # An ejector-class object is a foreign object too, so it counts
+                # as a detection. Skip if this frame was already counted as a
+                # normal anomaly above, to avoid double counting.
+                if not is_new_anomaly_found:
+                    self.anomaly_count += 1
+                    self._record_detection_summary(relay_hits, [])
+                    self._play_beep_async()
             self._schedule_relay_trigger()
         elif self.relay_enabled and self.relay_clear_enabled and not relay_detection_active:
             if self._relay_last_signal == "trigger" and self._relay_last_trigger_time > 0:
@@ -3372,9 +3388,21 @@ class MainWindow(QMainWindow):
         test_row.addWidget(self.arduino_clear_test_btn)
         self.arduino_feed_on_btn = QPushButton('Feeder ON (Pin 7)')
         self.arduino_feed_on_btn.clicked.connect(self._send_arduino_feed_on)
+        self.arduino_feed_on_btn.setStyleSheet(
+            'QPushButton { background-color: #27ae60; border: 1px solid #1e8449; font-weight: bold; }'
+            'QPushButton:hover { background-color: #2ecc71; }'
+            'QPushButton:pressed { background-color: #1e8449; }'
+            'QPushButton:disabled { background-color: #3d6b52; color: #aaa; border-color: #2f4f3f; }'
+        )
         test_row.addWidget(self.arduino_feed_on_btn)
         self.arduino_feed_off_btn = QPushButton('Feeder OFF (Pin 7)')
         self.arduino_feed_off_btn.clicked.connect(self._send_arduino_feed_off)
+        self.arduino_feed_off_btn.setStyleSheet(
+            'QPushButton { background-color: #c0392b; border: 1px solid #922b21; font-weight: bold; }'
+            'QPushButton:hover { background-color: #e74c3c; }'
+            'QPushButton:pressed { background-color: #922b21; }'
+            'QPushButton:disabled { background-color: #6b3630; color: #aaa; border-color: #4f2a26; }'
+        )
         test_row.addWidget(self.arduino_feed_off_btn)
         self.arduino_fan_on_btn = QPushButton('Fan ON (Pin 8)')
         self.arduino_fan_on_btn.clicked.connect(self._send_arduino_fan_on)

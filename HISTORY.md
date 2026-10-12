@@ -1,5 +1,108 @@
 แกหแกห
 
+## 2026-10-11
+
+- `onefileV20.py`: settings are no longer saved automatically when the window closes — removed `self._save_settings()` from `MainWindow.closeEvent`. Added a "Save Settings" button at the end of the bottom button row (after "Clear ALL output"), wired to new `_save_settings_clicked`, which calls `_save_settings()` and shows "Settings saved to config.ini." (or the error) in the status bar. Any change not saved with the button is lost on close.
+- Files modified: `onefileV20.py`, `HISTORY.md`. Verified with `python -m py_compile onefileV20.py` → `COMPILE_OK`.
+
+## 2026-10-10 (2)
+
+- "Stop feeder on anomaly" in `onefileV20.py` now stops on **every** detection, so the user can collect samples for retraining: in `_process_frame_impl`, when `stop_feeder_on_detect` is on and the frame has any YOLO box (`yolo_labels` non-empty — normal, Capture-only, or Air Ejector-only), `is_anomaly`/`is_new_anomaly_found` are set so the existing FEEDOFF + 5 beeps + ejector force-clear + pause path runs. Color/Recon anomalies and Dangerous classes behave as before.
+- Side effect, intended: with this checkbox on, Ejector-class objects pause the rail instead of being blown off (`general_pause_triggered` force-clears the ejector), so the sample stays on the rail to be picked up.
+- Every such stop now saves a snapshot to `output/detections/` (with class names in the filename) even when Auto-save is off: the danger-only fallback save became `elif danger_event_started or general_pause_triggered:`.
+- YOLO classes excluded by the YOLO Class Filter are still dropped inside `_run_yolo_detection` and never count.
+- Updated the checkbox tooltip. Files modified: `onefileV20.py`, `HISTORY.md`. Verified with `python -m py_compile onefileV20.py` → `COMPILE_OK`.
+
+## 2026-10-10
+
+- **Reverted by the user (same day) — not in the code.** The checkbox split below was undone by the user restoring `onefileV20.py`; the file is back to a single "Stop feeder on anomaly" checkbox that does FEEDOFF + 5 beeps + ejector force-clear + pause. Do not re-add the split unless asked.
+- Split the old "Stop feeder on anomaly" checkbox in `onefileV20.py` into two independent checkboxes in General Controls, per user request:
+  - **Stop feeder on anomaly** (`stop_feeder_on_detect`) — now only sends FEEDOFF; detection keeps running.
+  - **Pause detection on anomaly** (new `pause_on_detect`) — beeps 5 times, force-clears the ejector (`general_pause_triggered`), and pauses detection until the operator clicks Resume Detection.
+  - Either can be ticked alone or both together (both = the old behavior). Dangerous classes are still excluded from both and handled by the Danger sequence.
+- New `DetectionWorker.set_pause_on_detect` slot, wired in `_setup_detection_thread`; persisted to `config.ini` as `pause_on_detect`. When that key is missing, it defaults to the saved `stop_feed_on_detect` value, so existing setups that had the old checkbox ticked keep pausing as before.
+- The detection popup (`emit_popup_snapshot`) now shows when either checkbox is ticked. Status message on pause no longer claims "feeder stopped", since the feeder may still be running.
+- Files modified: `onefileV20.py`, `HISTORY.md`.
+- Verified syntax with `python -m py_compile onefileV20.py` → `COMPILE_OK`.
+
+## 2026-10-07 (3)
+
+- **Ejector Cooldown was intentionally reverted by the user — do not re-add.** The entries "2026-10-07" and "2026-10-07 (2)" below (`relay_cooldown_seconds`, `_relay_cooldown_until`, `ejector_cooldown_pause_requested`, the "Ejector Cooldown (s)" UI control) describe code that is no longer in `onefileV20.py`: the user tested it, it did not work in practice, and they restored the file to its 2026-10-04 state. The clumped-grain false positive after an air blast was solved instead by retraining the YOLO model with images captured during ejector firing as hard negatives, which works.
+- Bug reported: when an untrained/unknown object (e.g. a stray screw, "หัวน๊อต") triggers "Stop feeder on anomaly" (general anomaly pause, not Danger), the air ejector was sometimes left stuck firing air continuously for the whole pause. Root cause confirmed: the ejector's own auto-clear only runs via per-frame polling (the `elif ... and not relay_detection_active:` branch), and once "Stop feeder on anomaly" pauses detection, no more frames get processed — so if an Ejector-class object happened to be in the same (or a very recent) frame as the unrelated general anomaly, the ejector could fire or stay mid-fire with nothing left to ever clear it until the operator manually clicks Resume Detection. This is the same class of bug fixed for Dangerous classes on 2026-09-23 (2), just never extended to the general "Stop feeder on anomaly" pause path.
+- Fix: added a `general_pause_triggered` flag in `DetectionWorker._process_frame_impl`, set when `stop_feeder_on_detect` fires a pause this frame (mirrors `dangerous_hit`). The ejector's synchronous force-clear condition changed from `if dangerous_hit:` to `if dangerous_hit or general_pause_triggered:`, so a general-anomaly pause now force-clears/blocks the ejector in the very same frame, exactly like a dangerous-class hit already did.
+- Added the same redundant GUI-side safety net already used for Danger (`send_relay_clear_now()`) to `MainWindow._handle_pause_detection_request` (Stop feeder on anomaly) and `_handle_service_breaker_trigger` (Service Breaker) — both pause detection and both could previously leave a mid-fire ejector stuck on for the same underlying reason.
+- Files modified: `onefileV20.py`, `HISTORY.md`.
+- Verified syntax with `python -m py_compile onefileV20.py` → `COMPILE_OK`.
+
+## 2026-10-07 (2)
+
+- Correction to the Ejector Cooldown added earlier the same day: user clarified the intent was never just "block the ejector from re-firing" — it should actually **pause detection** for ~1-2s after the ejector fires, then auto-resume, not merely gate the relay trigger while everything else keeps running.
+- Added `DetectionWorker.ejector_cooldown_pause_requested = pyqtSignal(float)` in `onefileV20.py`, emitted (carrying `relay_cooldown_seconds`) right alongside the existing `_relay_cooldown_until`/`_schedule_relay_trigger()` call when the ejector newly fires.
+- `MainWindow._setup_detection_thread` connects it to new `_handle_ejector_cooldown_pause(duration_seconds)`: if detection is running, not already paused for another reason (manual-resume anomaly pause, danger sequence, etc.), and no danger auto-clear sequence is active, it calls `_pause_detection()` and schedules `_finish_ejector_cooldown_pause` via `QTimer.singleShot(duration_ms, ...)` to auto-resume — guarded by a `_ejector_cooldown_sequence_id` counter (same pattern as the existing danger-clear sequence id) so a stale timer can't resume a detection run that moved on. If detection was already paused for a different reason when the ejector fires, this handler intentionally no-ops rather than auto-resuming a pause it didn't start (e.g. never auto-resumes a "Stop feeder on anomaly" pause that needs a manual Resume click).
+- The earlier `_relay_cooldown_until` same-frame gate is kept as a belt-and-braces check (mirrors the existing dangerous-hit race fix from 2026-09-23 (2)) — it blocks a worker-thread re-trigger in the same or next frame before the cross-thread pause signal has actually landed and stopped frame processing.
+- Updated the "Ejector Cooldown (s)" tooltip to describe the real behavior (detection auto-pauses and resumes, not just "blocks re-fire").
+- Files modified: `onefileV20.py`, `HISTORY.md`.
+- Verified syntax with `python -m py_compile onefileV20.py` → `COMPILE_OK`.
+
+## 2026-10-07
+
+- Problem reported: after the air ejector fires, the blast scatters grains into a clump that the YOLO model sometimes misreads as a new anomaly (e.g. "Rice_worm_rest" at ~0.72-0.79 confidence, screenshot showed two such false boxes), re-firing the ejector on its own mess and scattering it further in a loop.
+- Added an "Ejector Cooldown" to `onefileV20.py`: `DetectionWorker.relay_cooldown_seconds` (default 1.5s) + `self._relay_cooldown_until` timestamp. After the ejector fires, `_relay_cooldown_until` is set to `now + relay_cooldown_seconds`; the trigger-scheduling condition in `_process_frame_impl`'s ejector block now also requires `now_ts >= self._relay_cooldown_until`, so no new trigger can fire during that window even if `relay_detection_active` flickers back True (e.g. from borderline confidence on the disturbed clump). The existing per-event dedupe (`_relay_last_signal != "trigger"`) still governs everything else; this cooldown only adds a floor under how soon a *new* trigger can start after the last one. Auto-clear behavior (turning the ejector back off) is untouched.
+- New UI control "Ejector Cooldown (s)" (a `DelayControl`, range 0.0-10.0s, step 0.1, default 1.5) added on the same row as "Capture Interval (s)" in Model & Detection Thresholds, wired to `_update_relay_cooldown` → `DetectionWorker.set_relay_cooldown`, pushed on thread setup, and persisted to `config.ini` (`relay_cooldown`). `_relay_cooldown_until` is reset to 0 in `reset_counter`.
+- This only prevents the *re-trigger loop*; it does not fix the underlying false positive itself. Recommended follow-up (not yet done): collect the false-positive images already being saved to `output/ejector_captures/` and add them as hard-negative training examples so the model learns to tell a disturbed grain clump apart from a real worm.
+- Files modified: `onefileV20.py`, `HISTORY.md`.
+- Verified syntax with `python -m py_compile onefileV20.py` → `COMPILE_OK`.
+
+## 2026-10-04
+
+- Moved the "White Balance (Once)" button + hint label in `onefileV20.py` from the left column's camera/exposure block (below the Exposure hint) into the "General Controls" group box, as a new row right after the "Mode:" dropdown — per a screenshot where the user drew an arrow from the button to its new target spot.
+- Follow-up correction: user clarified it should share the SAME row as "Mode:", not its own row below it — merged into `mode_row` (Mode label + combo, then White Balance button + hint, all in one `QHBoxLayout`) instead of a separate row.
+- Removed the `self.exposure_hint_label` QLabel ("-13 = Fast/Dark, 0 = Slow/Bright") entirely, per a screenshot with a red arrow pointing at it — it duplicated info already in the Exposure slider's own value label (which shows e.g. "-5 (Balanced)" via `_format_exposure_label`), so it was redundant.
+- Files modified: `onefileV20.py`, `HISTORY.md`.
+- Verified syntax with `python -m py_compile onefileV20.py` → `COMPILE_OK`.
+
+## 2026-09-29
+
+- **Work now targets `onefileV20.py` instead of `onefileV19.py`** per user request (V20 was already a full copy including every fix through 2026-09-28 (2)).
+- Added a separate, independent confidence threshold just for the Air Ejector: new `AnomalyDetector.yolo_relay_confidence` (default 0.75, deliberately higher than the general `yolo_confidence` default 0.35) with setter `set_yolo_relay_confidence`. Reason: this camera's higher resolution makes for noisier/harder-to-train detections, so the user wants the ejector to require a stricter confidence than the general "YOLO Confidence" slider before it's allowed to fire, even on a box that's confident enough to count as a normal anomaly elsewhere.
+- New UI slider "YOLO Air Ejector Confidence" added right under "YOLO Air Ejector Classes" in the Model & Detection Thresholds group, with its own label/tooltip, wired to `_update_yolo_relay_confidence`, and persisted to `config.ini` (`yolo_relay_confidence`).
+- Plumbing: `AnomalyDetector` now tracks `last_yolo_confidences` (parallel array to `last_yolo_detections`/`last_yolo_class_ids`, populated in `_apply_yolo_results` and cleared in the same places as those two). `DetectionWorker._get_relay_yolo_hits` signature changed from `(labels, class_ids)` to `(labels, class_ids, confidences)` and now rejects any relay-class match whose confidence is below `yolo_relay_confidence`, independent of whatever confidence let it through the general YOLO Class Filter. This was necessary because the existing relay-hit check only matched on label/class-id text with no confidence awareness at all, so a per-instance confidence gate had to be threaded through explicitly rather than reusing the general per-box gate already applied inside `_run_yolo_detection`.
+- Files modified: `onefileV20.py`, `HISTORY.md`.
+- UPDATE: `python -m py_compile onefileV20.py` was blocked by a transient sandbox tool error for the rest of that session; it was confirmed passing (`COMPILE_OK`) at the start of the next session (2026-09-30), after the capture-interval change below was also applied.
+
+## 2026-09-30
+
+- Exposed the shared "capture interval" cooldown (`DetectionWorker.class_capture_min_interval`, governs both "YOLO Capture Classes" saves and the ejector-trigger capture) as a UI control instead of a hardcoded value — user wanted to tune it themselves without asking for a code change each time.
+- Added `DetectionWorker.set_capture_interval(value)` (plain method, called directly like `configure_arduino`/`configure_relay`, not a signal-marshaled pyqtSlot).
+- New UI row "Capture Interval (s):" (a `DelayControl` spin box, range 0.0-2.0s, step 0.01, 2 decimals, default 0.04) added under the new "YOLO Air Ejector Confidence" slider in the Model & Detection Thresholds group, wired to `_update_capture_interval`, pushed to the worker on thread setup and after settings load, and persisted to `config.ini` (`capture_interval`).
+- Files modified: `onefileV20.py`, `HISTORY.md`.
+- Verified syntax with `python -m py_compile onefileV20.py` → `COMPILE_OK`.
+
+## 2026-09-28 (2)
+
+- Colored the "Feeder ON (Pin 7)" and "Feeder OFF (Pin 7)" buttons in the Arduino Integration panel of `onefileV19.py` — green for ON, red for OFF — so they're easier to tell apart at a glance (user pointed at these two buttons in a screenshot). Other Arduino test buttons (Servo Trigger/Clear, Fan ON/OFF) are unchanged.
+- Files modified: `onefileV19.py`, `HISTORY.md`.
+- Verified syntax with `python -m py_compile onefileV19.py`.
+
+## 2026-09-28
+
+- Lowered `DetectionWorker.class_capture_min_interval` in `onefileV19.py` further, from 0.1s to 0.04s. User reported the new HuaTeng camera only produced 4 "YOLO Capture Classes" images per object crossing vs 8 with the old camera, despite the new camera's higher rated FPS. Root cause: capture count is governed by (object dwell time in frame) ÷ (cooldown), not by the camera's max FPS — the new camera's field of view/framing shows each object for less real time (~0.3-0.4s vs ~0.7-0.8s on the old camera), so the same 0.1s cooldown yielded fewer shots even though the achieved processing FPS (~32fps) was higher. 0.04s keeps pace with that ~32fps throughput and should recover a similar shot count within the shorter dwell window.
+- Files modified: `onefileV19.py`, `HISTORY.md`.
+- Verified syntax with `python -m py_compile onefileV19.py`.
+
+## 2026-09-27
+
+- Lowered `DetectionWorker.class_capture_min_interval` in `onefileV19.py` from 0.8s to 0.1s, applied uniformly to every class (same shared cooldown value for all labels, as before). Reason: an object crossing the rail is visible for ~0.3-0.8s, so the old 0.8s per-label cooldown let only the first frame through and skipped the rest — "YOLO Capture Classes" (`output/yolo_captures/`) ended up with exactly one image per object instead of the 5-8 a full crossing produces. At 0.1s the same object now yields several captures across its crossing.
+- This interval is shared with the ejector-trigger capture (`_enqueue_relay_capture`, added 2026-09-23), but that path is already gated by the trigger-state transition (only fires once per idle→trigger event) so it is not meaningfully affected by the lower value.
+- Files modified: `onefileV19.py`, `HISTORY.md`.
+- Verified syntax with `python -m py_compile onefileV19.py`.
+
+## 2026-09-26
+
+- `onefileV19.py`: when the air ejector newly fires on an Ejector-class object, it now also counts as a detection — `anomaly_count` +1, the class is recorded in the detection summary, and the beep plays if "Enable Beep Sound" is on. Skipped if the same frame was already counted as a normal anomaly (no double count). It does NOT trigger Servo, "Stop feeder on anomaly", or auto-save; the ejector stays independent of those.
+- Files modified: `onefileV19.py`, `HISTORY.md`.
+- Verified syntax with `python -m py_compile onefileV19.py`.
+
 ## 2026-09-23 (3)
 
 - Added an "which image caused this ejector shot" trail: whenever the air ejector newly fires (relay transitions from idle to trigger), `DetectionWorker._process_frame_impl` in `onefileV19.py` now saves that frame to `output/ejector_captures/` (annotated) and `output/ejector_captures_original/` (raw), one file per matched class, named `<ClassName>_<timestamp>.png` — e.g. `Stone_20260923_...png`. Mirrors the existing "YOLO Capture Classes" save mechanism.
