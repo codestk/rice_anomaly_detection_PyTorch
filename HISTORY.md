@@ -1,5 +1,49 @@
 แกหแกห
 
+## 2026-10-20
+
+- `onefileV21.py`: YOLO Capture Classes now save as many images per object as a normal detection. The user saw fewer captures than in normal detect mode for the same object. Cause: capture had a per-class cooldown (`class_capture_min_interval`, "Capture Interval", default 0.04s), while normal detection auto-save saves every anomaly frame (`is_new_anomaly_found` is True on every anomaly frame, so `auto_save_min_interval` never applies). `_enqueue_class_capture` now passes `0.0` as the interval, so every frame showing the class is saved.
+- "Capture Interval" still applies to the ejector-trigger capture and Reconstruction training samples. Tooltip and `set_capture_interval` docstring updated.
+- Remaining known limit (unchanged): the shared save queue is `maxsize=16`, and `put_nowait` silently drops tasks when it is full. Both capture and detection saves are affected the same way.
+- Files modified: `onefileV21.py`, `HISTORY.md`. Verified with `python -m py_compile onefileV21.py` → `COMPILE_OK`. Not tested on the live rail.
+
+## 2026-10-16
+
+- `onefileV20.py`: the danger delayed snapshot is now a burst, so there are more danger images to train on. Before, one raw frame was saved 1s after a Dangerous-class hit. Now 10 raw frames are saved (`MainWindow.danger_delayed_burst_count = 10`), 150ms apart (`danger_delayed_burst_interval_ms = 150`), starting 1s after the hit. That covers about 1.0–2.35s, which ends before the Auto cleansing fan starts at 3s.
+- Files are saved in `output/danger_delayed/` as `danger_delayed_<event timestamp>_<01..10>.png`. All frames in one burst use the same event timestamp. While paused, the live view keeps updating `current_frame`, so each step saves a newer camera frame. If detection stops partway through, the burst stops and the status bar shows how many frames were saved.
+- Files modified: `onefileV20.py`, `HISTORY.md`. Verified with `python -m py_compile onefileV20.py` → `COMPILE_OK`. Not tested on the live rail.
+
+## 2026-10-14 (3)
+
+- `onefileV20.py`: the servo (Pin 9) now moves **only for YOLO Dangerous Classes**, in every mode. `servo_detection_active` changed from `is_anomaly_present or dangerous_hit` to `dangerous_hit`, so Color/Recon/normal YOLO anomalies no longer open it; Auto-clear still closes it once no dangerous class is in frame for the clear delay.
+- `reset_counter` (run on Start Detection) now sends the servo Clear only if the arm was actually left open (`_arduino_last_signal == "trigger"`), so starting detection no longer moves the servo by itself.
+- Checkbox "Enable trigger on anomaly" renamed to "Enable servo on danger" with a tooltip. Settings key `arduino_enabled` unchanged.
+- Files modified: `onefileV20.py`, `HISTORY.md`. Verified with `python -m py_compile onefileV20.py` → `COMPILE_OK`.
+
+## 2026-10-14 (2)
+
+- `onefileV20.py`: Auto cleansing ejector blast shortened from 1s to 0.5s (`danger_ejector_blast_ms = 500`). Tooltip updated, and the status-bar message now formats the blast length with `:g` so it shows "0.5s" instead of rounding to "0s".
+- Files modified: `onefileV20.py`, `HISTORY.md`. Verified with `python -m py_compile onefileV20.py` → `COMPILE_OK`.
+
+## 2026-10-14
+
+- `onefileV20.py`: the "Reconstruction/Model" mode (`detector.mode == 'recon'`) is now collect-only. In `DetectionWorker._process_frame_impl`, a recon detection is saved to `output/recon_training/` (annotated) and `output/recon_training_original/` (raw) as `recon_<timestamp>.png`, counted in Detections and the summary, and then `is_anomaly_present` is cleared so nothing downstream acts on it — no servo, feeder stop, pause, beep, service breaker, or auto-save popup. Saves are rate-limited by the "Capture Interval (s)" setting. Random Save for Training still skips these frames (`recon_detected`).
+- Only the Reconstruction mode is affected. In "Hybrid (OR)" the recon part still triggers actions as before, since that is what catches untrained objects for "Stop feeder on anomaly". YOLO does not run in Reconstruction mode, so Danger/Ejector/Capture classes are inactive there (unchanged).
+- Files modified: `onefileV20.py`, `HISTORY.md`. Verified with `python -m py_compile onefileV20.py` → `COMPILE_OK`.
+- Follow-up (same day): user still saw the servo arm move in Reconstruction mode. Detections no longer triggered it, but two non-detection paths still sent servo commands: the forced Clear in `reset_counter(force_clear=True)` on Start Detection, and the servo Auto-clear branch closing an arm left open from an earlier run. In Reconstruction mode both are now skipped (`recon_mode` guard in `_process_frame_impl` and `reset_counter`), and any pending servo trigger timer is canceled, so the servo receives no commands at all. The manual "Test Trigger / Send Clear" buttons still work.
+
+## 2026-10-13 (2)
+
+- `onefileV20.py` Auto cleansing: the ejector blast no longer starts together with the fan. New `MainWindow.danger_ejector_delay_ms = 3000`; `_start_danger_fan_clear` turns the fan on and schedules new `_fire_danger_ejector_blast(sequence_id)` 3s later, which checks the sequence id is still current (so a canceled sequence does not fire) and then fires the ejector for `danger_ejector_blast_ms`.
+- Kept the user's own edits to the timings: `danger_fan_clear_ms = 10000` and `danger_ejector_blast_ms = 1000`. Tooltip updated to match (fan 10s, 1s blast 3s after the fan starts).
+- Files modified: `onefileV20.py`, `HISTORY.md`. Verified with `python -m py_compile onefileV20.py` → `COMPILE_OK`.
+
+## 2026-10-13
+
+- `onefileV20.py`: the "Auto cleansing" danger sequence now also fires the air ejector for 2s (`MainWindow.danger_ejector_blast_ms = 2000`) at the moment the fan turns on, in `_start_danger_fan_clear` (`send_relay_trigger_test()` then `QTimer.singleShot(..., send_relay_clear_now)`). This is a deliberate change from 2026-09-23, when the user wanted the ejector idle during auto clear; the forced ejector-off at the start of the danger pause is unchanged, so the ejector only fires in this 2s window.
+- The blast uses the configured Ejector ON/OFF commands and fires even if "Enable air ejector on anomaly" is unticked (same as the fan, which has no enable checkbox). The OFF is sent unconditionally after 2s, and `_cancel_danger_clear_sequence(stop_fan=True)` also sends ejector OFF.
+- Updated the "Auto cleansing" tooltip. Files modified: `onefileV20.py`, `HISTORY.md`. Verified with `python -m py_compile onefileV20.py` → `COMPILE_OK`.
+
 ## 2026-10-11
 
 - `onefileV20.py`: settings are no longer saved automatically when the window closes — removed `self._save_settings()` from `MainWindow.closeEvent`. Added a "Save Settings" button at the end of the bottom button row (after "Clear ALL output"), wired to new `_save_settings_clicked`, which calls `_save_settings()` and shows "Settings saved to config.ini." (or the error) in the status bar. Any change not saved with the button is lost on close.

@@ -1161,6 +1161,7 @@ class DetectionWorker(QObject):
         self.class_capture_min_interval = 0.04
         self._class_capture_last_save_time = {}
         self._relay_capture_last_save_time = {}
+        self._recon_capture_last_save_time = 0.0
         self._save_queue = queue.Queue(maxsize=16)
         self._save_thread = threading.Thread(target=self._save_worker, daemon=True)
         self._save_thread.start()
@@ -1703,6 +1704,28 @@ class DetectionWorker(QObject):
             self.status_update.emit(runtime_status)
 
         now_ts = time.time()
+        # Reconstruction mode only collects training images: a detection is
+        # saved and counted, but nothing downstream (servo, feeder, pause,
+        # beep, breaker, auto-save popup) sees it as an anomaly.
+        recon_detected = False
+        if getattr(self.detector, 'mode', '') == 'recon':
+            recon_detected = bool(is_anomaly_present)
+            is_anomaly_present = False
+            if recon_detected and (now_ts - self._recon_capture_last_save_time) >= self.class_capture_min_interval:
+                self._recon_capture_last_save_time = now_ts
+                self.anomaly_count += 1
+                self._record_detection_summary([], ['Model'])
+                self._enqueue_labeled_capture(
+                    processed_frame,
+                    original_frame,
+                    ['recon'],
+                    now_ts,
+                    os.path.join('output', 'recon_training'),
+                    os.path.join('output', 'recon_training_original'),
+                    {},
+                    0.0,
+                    "Recon training sample",
+                )
         yolo_labels = list(getattr(self.detector, 'last_yolo_detections', []))
         detection_sources = list(getattr(self.detector, 'last_detection_sources', []))
         yolo_ids = list(getattr(self.detector, 'last_yolo_class_ids', []))
@@ -1720,7 +1743,8 @@ class DetectionWorker(QObject):
         if not dangerous_hit and self._danger_alarm_active:
             self._danger_alarm_active = False
         danger_event_started = dangerous_hit and not self._danger_alarm_active
-        servo_detection_active = bool(is_anomaly_present or dangerous_hit)
+        # The servo only ever acts on dangerous YOLO classes.
+        servo_detection_active = bool(dangerous_hit)
         is_new_anomaly_found = False
 
         is_anomaly = is_anomaly_present
@@ -1777,7 +1801,11 @@ class DetectionWorker(QObject):
                 self.send_arduino_feed_off()
                 self._play_pause_on_anomaly_beep()
                 self.pause_detection_requested.emit()
-        if (
+        recon_mode = getattr(self.detector, 'mode', '') == 'recon'
+        if recon_mode:
+            # Reconstruction mode never moves the servo, not even to auto-clear.
+            self._cancel_arduino_trigger_timer()
+        elif (
             self.arduino_enabled
             and is_new_anomaly_found
             and servo_detection_active
@@ -1886,6 +1914,7 @@ class DetectionWorker(QObject):
         can_random_save = (
             self.random_save_enabled
             and not is_anomaly_present  # only keep clean frames for training
+            and not recon_detected
             and (now_ts - self.last_random_save_time) >= self.random_save_min_interval
         )
         if can_random_save:
@@ -2129,7 +2158,15 @@ class DetectionWorker(QObject):
         if hasattr(self.detector, 'last_detection_sources'):
             self.detector.last_detection_sources = []
         self._cancel_arduino_trigger_timer()
-        if self.arduino_enabled and (self.arduino_clear_enabled or force_clear):
+        # Only close the arm if it was actually left open by a danger trigger,
+        # so Start Detection doesn't move the servo on its own.
+        recon_mode = getattr(self.detector, 'mode', '') == 'recon'
+        if (
+            self.arduino_enabled
+            and (self.arduino_clear_enabled or force_clear)
+            and not recon_mode
+            and self._arduino_last_signal == "trigger"
+        ):
             self._send_arduino_clear()
         self._cancel_relay_trigger_timer()
         if self.relay_enabled and (self.relay_clear_enabled or force_clear):
@@ -2436,7 +2473,9 @@ class MainWindow(QMainWindow):
         self._summary_text_edit = None
         self._danger_delayed_snapshot_pending = False
         self.danger_fan_start_delay_ms = 3000
-        self.danger_fan_clear_ms = 20000
+        self.danger_fan_clear_ms = 10000
+        self.danger_ejector_delay_ms = 3000
+        self.danger_ejector_blast_ms = 500
         self.danger_feeder_resume_delay_ms = 5000
         self._danger_clear_sequence_id = 0
         self._danger_clear_sequence_active = False
@@ -2583,6 +2622,7 @@ class MainWindow(QMainWindow):
         self._danger_clear_sequence_active = False
         if stop_fan and was_active and serial is not None and self.arduino_manager.is_connected():
             self.detection_worker.send_arduino_fan_off()
+            self.detection_worker.send_relay_clear_now()
 
     def _start_danger_auto_fan_clear_sequence(self, message):
         if not self._danger_auto_fan_clear_enabled():
@@ -2619,14 +2659,30 @@ class MainWindow(QMainWindow):
             return
 
         self.detection_worker.send_arduino_fan_on()
+        QTimer.singleShot(
+            self.danger_ejector_delay_ms,
+            lambda sid=sequence_id: self._fire_danger_ejector_blast(sid),
+        )
         self.status_bar.showMessage(
-            f'Danger fan clearing rail for {self.danger_fan_clear_ms // 1000}s.',
+            f'Danger fan clearing rail for {self.danger_fan_clear_ms // 1000}s '
+            f'(ejector blast {self.danger_ejector_blast_ms / 1000:g}s after '
+            f'{self.danger_ejector_delay_ms / 1000:.0f}s).',
             8000,
         )
         QTimer.singleShot(
             self.danger_fan_clear_ms,
             lambda sid=sequence_id: self._finish_danger_fan_clear(sid),
         )
+
+    def _fire_danger_ejector_blast(self, sequence_id):
+        if sequence_id != self._danger_clear_sequence_id or not self._danger_clear_sequence_active:
+            return
+        if serial is None or not self.arduino_manager.is_connected():
+            return
+        # The OFF is sent unconditionally so a canceled or interrupted
+        # sequence can never leave the ejector blowing.
+        self.detection_worker.send_relay_trigger_test()
+        QTimer.singleShot(self.danger_ejector_blast_ms, self.detection_worker.send_relay_clear_now)
 
     def _finish_danger_fan_clear(self, sequence_id):
         if sequence_id != self._danger_clear_sequence_id or not self._danger_clear_sequence_active:
@@ -3141,7 +3197,7 @@ class MainWindow(QMainWindow):
         auto_beep_row.addWidget(self.service_breaker_check)
         auto_beep_row.addSpacing(24)
         self.danger_auto_fan_clear_check = QCheckBox('Auto cleansing')
-        self.danger_auto_fan_clear_check.setToolTip('When a dangerous YOLO class pauses detection, turn feeder off, wait 3s, run the fan for 20s, resume detection, then turn the feeder on after 5s.')
+        self.danger_auto_fan_clear_check.setToolTip('When a dangerous YOLO class pauses detection, turn feeder off, wait 3s, run the fan for 10s (with a 0.5s air ejector blast 3s after the fan starts), resume detection, then turn the feeder on after 5s.')
         self.danger_auto_fan_clear_check.toggled.connect(self._handle_danger_auto_fan_clear_toggled)
         auto_beep_row.addWidget(self.danger_auto_fan_clear_check)
         auto_beep_row.addSpacing(24)
@@ -3433,7 +3489,8 @@ class MainWindow(QMainWindow):
         layout.addLayout(hardware_row)
 
         enable_row = QHBoxLayout()
-        self.arduino_enable_check = QCheckBox('Enable trigger on anomaly')
+        self.arduino_enable_check = QCheckBox('Enable servo on danger')
+        self.arduino_enable_check.setToolTip('Open the servo gate (Pin 9) only when a YOLO Dangerous Class is detected. Other anomalies never move the servo.')
         self.arduino_enable_check.toggled.connect(self._arduino_config_changed)
         enable_row.addWidget(self.arduino_enable_check)
         enable_row.addSpacing(12)
