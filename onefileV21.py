@@ -1319,9 +1319,7 @@ class DetectionWorker(QObject):
                 pass
 
     def _enqueue_class_capture(self, processed_frame, original_frame, hits, now_ts):
-        """Save matched YOLO capture classes with annotated and original frames.
-        No cooldown: every frame showing the class is saved, same as a normal
-        detection auto-save, so both get the same number of images per object."""
+        """Save matched YOLO capture classes with annotated and original frames."""
         self._enqueue_labeled_capture(
             processed_frame,
             original_frame,
@@ -1330,7 +1328,7 @@ class DetectionWorker(QObject):
             os.path.join('output', 'yolo_captures'),
             os.path.join('output', 'yolo_captures_original'),
             self._class_capture_last_save_time,
-            0.0,
+            self.class_capture_min_interval,
             "YOLO capture class",
         )
 
@@ -2134,8 +2132,8 @@ class DetectionWorker(QObject):
             self._reset_service_breaker_state()
 
     def set_capture_interval(self, value):
-        """Cooldown (seconds) per class label for the ejector-trigger capture
-        and Reconstruction training samples; see class_capture_min_interval."""
+        """Cooldown (seconds) per class label shared by YOLO Capture Classes
+        and the ejector-trigger capture; see class_capture_min_interval."""
         try:
             interval = float(value)
         except (TypeError, ValueError):
@@ -3094,13 +3092,15 @@ class MainWindow(QMainWindow):
         capture_interval_row.addWidget(QLabel('Capture Interval (s):'))
         self.capture_interval_spin = DelayControl(minimum=0.0, maximum=2.0, step=0.01, value=0.04, decimals=2)
         self.capture_interval_spin.setToolTip(
-            'Cooldown per class name before another image is saved — used by the ejector-trigger capture '
-            'and Reconstruction-mode training samples ("YOLO Capture Classes" save every frame, like normal '
-            'detections). Lower = more images per object crossing the rail; '
+            'Cooldown per class name before another image is saved — shared by "YOLO Capture Classes" '
+            'and the ejector-trigger capture. Lower = more images per object crossing the rail; '
             'too low just re-saves the same object repeatedly without adding useful shots.'
         )
         self.capture_interval_spin.valueChanged.connect(self._update_capture_interval)
         capture_interval_row.addWidget(self.capture_interval_spin)
+        capture_interval_hint = QLabel('Used by: YOLO Capture, Ejector capture, Recon training  (0 = every frame)')
+        capture_interval_hint.setStyleSheet('color: gray;')
+        capture_interval_row.addWidget(capture_interval_hint)
         capture_interval_row.addStretch()
         thresholds_layout.addLayout(capture_interval_row)
         thresholds_layout.addLayout(thr)

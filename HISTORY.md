@@ -2,10 +2,10 @@
 
 ## 2026-10-20
 
-- `onefileV21.py`: YOLO Capture Classes now save as many images per object as a normal detection. The user saw fewer captures than in normal detect mode for the same object. Cause: capture had a per-class cooldown (`class_capture_min_interval`, "Capture Interval", default 0.04s), while normal detection auto-save saves every anomaly frame (`is_new_anomaly_found` is True on every anomaly frame, so `auto_save_min_interval` never applies). `_enqueue_class_capture` now passes `0.0` as the interval, so every frame showing the class is saved.
-- "Capture Interval" still applies to the ejector-trigger capture and Reconstruction training samples. Tooltip and `set_capture_interval` docstring updated.
-- Remaining known limit (unchanged): the shared save queue is `maxsize=16`, and `put_nowait` silently drops tasks when it is full. Both capture and detection saves are affected the same way.
-- Files modified: `onefileV21.py`, `HISTORY.md`. Verified with `python -m py_compile onefileV21.py` → `COMPILE_OK`. Not tested on the live rail.
+- `onefileV21.py`: added a gray hint label after the "Capture Interval (s)" spinbox: "Used by: YOLO Capture, Ejector capture, Recon training (0 = every frame)".
+- Background: the user saw fewer YOLO captures than normal-detect saves for the same object. Cause: capture has a per-class cooldown (`class_capture_min_interval`, default 0.04s), while normal detection auto-save saves every anomaly frame (`is_new_anomaly_found` is True on every anomaly frame, so `auto_save_min_interval` never applies). To get equal counts, set Capture Interval to 0.00. Removing the cooldown from YOLO Capture in code, and removing the setting entirely, were both tried or discussed and rejected by the user. Keep the interval as a shared knob.
+- Known limit (unchanged): the shared save queue is `maxsize=16`, and `put_nowait` silently drops tasks when it is full.
+- Files modified: `onefileV21.py`, `HISTORY.md`. Verified with `python -m py_compile onefileV21.py` → `COMPILE_OK`.
 
 ## 2026-10-16
 
