@@ -1393,18 +1393,20 @@ class DetectionWorker(QObject):
         return True
 
     def _send_arduino_trigger(self, require_enabled=True):
-        if self._send_arduino_command(
+        sent = self._send_arduino_command(
             self.arduino_trigger_command,
             "trigger",
             require_enabled=require_enabled,
             angle=self.arduino_trigger_angle,
-        ):
+        )
+        if sent:
             if require_enabled and self.arduino_enabled:
                 self._arduino_last_trigger_time = time.time()
+        return sent
 
     def _send_arduino_clear(self, require_enabled=True):
         self._cancel_arduino_trigger_timer()
-        self._send_arduino_command(
+        return self._send_arduino_command(
             self.arduino_clear_command,
             "clear",
             require_enabled=require_enabled,
@@ -1527,7 +1529,7 @@ class DetectionWorker(QObject):
             is_anomaly = True
             is_new_anomaly_found = True
 
-        if is_anomaly_present:
+        if servo_detection_active:
             self._last_anomaly_seen_time = now_ts
 
         if is_anomaly_present:
@@ -1574,7 +1576,8 @@ class DetectionWorker(QObject):
             self._schedule_arduino_trigger()
         elif self.arduino_enabled and self.arduino_clear_enabled and not servo_detection_active:
             if self._arduino_last_signal == "trigger" and self._arduino_last_trigger_time > 0:
-                if now_ts - self._arduino_last_trigger_time >= self.arduino_clear_delay:
+                last_active_ts = max(self._arduino_last_trigger_time, self._last_anomaly_seen_time)
+                if now_ts - last_active_ts >= self.arduino_clear_delay:
                     self._send_arduino_clear()
 
         should_auto_save = self.auto_save and is_anomaly_present
