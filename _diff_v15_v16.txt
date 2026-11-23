@@ -1,0 +1,837 @@
+--- onefileV15.py	2026-07-23 20:58:16.274455200 +0700
++++ onefileV16.py	2026-07-27 15:25:44.892344000 +0700
+@@ -39,7 +39,6 @@
+ from PyQt6.QtPrintSupport import QPrinter, QPrintDialog
+ from PyQt6.QtMultimedia import QMediaDevices
+ 
+-# ... (ส่วน THEME และ open_camera_by_index เหมือนเดิม) ...
+ DARK_THEME_STYLESHEET = """
+ QWidget { background-color: #2b2b2b; color: #f0f0f0; font-size: 10pt; border: none; }
+ QMainWindow { background-color: #3c3c3c; }
+@@ -243,57 +242,7 @@
+             self._serial.flush()
+ 
+ 
+-# def open_camera_by_index(index, resolution=None, prefer_backend="MSMF", fps=None, preferred_fourcc=None, warmup_frames=10):
+-#     pref = (prefer_backend or "AUTO").upper()
+-#     if pref == "MSMF":
+-#         backends = [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]
+-#     elif pref == "DSHOW":
+-#         backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+-#     else:
+-#         backends = [cv2.CAP_ANY, cv2.CAP_MSMF, cv2.CAP_DSHOW]
+-
+-#     fourcc_list = preferred_fourcc or [ "YUY2","MJPG",  "H264", None]
+-
+-#     def _apply_settings(cap, fourcc_code):
+-#         if fourcc_code:
+-#             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc_code))
+-#         if resolution:
+-#             cap.set(cv2.CAP_PROP_FRAME_WIDTH, resolution[0])
+-#             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resolution[1])
+-#         if fps:
+-#             cap.set(cv2.CAP_PROP_FPS, fps)
+-
+-#     for backend in backends:
+-#         base_cap = cv2.VideoCapture(index, backend)
+-#         if not base_cap.isOpened():
+-#             base_cap.release()
+-#             continue
+-
+-#         for attempt, fourcc_code in enumerate(fourcc_list):
+-#             if attempt > 0:
+-#                 base_cap.release()
+-#                 base_cap = cv2.VideoCapture(index, backend)
+-#                 if not base_cap.isOpened():
+-#                     break
+-
+-#             _apply_settings(base_cap, fourcc_code)
+-#             ok = True
+-#             for _ in range(max(1, warmup_frames)):
+-#                 ret, _ = base_cap.read()
+-#                 if not ret:
+-#                     ok = False
+-#                     break
+-#             if ok:
+-#                 if fourcc_code:
+-#                     print(f"[LOG {time.time():.2f}] Camera {index}: using FOURCC {fourcc_code} via backend {backend}.")
+-#                 else:
+-#                     print(f"[LOG {time.time():.2f}] Camera {index}: using default FOURCC via backend {backend}.")
+-#                 return base_cap
+ 
+-#         base_cap.release()
+-
+-#     print(f"[LOG {time.time():.2f}] Unable to configure camera {index} with requested formats.")
+-#     return None
+ 
+ 
+ 
+@@ -706,17 +655,16 @@
+                 delta = maxc - minc
+                 v = maxc
+                 s = torch.where(maxc == 0, torch.zeros_like(maxc), delta / maxc)
+-                h = torch.zeros_like(maxc)
+                 mask = delta > 1e-6
+                 mask_r = (maxc == r) & mask
+                 mask_g = (maxc == g) & mask
+-                mask_b = (maxc == b) & mask
+-                if mask_r.any():
+-                    h[mask_r] = ((g - b) / delta)[mask_r] % 6.0
+-                if mask_g.any():
+-                    h[mask_g] = ((b - r) / delta)[mask_g] + 2.0
+-                if mask_b.any():
+-                    h[mask_b] = ((r - g) / delta)[mask_b] + 4.0
++                # avoid div-by-zero on pixels where delta==0; their branch value is discarded below anyway
++                safe_delta = torch.where(mask, delta, torch.ones_like(delta))
++                h_r = ((g - b) / safe_delta) % 6.0
++                h_g = ((b - r) / safe_delta) + 2.0
++                h_b = ((r - g) / safe_delta) + 4.0
++                h = torch.where(mask_r, h_r, torch.where(mask_g, h_g, h_b))
++                h = torch.where(mask, h, torch.zeros_like(maxc))
+                 h = (h * 60.0) / 2.0
+                 h = h.clamp(0.0, 179.0)
+                 s = (s * 255.0).clamp(0.0, 255.0)
+@@ -738,7 +686,17 @@
+         hue_low = max(h_low - tolerance, 0)
+         hue_high = min(h_high + tolerance, 179)
+         mask = ((h >= hue_low) & (h <= hue_high) & (s >= s_min) & (v >= v_min)).to(torch.uint8) * 255
+-        return mask.detach().cpu().numpy()
++        return mask.detach()
++
++    def _gpu_masks_to_numpy(self, mask_tensors):
++        results = [None] * len(mask_tensors)
++        valid_positions = [i for i, m in enumerate(mask_tensors) if m is not None]
++        if not valid_positions:
++            return results
++        stacked = torch.stack([mask_tensors[i] for i in valid_positions], dim=0).cpu().numpy()
++        for out_i, pos in enumerate(valid_positions):
++            results[pos] = stacked[out_i]
++        return results
+ 
+     def _tensor_to_gray_uint8(self, tensor):
+         tensor = tensor.detach()
+@@ -849,15 +807,18 @@
+             any_hue_enabled = self.primary_hue_enabled or self.secondary_hue_enabled or self.tertiary_hue_enabled
+             hsv_gpu = self._hsv_from_bgr_torch(frame) if any_hue_enabled else None
+             if hsv_gpu is not None:
+-                mask_primary = self._mask_from_hsv_torch(
++                mask_primary_gpu = self._mask_from_hsv_torch(
+                     hsv_gpu, self.h_low, self.h_high, self.s_min, self.v_min, self.primary_hue_enabled
+                 )
+-                mask_secondary = self._mask_from_hsv_torch(
++                mask_secondary_gpu = self._mask_from_hsv_torch(
+                     hsv_gpu, self.h2_low, self.h2_high, self.s2_min, self.v2_min, self.secondary_hue_enabled
+                 )
+-                mask_tertiary = self._mask_from_hsv_torch(
++                mask_tertiary_gpu = self._mask_from_hsv_torch(
+                     hsv_gpu, self.h3_low, self.h3_high, self.s3_min, self.v3_min, self.tertiary_hue_enabled
+                 )
++                mask_primary, mask_secondary, mask_tertiary = self._gpu_masks_to_numpy(
++                    [mask_primary_gpu, mask_secondary_gpu, mask_tertiary_gpu]
++                )
+             else:
+                 hsv_cpu = self._compute_hsv_cpu(frame) if any_hue_enabled else None
+                 mask_primary = self._mask_color_from_hsv(
+@@ -927,15 +888,18 @@
+         any_hue_enabled = self.primary_hue_enabled or self.secondary_hue_enabled or self.tertiary_hue_enabled
+         hsv_gpu = self._hsv_from_bgr_torch(frame) if any_hue_enabled else None
+         if hsv_gpu is not None:
+-            mask_color_primary = self._mask_from_hsv_torch(
++            mask_color_primary_gpu = self._mask_from_hsv_torch(
+                 hsv_gpu, self.h_low, self.h_high, self.s_min, self.v_min, self.primary_hue_enabled
+             )
+-            mask_color_secondary = self._mask_from_hsv_torch(
++            mask_color_secondary_gpu = self._mask_from_hsv_torch(
+                 hsv_gpu, self.h2_low, self.h2_high, self.s2_min, self.v2_min, self.secondary_hue_enabled
+             )
+-            mask_color_tertiary = self._mask_from_hsv_torch(
++            mask_color_tertiary_gpu = self._mask_from_hsv_torch(
+                 hsv_gpu, self.h3_low, self.h3_high, self.s3_min, self.v3_min, self.tertiary_hue_enabled
+             )
++            mask_color_primary, mask_color_secondary, mask_color_tertiary = self._gpu_masks_to_numpy(
++                [mask_color_primary_gpu, mask_color_secondary_gpu, mask_color_tertiary_gpu]
++            )
+         else:
+             hsv_cpu = self._compute_hsv_cpu(frame) if any_hue_enabled else None
+             mask_color_primary = self._mask_color_from_hsv(
+@@ -1072,6 +1036,8 @@
+     result_ready = pyqtSignal(np.ndarray, np.ndarray, float, bool, int)
+     status_update = pyqtSignal(str)
+     arduino_state_changed = pyqtSignal(str)
++    feeder_state_changed = pyqtSignal(str)
++    fan_state_changed = pyqtSignal(str)
+     detection_saved = pyqtSignal(str)
+     service_breaker_triggered = pyqtSignal(str)
+     stop_detection_requested = pyqtSignal()
+@@ -1089,7 +1055,6 @@
+         self.last_random_save_time = 0
+         self.anomaly_count = 0
+         self.beep_enabled = False
+-        self.tripwire_enabled = False
+         self.stop_feeder_on_detect = False
+         self._stop_feed_beep_active = False
+         self._stop_feed_beep_thread = None
+@@ -1098,7 +1063,6 @@
+         self.service_breaker_limit =18
+         self._consecutive_detection_events = 0
+         self._service_breaker_fired = False
+-        self.recently_detected_centroids = []
+         self.detection_summary = {}
+         self.first_frame_processed = False # <--- LOGGING FLAG
+         self.arduino_manager = None
+@@ -1111,6 +1075,8 @@
+         self.arduino_trigger_angle = None
+         self.arduino_clear_angle = None
+         self._arduino_last_signal = "clear"
++        self._arduino_last_feeder_signal = "OFF"
++        self._arduino_last_fan_signal = "OFF"
+         self._arduino_last_trigger_time = 0.0
+         self._last_anomaly_seen_time = 0.0
+         self._arduino_trigger_timer = None
+@@ -1209,6 +1175,18 @@
+     def reset_danger_alarm(self):
+         self._danger_alarm_active = False
+ 
++    def stop_save_worker(self):
++        if hasattr(self, '_save_queue') and self._save_queue is not None:
++            try:
++                self._save_queue.put_nowait(None)
++            except queue.Full:
++                pass
++        if hasattr(self, '_save_thread') and self._save_thread is not None and self._save_thread.is_alive():
++            try:
++                self._save_thread.join(timeout=1.0)
++            except Exception as e:
++                print(f"Error joining save thread: {e}")
++
+     def _save_worker(self):
+         while True:
+             task = self._save_queue.get()
+@@ -1484,46 +1462,9 @@
+         servo_detection_active = bool(is_anomaly_present or dangerous_hit)
+         is_new_anomaly_found = False
+ 
+-        tripwire_start = time.perf_counter()
+-        if self.tripwire_enabled and is_anomaly_present:
+-            # 1. Clean up old centroids
+-            expiry_time = 2.0 # seconds
+-            self.recently_detected_centroids = [
+-                (c, t) for (c, t) in self.recently_detected_centroids if now_ts - t < expiry_time
+-            ]
+-
+-            newly_detected_centroids = []
+-            distance_threshold = 50 # pixels
+-
+-            for contour in contours:
+-                M = cv2.moments(contour)
+-                if M["m00"] == 0: continue
+-                cX = int(M["m10"] / M["m00"])
+-                cY = int(M["m01"] / M["m00"])
+-                centroid = (cX, cY)
+-
+-                # 2. Check if this is a new object
+-                is_new = True
+-                for existing_centroid, _ in self.recently_detected_centroids:
+-                    dist = np.sqrt((centroid[0] - existing_centroid[0])**2 + (centroid[1] - existing_centroid[1])**2)
+-                    if dist < distance_threshold:
+-                        is_new = False
+-                        break
+-                
+-                # 3. If it's new, mark it and add to our lists
+-                if is_new:
+-                    is_new_anomaly_found = True
+-                    newly_detected_centroids.append((centroid, now_ts))
+-
+-            # 4. Add the truly new objects to the main list
+-            self.recently_detected_centroids.extend(newly_detected_centroids)
+-            is_anomaly = is_new_anomaly_found
+-        else:
+-            # Original behavior when tripwire is off
+-            is_anomaly = is_anomaly_present
+-            if is_anomaly:
+-                is_new_anomaly_found = True
+-        tripwire_ms = (time.perf_counter() - tripwire_start) * 1000.0
++        is_anomaly = is_anomaly_present
++        if is_anomaly:
++            is_new_anomaly_found = True
+ 
+         if dangerous_hit:
+             is_anomaly = True
+@@ -1650,7 +1591,6 @@
+             print(
+                 f"[PERF] total={total_ms:.2f}ms "
+                 f"detect={detect_ms:.2f}ms "
+-                f"tripwire={tripwire_ms:.2f}ms "
+                 f"yolo_infer={yolo_infer_ms:.2f}ms "
+                 f"yolo_draw={yolo_draw_ms:.2f}ms "
+                 f"yolo_count={yolo_count} "
+@@ -1663,7 +1603,6 @@
+             print(
+                 f"[PERF][SLOW] total={total_ms:.2f}ms "
+                 f"detect={detect_ms:.2f}ms "
+-                f"tripwire={tripwire_ms:.2f}ms "
+                 f"yolo_infer={yolo_infer_ms:.2f}ms "
+                 f"yolo_draw={yolo_draw_ms:.2f}ms "
+                 f"yolo_count={yolo_count} "
+@@ -1731,12 +1670,6 @@
+         self.random_save_enabled = status
+         if not status:
+             self.last_random_save_time = 0
+-    @pyqtSlot(bool)
+-    def set_tripwire_enabled(self, status):
+-        self.tripwire_enabled = status
+-        if not status:
+-            self.recently_detected_centroids.clear()
+-
+     @pyqtSlot(object)
+     def set_arduino_manager(self, manager):
+         self.arduino_manager = manager
+@@ -1790,19 +1723,29 @@
+     def send_arduino_feed_on(self):
+         if self._send_arduino_command("FEEDON", require_enabled=False):
+             self._stop_stop_feed_beep()
++            self._arduino_last_feeder_signal = "ON"
++            self.feeder_state_changed.emit("ON")
+ 
+     @pyqtSlot()
+     def send_arduino_feed_off(self):
+-        self._send_arduino_command("FEEDOFF", require_enabled=False)
+-        self._stop_stop_feed_beep()
++        if self._send_arduino_command("FEEDOFF", require_enabled=False):
++            self._stop_stop_feed_beep()
++            self._arduino_last_feeder_signal = "OFF"
++            self.feeder_state_changed.emit("OFF")
++        else:
++            self._stop_stop_feed_beep()
+ 
+     @pyqtSlot()
+     def send_arduino_fan_on(self):
+-        self._send_arduino_command("FANON", require_enabled=False)
++        if self._send_arduino_command("FANON", require_enabled=False):
++            self._arduino_last_fan_signal = "ON"
++            self.fan_state_changed.emit("ON")
+ 
+     @pyqtSlot()
+     def send_arduino_fan_off(self):
+-        self._send_arduino_command("FANOFF", require_enabled=False)
++        if self._send_arduino_command("FANOFF", require_enabled=False):
++            self._arduino_last_fan_signal = "OFF"
++            self.fan_state_changed.emit("OFF")
+ 
+     @pyqtSlot(bool)
+     def set_stop_feeder_on_detect(self, status):
+@@ -2101,11 +2044,10 @@
+         event.accept()
+ 
+ 
+-class MainWindow(QMainWindow):
+-    detection_frame_ready = pyqtSignal(np.ndarray)
+-
+-    # ... (ส่วน __init__ และอื่นๆ เหมือนเดิม) ...
+-    def __init__(self):
++class MainWindow(QMainWindow):
++    detection_frame_ready = pyqtSignal(np.ndarray)
++
++    def __init__(self):
+         super().__init__()
+         self.setWindowTitle('Live Anomaly Detection GUI (Hybrid OR + Folder Clear)')
+         self.setGeometry(100,100,1200,800)
+@@ -2122,10 +2064,10 @@
+         self.start_time = 0
+         self.fps = 0.0
+         self.detection_timer_start = None
+-        self.detection_elapsed_total = 0.0
+-        self._last_pixmap_size = (0, 0)
+-        self._last_paused_live_display_time = 0.0
+-        self.focus_measure = 0.0
++        self.detection_elapsed_total = 0.0
++        self._last_pixmap_size = (0, 0)
++        self._last_paused_live_display_time = 0.0
++        self.focus_measure = 0.0
+         self.show_video_labels = True
+         self.zoom_level = 1.0
+         self.pan_offset = QPoint(0, 0)
+@@ -2186,15 +2128,16 @@
+         self.detection_worker.result_ready.connect(self.display_processed_frame)
+         self.detection_worker.status_update.connect(lambda msg: self.status_bar.showMessage(msg, 3000))
+         self.detection_worker.arduino_state_changed.connect(self._handle_servo_state_changed)
+-        self.detection_worker.detection_saved.connect(self._handle_stop_feed_detection_popup)
+-        self.detection_worker.service_breaker_triggered.connect(self._handle_service_breaker_trigger)
+-        self.detection_worker.stop_detection_requested.connect(self._handle_stop_detection_request)
+-        self.detection_worker.dangerous_detection_triggered.connect(self._handle_dangerous_detection)
+-        self.detection_frame_ready.connect(self.detection_worker.process_frame)
+-        if hasattr(self, 'service_breaker_check'):
+-            self.service_breaker_check.toggled.connect(self.detection_worker.set_service_breaker_enabled)
++        self.detection_worker.feeder_state_changed.connect(self._handle_feeder_state_changed)
++        self.detection_worker.fan_state_changed.connect(self._handle_fan_state_changed)
++        self.detection_worker.detection_saved.connect(self._handle_stop_feed_detection_popup)
++        self.detection_worker.service_breaker_triggered.connect(self._handle_service_breaker_trigger)
++        self.detection_worker.stop_detection_requested.connect(self._handle_stop_detection_request)
++        self.detection_worker.dangerous_detection_triggered.connect(self._handle_dangerous_detection)
++        self.detection_frame_ready.connect(self.detection_worker.process_frame)
++        if hasattr(self, 'service_breaker_check'):
++            self.service_breaker_check.toggled.connect(self.detection_worker.set_service_breaker_enabled)
+         self.auto_save_check.toggled.connect(self.detection_worker.set_auto_save)
+-        self.tripwire_check.toggled.connect(self.detection_worker.set_tripwire_enabled)
+         if hasattr(self, 'stop_feed_on_detect_check'):
+             self.stop_feed_on_detect_check.toggled.connect(self.detection_worker.set_stop_feeder_on_detect)
+         self.detection_thread.start()
+@@ -2212,6 +2155,14 @@
+     def _handle_servo_state_changed(self, state):
+         self._apply_servo_state_to_indicator(state)
+ 
++    @pyqtSlot(str)
++    def _handle_feeder_state_changed(self, state):
++        self._apply_feeder_state_to_indicator(state)
++
++    @pyqtSlot(str)
++    def _handle_fan_state_changed(self, state):
++        self._apply_fan_state_to_indicator(state)
++
+     @pyqtSlot()
+     def _handle_stop_detection_request(self):
+         if not self.is_detection_running:
+@@ -2349,6 +2300,46 @@
+         )
+         label.setText(text)
+ 
++    def _apply_feeder_state_to_indicator(self, state):
++        light = getattr(self, "arduino_feeder_light", None)
++        label = getattr(self, "arduino_feeder_status_label", None)
++        if light is None or label is None:
++            return
++        normalized = (state or "").strip().upper()
++        if normalized == "ON":
++            color = "#2ecc71"
++            text = "ON"
++        elif normalized == "OFF":
++            color = "#e74c3c"
++            text = "OFF"
++        else:
++            color = "#7f8c8d"
++            text = "Unknown"
++        light.setStyleSheet(
++            f"background-color: {color}; border-radius: 9px; border: 1px solid #111;"
++        )
++        label.setText(text)
++
++    def _apply_fan_state_to_indicator(self, state):
++        light = getattr(self, "arduino_fan_light", None)
++        label = getattr(self, "arduino_fan_status_label", None)
++        if light is None or label is None:
++            return
++        normalized = (state or "").strip().upper()
++        if normalized == "ON":
++            color = "#2ecc71"
++            text = "ON"
++        elif normalized == "OFF":
++            color = "#e74c3c"
++            text = "OFF"
++        else:
++            color = "#7f8c8d"
++            text = "Unknown"
++        light.setStyleSheet(
++            f"background-color: {color}; border-radius: 9px; border: 1px solid #111;"
++        )
++        label.setText(text)
++
+     def _ensure_detection_popup(self):
+         if self._detection_popup is not None:
+             return self._detection_popup
+@@ -2690,10 +2681,6 @@
+         self.random_save_check.toggled.connect(self._update_random_save_status)
+         mid_controls_row.addWidget(self.random_save_check)
+         mid_controls_row.addSpacing(16)
+-        self.tripwire_check = QCheckBox('Tripwire/Once per object')
+-        self.tripwire_check.toggled.connect(self._update_tripwire_status)
+-        mid_controls_row.addWidget(self.tripwire_check)
+-        mid_controls_row.addSpacing(16)
+         self.video_labels_check = QCheckBox('Show Video Labels')
+         self.video_labels_check.setChecked(True)
+         self.video_labels_check.toggled.connect(self._toggle_video_labels)
+@@ -2911,16 +2898,34 @@
+         connect_row.addStretch()
+         layout.addLayout(connect_row)
+ 
+-        servo_row = QHBoxLayout()
+-        servo_row.addWidget(QLabel('Servo Status:'))
++        hardware_row = QHBoxLayout()
++        hardware_row.addWidget(QLabel('Servo (Pin 9):'))
+         self.arduino_servo_light = QLabel()
+         self.arduino_servo_light.setFixedSize(18, 18)
+         self.arduino_servo_light.setStyleSheet('background-color: #7f8c8d; border-radius: 9px; border: 1px solid #111;')
+-        servo_row.addWidget(self.arduino_servo_light)
++        hardware_row.addWidget(self.arduino_servo_light)
+         self.arduino_servo_status_label = QLabel('Unknown')
+-        servo_row.addWidget(self.arduino_servo_status_label)
+-        servo_row.addStretch()
+-        layout.addLayout(servo_row)
++        hardware_row.addWidget(self.arduino_servo_status_label)
++        hardware_row.addSpacing(16)
++
++        hardware_row.addWidget(QLabel('Feeder (Pin 7):'))
++        self.arduino_feeder_light = QLabel()
++        self.arduino_feeder_light.setFixedSize(18, 18)
++        self.arduino_feeder_light.setStyleSheet('background-color: #7f8c8d; border-radius: 9px; border: 1px solid #111;')
++        hardware_row.addWidget(self.arduino_feeder_light)
++        self.arduino_feeder_status_label = QLabel('Unknown')
++        hardware_row.addWidget(self.arduino_feeder_status_label)
++        hardware_row.addSpacing(16)
++
++        hardware_row.addWidget(QLabel('Fan (Pin 8):'))
++        self.arduino_fan_light = QLabel()
++        self.arduino_fan_light.setFixedSize(18, 18)
++        self.arduino_fan_light.setStyleSheet('background-color: #7f8c8d; border-radius: 9px; border: 1px solid #111;')
++        hardware_row.addWidget(self.arduino_fan_light)
++        self.arduino_fan_status_label = QLabel('Unknown')
++        hardware_row.addWidget(self.arduino_fan_status_label)
++        hardware_row.addStretch()
++        layout.addLayout(hardware_row)
+ 
+         enable_row = QHBoxLayout()
+         self.arduino_enable_check = QCheckBox('Enable trigger on anomaly')
+@@ -2958,26 +2963,26 @@
+         layout.addLayout(command_row)
+ 
+         test_row = QHBoxLayout()
+-        self.arduino_trigger_test_btn = QPushButton('Test Trigger')
++        self.arduino_trigger_test_btn = QPushButton('Test Trigger (Pin 9)')
+         self.arduino_trigger_test_btn.clicked.connect(self._send_arduino_test_trigger)
+         test_row.addWidget(self.arduino_trigger_test_btn)
+-        self.arduino_clear_test_btn = QPushButton('Send Clear')
++        self.arduino_clear_test_btn = QPushButton('Send Clear (Pin 9)')
+         self.arduino_clear_test_btn.clicked.connect(self._send_arduino_test_clear)
+         test_row.addWidget(self.arduino_clear_test_btn)
+         test_row.addStretch()
+         layout.addLayout(test_row)
+ 
+         feed_row = QHBoxLayout()
+-        self.arduino_feed_on_btn = QPushButton('Feeder ON')
++        self.arduino_feed_on_btn = QPushButton('Feeder ON (Pin 7)')
+         self.arduino_feed_on_btn.clicked.connect(self._send_arduino_feed_on)
+         feed_row.addWidget(self.arduino_feed_on_btn)
+-        self.arduino_feed_off_btn = QPushButton('Feeder OFF')
++        self.arduino_feed_off_btn = QPushButton('Feeder OFF (Pin 7)')
+         self.arduino_feed_off_btn.clicked.connect(self._send_arduino_feed_off)
+         feed_row.addWidget(self.arduino_feed_off_btn)
+         self.arduino_fan_on_btn = QPushButton('Fan ON (Pin 8)')
+         self.arduino_fan_on_btn.clicked.connect(self._send_arduino_fan_on)
+         feed_row.addWidget(self.arduino_fan_on_btn)
+-        self.arduino_fan_off_btn = QPushButton('Fan OFF')
++        self.arduino_fan_off_btn = QPushButton('Fan OFF (Pin 8)')
+         self.arduino_fan_off_btn.clicked.connect(self._send_arduino_fan_off)
+         feed_row.addWidget(self.arduino_fan_off_btn)
+         feed_row.addStretch()
+@@ -3053,8 +3058,13 @@
+                 self.arduino_fan_on_btn.setEnabled(True)
+             if hasattr(self, 'arduino_fan_off_btn'):
+                 self.arduino_fan_off_btn.setEnabled(True)
+-            if hasattr(self, 'detection_worker') and hasattr(self.detection_worker, '_arduino_last_signal'):
+-                self._handle_servo_state_changed(self.detection_worker._arduino_last_signal)
++            if hasattr(self, 'detection_worker'):
++                if hasattr(self.detection_worker, '_arduino_last_signal'):
++                    self._handle_servo_state_changed(self.detection_worker._arduino_last_signal)
++                if hasattr(self.detection_worker, '_arduino_last_feeder_signal'):
++                    self._handle_feeder_state_changed(self.detection_worker._arduino_last_feeder_signal)
++                if hasattr(self.detection_worker, '_arduino_last_fan_signal'):
++                    self._handle_fan_state_changed(self.detection_worker._arduino_last_fan_signal)
+         else:
+             default_text = 'Not connected' if serial is not None else 'pyserial not installed'
+             self.arduino_status_label.setText(default_text)
+@@ -3071,6 +3081,8 @@
+             if hasattr(self, 'arduino_fan_off_btn'):
+                 self.arduino_fan_off_btn.setEnabled(False)
+             self._apply_servo_state_to_indicator('unknown')
++            self._apply_feeder_state_to_indicator('unknown')
++            self._apply_fan_state_to_indicator('unknown')
+         self._update_arduino_delay_spin_states()
+ 
+     def _handle_arduino_connect(self):
+@@ -3135,7 +3147,7 @@
+             self.status_bar.showMessage('Arduino not connected.', 2000)
+             return
+         self.detection_worker.send_arduino_trigger_test()
+-        self.status_bar.showMessage('Trigger command sent to Arduino.', 2000)
++        self.status_bar.showMessage('Trigger command sent to Servo (Pin 9).', 2000)
+ 
+     def _send_arduino_test_clear(self):
+         if serial is None:
+@@ -3144,7 +3156,7 @@
+             self.status_bar.showMessage('Arduino not connected.', 2000)
+             return
+         self.detection_worker.send_arduino_clear_now()
+-        self.status_bar.showMessage('Clear command sent to Arduino.', 2000)
++        self.status_bar.showMessage('Clear command sent to Servo (Pin 9).', 2000)
+ 
+     def _send_arduino_feed_on(self):
+         if serial is None:
+@@ -3153,7 +3165,7 @@
+             self.status_bar.showMessage('Arduino not connected.', 2000)
+             return
+         self.detection_worker.send_arduino_feed_on()
+-        self.status_bar.showMessage('Feeder ON command sent to Arduino.', 2000)
++        self.status_bar.showMessage('Feeder ON command sent to Arduino (Pin 7).', 2000)
+ 
+     def _send_arduino_feed_off(self):
+         if serial is None:
+@@ -3162,7 +3174,7 @@
+             self.status_bar.showMessage('Arduino not connected.', 2000)
+             return
+         self.detection_worker.send_arduino_feed_off()
+-        self.status_bar.showMessage('Feeder OFF command sent to Arduino.', 2000)
++        self.status_bar.showMessage('Feeder OFF command sent to Arduino (Pin 7).', 2000)
+ 
+     def _send_arduino_fan_on(self):
+         if serial is None:
+@@ -3171,7 +3183,7 @@
+             self.status_bar.showMessage('Arduino not connected.', 2000)
+             return
+         self.detection_worker.send_arduino_fan_on()
+-        self.status_bar.showMessage('Fan ON command sent to Arduino pin 8.', 2000)
++        self.status_bar.showMessage('Fan ON command sent to Arduino (Pin 8).', 2000)
+ 
+     def _send_arduino_fan_off(self):
+         if serial is None:
+@@ -3180,7 +3192,7 @@
+             self.status_bar.showMessage('Arduino not connected.', 2000)
+             return
+         self.detection_worker.send_arduino_fan_off()
+-        self.status_bar.showMessage('Fan OFF command sent to Arduino pin 8.', 2000)
++        self.status_bar.showMessage('Fan OFF command sent to Arduino (Pin 8).', 2000)
+ 
+     def _update_arduino_delay_spin_states(self):
+         trigger_spin = getattr(self, 'arduino_trigger_delay_spin', None)
+@@ -3479,14 +3491,6 @@
+             2000
+         )
+ 
+-    def _update_tripwire_status(self, checked):
+-        if hasattr(self, 'detection_worker'):
+-            self.detection_worker.set_tripwire_enabled(checked)
+-        self.status_bar.showMessage(
+-            'Tripwire enabled.' if checked else 'Tripwire disabled.',
+-            2000
+-        )
+-
+     def _toggle_center_marker(self, checked):
+         self.center_marker_enabled = checked
+         if hasattr(self, 'status_bar'):
+@@ -3957,8 +3961,8 @@
+             preferred_fourcc=preferred_fourcc,
+             exposure_value=exposure_value
+         )
+-        self.video_thread.change_pixmap_signal.connect(self._handle_detection_camera_frame)
+-        self.video_thread.fourcc_signal.connect(self._update_fourcc_label)
++        self.video_thread.change_pixmap_signal.connect(self._handle_detection_camera_frame)
++        self.video_thread.fourcc_signal.connect(self._update_fourcc_label)
+         
+         print(f"[LOG {time.time():.2f}] Starting VideoThread...")
+         self.video_thread.start()
+@@ -3970,13 +3974,13 @@
+         self._toggle_controls(False)
+         print(f"[LOG {time.time():.2f}] _start_detection function finished. Total time: {time.time() - start_time_total:.4f} seconds.")
+ 
+-    def _pause_detection(self):
+-        if not self.is_detection_running or self.is_paused:
+-            return
+-        self.is_paused = True
+-        self._last_paused_live_display_time = 0.0
+-        if self.detection_timer_start:
+-            self.detection_elapsed_total += time.time() - self.detection_timer_start
++    def _pause_detection(self):
++        if not self.is_detection_running or self.is_paused:
++            return
++        self.is_paused = True
++        self._last_paused_live_display_time = 0.0
++        if self.detection_timer_start:
++            self.detection_elapsed_total += time.time() - self.detection_timer_start
+             self.detection_timer_start = None
+         self.frame_count = 0
+         self.start_time = time.time()
+@@ -3990,11 +3994,11 @@
+             self.detection_worker.reset_service_breaker()
+             if reset_danger_alarm:
+                 self.detection_worker.reset_danger_alarm()
+-        if hasattr(self, 'video_thread') and self.video_thread.isRunning():
+-            self.video_thread.resume()
+-        self.is_paused = False
+-        self._last_paused_live_display_time = 0.0
+-        self.detection_timer_start = time.time()
++        if hasattr(self, 'video_thread') and self.video_thread.isRunning():
++            self.video_thread.resume()
++        self.is_paused = False
++        self._last_paused_live_display_time = 0.0
++        self.detection_timer_start = time.time()
+         self.frame_count = 0
+         self.start_time = time.time()
+         self.status_bar.showMessage('Detection resumed.')
+@@ -4017,7 +4021,6 @@
+         if show_summary and was_running:
+             self._show_detection_summary()
+ 
+-    # ... (ส่วนที่เหลือของ MainWindow เหมือนเดิม) ...
+     def _toggle_controls(self, enable):
+         running = not enable
+         paused = self.is_paused if running else False
+@@ -4338,66 +4341,66 @@
+         self.pan_offset.setY(self.pan_offset.y() + int(dy * sensitivity))
+         if not self.is_detection_running:
+             self._reprocess_image()
+-
+-
+-    @pyqtSlot(np.ndarray)
+-    def _handle_detection_camera_frame(self, frame):
+-        if not self.is_detection_running:
+-            return
+-        if self.is_paused:
+-            self.display_paused_live_frame(frame)
+-            return
+-        self.detection_frame_ready.emit(frame)
+-
+-    def display_paused_live_frame(self, frame):
+-        now = time.time()
+-        if now - self._last_paused_live_display_time < (1.0 / 30.0):
+-            return
+-        self._last_paused_live_display_time = now
+-        live_frame = frame.copy()
+-        self.current_frame = live_frame.copy()
+-        focus_value, roi_rect = self._compute_focus_measure(live_frame)
+-        self.focus_measure = focus_value
+-        self._apply_visual_guides(live_frame)
+-        if getattr(self, 'show_video_labels', True):
+-            h, w = live_frame.shape[:2]
+-            self._draw_focus_overlay(live_frame, focus_value, None)
+-            paused_text = 'LIVE VIEW ONLY - DETECTION PAUSED'
+-            paused_font = cv2.FONT_HERSHEY_SIMPLEX
+-            paused_scale = 1.0
+-            paused_thickness = 2
+-            (paused_w, paused_h), _ = cv2.getTextSize(paused_text, paused_font, paused_scale, paused_thickness)
+-            paused_x = max(10, w - paused_w - 20)
+-            paused_y = max(42, paused_h + 12)
+-            cv2.putText(
+-                live_frame,
+-                paused_text,
+-                (paused_x, paused_y),
+-                paused_font,
+-                paused_scale,
+-                (0, 255, 0),
+-                paused_thickness,
+-                cv2.LINE_AA,
+-            )
+-            cv2.putText(
+-                live_frame,
+-                f'{w}x{h}',
+-                (10, h - 14),
+-                cv2.FONT_HERSHEY_SIMPLEX,
+-                0.8,
+-                (0, 255, 0),
+-                2,
+-                cv2.LINE_AA,
+-            )
+-        pixmap = self.convert_cv_qt(live_frame)
+-        self.video_window.video_label.setPixmap(pixmap)
+-        self._last_pixmap_size = (pixmap.width(), pixmap.height())
+-
+-    @pyqtSlot(np.ndarray, np.ndarray, float, bool, int)
+-    def display_processed_frame(self, processed_frame, original_frame, mse, is_anomaly, anomaly_count):
+-        if self.is_paused:
+-            return
+-        self.current_frame = original_frame
++
++
++    @pyqtSlot(np.ndarray)
++    def _handle_detection_camera_frame(self, frame):
++        if not self.is_detection_running:
++            return
++        if self.is_paused:
++            self.display_paused_live_frame(frame)
++            return
++        self.detection_frame_ready.emit(frame)
++
++    def display_paused_live_frame(self, frame):
++        now = time.time()
++        if now - self._last_paused_live_display_time < (1.0 / 30.0):
++            return
++        self._last_paused_live_display_time = now
++        live_frame = frame.copy()
++        self.current_frame = live_frame.copy()
++        focus_value, roi_rect = self._compute_focus_measure(live_frame)
++        self.focus_measure = focus_value
++        self._apply_visual_guides(live_frame)
++        if getattr(self, 'show_video_labels', True):
++            h, w = live_frame.shape[:2]
++            self._draw_focus_overlay(live_frame, focus_value, None)
++            paused_text = 'LIVE VIEW ONLY - DETECTION PAUSED'
++            paused_font = cv2.FONT_HERSHEY_SIMPLEX
++            paused_scale = 1.0
++            paused_thickness = 2
++            (paused_w, paused_h), _ = cv2.getTextSize(paused_text, paused_font, paused_scale, paused_thickness)
++            paused_x = max(10, w - paused_w - 20)
++            paused_y = max(42, paused_h + 12)
++            cv2.putText(
++                live_frame,
++                paused_text,
++                (paused_x, paused_y),
++                paused_font,
++                paused_scale,
++                (0, 255, 0),
++                paused_thickness,
++                cv2.LINE_AA,
++            )
++            cv2.putText(
++                live_frame,
++                f'{w}x{h}',
++                (10, h - 14),
++                cv2.FONT_HERSHEY_SIMPLEX,
++                0.8,
++                (0, 255, 0),
++                2,
++                cv2.LINE_AA,
++            )
++        pixmap = self.convert_cv_qt(live_frame)
++        self.video_window.video_label.setPixmap(pixmap)
++        self._last_pixmap_size = (pixmap.width(), pixmap.height())
++
++    @pyqtSlot(np.ndarray, np.ndarray, float, bool, int)
++    def display_processed_frame(self, processed_frame, original_frame, mse, is_anomaly, anomaly_count):
++        if self.is_paused:
++            return
++        self.current_frame = original_frame
+         self.frame_count += 1; elapsed = time.time() - self.start_time
+         if elapsed > 1.0:
+             self.fps = self.frame_count/elapsed; self.frame_count = 0; self.start_time = time.time()
+@@ -4521,8 +4524,6 @@
+             s.setValue('arduino_baud', self.arduino_baud_combo.currentText())
+             if hasattr(self, 'stop_feed_on_detect_check'):
+                 s.setValue('stop_feed_on_detect', self.stop_feed_on_detect_check.isChecked())
+-        if hasattr(self, 'tripwire_check'):
+-            s.setValue('tripwire_enabled', self.tripwire_check.isChecked())
+ 
+     def _load_settings(self):
+         s = QSettings('config.ini', QSettings.Format.IniFormat)
+@@ -4717,11 +4718,6 @@
+         self.hsv_lock_check.setChecked(lock_hsv)
+         self.hsv_target_locked = lock_hsv
+ 
+-        if hasattr(self, 'tripwire_check'):
+-            tripwire_enabled = s.value('tripwire_enabled', False, type=bool)
+-            self.tripwire_check.setChecked(tripwire_enabled)
+-            self.detection_worker.set_tripwire_enabled(tripwire_enabled)
+-
+         self._push_arduino_config()
+ 
+         if mode_idx in (1,2) and not model_path:
+@@ -4733,6 +4729,8 @@
+         self._stop_detection(show_summary=False)
+         self.monitor_window.close()
+         self.video_window.close()
++        if hasattr(self, 'detection_worker') and self.detection_worker is not None:
++            self.detection_worker.stop_save_worker()
+         self.detection_thread.quit()
+         self.detection_thread.wait()
+         event.accept()
+@@ -4744,4 +4742,3 @@
+     sys.exit(app.exec())
+ 
+ 
+-#xxxx coment

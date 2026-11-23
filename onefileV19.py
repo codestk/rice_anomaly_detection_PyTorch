@@ -285,7 +285,10 @@ class AnomalyDetector:
         self.yolo_model_path = ''
         self.yolo_enabled = False
         self.yolo_confidence = 0.35
+<<<<<<< HEAD
         self.yolo_relay_confidence = 0.75
+=======
+>>>>>>> feature/huateng-camera-support
         self._yolo_names = {}
         self.yolo_class_filter = set()
         self.yolo_dangerous_classes = set()
@@ -298,7 +301,10 @@ class AnomalyDetector:
         self._last_yolo_infer_device = None
         self.last_yolo_detections = []
         self.last_yolo_class_ids = []
+<<<<<<< HEAD
         self.last_yolo_confidences = []
+=======
+>>>>>>> feature/huateng-camera-support
         self.last_detection_sources = []
 
     def _device_display_name(self, device_value):
@@ -408,12 +414,15 @@ class AnomalyDetector:
         except (TypeError, ValueError):
             return
         self.yolo_confidence = max(0.01, min(0.99, conf))
+<<<<<<< HEAD
     def set_yolo_relay_confidence(self, value):
         try:
             conf = float(value)
         except (TypeError, ValueError):
             return
         self.yolo_relay_confidence = max(0.01, min(0.99, conf))
+=======
+>>>>>>> feature/huateng-camera-support
     def _normalize_yolo_class_items(self, items):
         normalized = set()
         if isinstance(items, str):
@@ -625,14 +634,20 @@ class AnomalyDetector:
         if self.mode not in ('hybrid', 'yolo'):
             self.last_yolo_detections = []
             self.last_yolo_class_ids = []
+<<<<<<< HEAD
             self.last_yolo_confidences = []
+=======
+>>>>>>> feature/huateng-camera-support
             self._last_yolo_draw_ms = 0.0
             self._last_yolo_count = 0
             return annotated_frame, mse, is_anom, contours
         yolo_detections = self._run_yolo_detection(original_frame)
         self.last_yolo_detections = [det['label'] for det in yolo_detections]
         self.last_yolo_class_ids = [det.get('cls_id') for det in yolo_detections]
+<<<<<<< HEAD
         self.last_yolo_confidences = [det.get('conf', 0.0) for det in yolo_detections]
+=======
+>>>>>>> feature/huateng-camera-support
         if not yolo_detections:
             self._last_yolo_draw_ms = 0.0
             return annotated_frame, mse, is_anom, contours
@@ -1161,7 +1176,10 @@ class DetectionWorker(QObject):
         self.class_capture_min_interval = 0.04
         self._class_capture_last_save_time = {}
         self._relay_capture_last_save_time = {}
+<<<<<<< HEAD
         self._recon_capture_last_save_time = 0.0
+=======
+>>>>>>> feature/huateng-camera-support
         self._save_queue = queue.Queue(maxsize=16)
         self._save_thread = threading.Thread(target=self._save_worker, daemon=True)
         self._save_thread.start()
@@ -1247,6 +1265,7 @@ class DetectionWorker(QObject):
                 hits.append(cls_key)
         return hits
 
+<<<<<<< HEAD
     def _get_relay_yolo_hits(self, labels, class_ids, confidences):
         relay_set = getattr(self.detector, 'yolo_relay_classes', set()) or set()
         if not relay_set:
@@ -1280,6 +1299,24 @@ class DetectionWorker(QObject):
             hit_text = str(label).strip() or (cls_key or "")
             if hit_text and hit_text not in hits:
                 hits.append(hit_text)
+=======
+    def _get_relay_yolo_hits(self, labels, class_ids):
+        relay_set = getattr(self.detector, 'yolo_relay_classes', set()) or set()
+        if not relay_set:
+            return []
+        hits = []
+        for label in labels or []:
+            key = str(label).strip().lower()
+            if key and key in relay_set:
+                hits.append(str(label).strip())
+        for cls_id in class_ids or []:
+            try:
+                cls_key = str(int(cls_id))
+            except (TypeError, ValueError):
+                continue
+            if cls_key in relay_set and cls_key not in hits:
+                hits.append(cls_key)
+>>>>>>> feature/huateng-camera-support
         return hits
 
     def _enqueue_labeled_capture(
@@ -1704,6 +1741,7 @@ class DetectionWorker(QObject):
             self.status_update.emit(runtime_status)
 
         now_ts = time.time()
+<<<<<<< HEAD
         # Reconstruction mode only collects training images: a detection is
         # saved and counted, but nothing downstream (servo, feeder, pause,
         # beep, breaker, auto-save popup) sees it as an anomaly.
@@ -1730,11 +1768,20 @@ class DetectionWorker(QObject):
         detection_sources = list(getattr(self.detector, 'last_detection_sources', []))
         yolo_ids = list(getattr(self.detector, 'last_yolo_class_ids', []))
         yolo_confs = list(getattr(self.detector, 'last_yolo_confidences', []))
+=======
+        yolo_labels = list(getattr(self.detector, 'last_yolo_detections', []))
+        detection_sources = list(getattr(self.detector, 'last_detection_sources', []))
+        yolo_ids = list(getattr(self.detector, 'last_yolo_class_ids', []))
+>>>>>>> feature/huateng-camera-support
         capture_only_hits = self._get_capture_only_yolo_hits(yolo_labels, yolo_ids)
         if capture_only_hits:
             self._enqueue_class_capture(processed_frame, original_frame, capture_only_hits, now_ts)
         relay_class_filter_active = bool(getattr(self.detector, 'yolo_relay_classes', set()))
+<<<<<<< HEAD
         relay_hits = self._get_relay_yolo_hits(yolo_labels, yolo_ids, yolo_confs) if relay_class_filter_active else []
+=======
+        relay_hits = self._get_relay_yolo_hits(yolo_labels, yolo_ids) if relay_class_filter_active else []
+>>>>>>> feature/huateng-camera-support
         relay_class_ok = bool(relay_hits) if relay_class_filter_active else True
         label_text = self._build_detection_label_text(yolo_labels, detection_sources)
         self._last_detection_label_text = label_text
@@ -1743,8 +1790,12 @@ class DetectionWorker(QObject):
         if not dangerous_hit and self._danger_alarm_active:
             self._danger_alarm_active = False
         danger_event_started = dangerous_hit and not self._danger_alarm_active
+<<<<<<< HEAD
         # The servo only ever acts on dangerous YOLO classes.
         servo_detection_active = bool(dangerous_hit)
+=======
+        servo_detection_active = bool(is_anomaly_present or dangerous_hit)
+>>>>>>> feature/huateng-camera-support
         is_new_anomaly_found = False
 
         is_anomaly = is_anomaly_present
@@ -1755,6 +1806,7 @@ class DetectionWorker(QObject):
             is_anomaly = True
             is_new_anomaly_found = True
 
+<<<<<<< HEAD
         # "Stop feeder on anomaly" is used to collect training samples, so any
         # YOLO box on screen counts here — including classes only listed under
         # Capture or Air Ejector, which never count as an anomaly otherwise.
@@ -1762,6 +1814,8 @@ class DetectionWorker(QObject):
             is_anomaly = True
             is_new_anomaly_found = True
 
+=======
+>>>>>>> feature/huateng-camera-support
         if servo_detection_active:
             self._last_anomaly_seen_time = now_ts
 
@@ -1791,12 +1845,16 @@ class DetectionWorker(QObject):
                 message = f"{message}: {', '.join(dangerous_hits)}"
             self.dangerous_detection_triggered.emit(message)
 
+<<<<<<< HEAD
         general_pause_triggered = False
+=======
+>>>>>>> feature/huateng-camera-support
         if is_new_anomaly_found:
             self.anomaly_count += 1
             self._record_detection_summary(yolo_labels, detection_sources)
             self._play_beep_async()
             if self.stop_feeder_on_detect and not dangerous_hit:
+<<<<<<< HEAD
                 general_pause_triggered = True
                 self.send_arduino_feed_off()
                 self._play_pause_on_anomaly_beep()
@@ -1806,6 +1864,12 @@ class DetectionWorker(QObject):
             # Reconstruction mode never moves the servo, not even to auto-clear.
             self._cancel_arduino_trigger_timer()
         elif (
+=======
+                self.send_arduino_feed_off()
+                self._play_pause_on_anomaly_beep()
+                self.pause_detection_requested.emit()
+        if (
+>>>>>>> feature/huateng-camera-support
             self.arduino_enabled
             and is_new_anomaly_found
             and servo_detection_active
@@ -1824,6 +1888,7 @@ class DetectionWorker(QObject):
         # frame. Blank list = disabled (never fires), matching the "blank =
         # none" convention used by Dangerous/Capture Classes.
         #
+<<<<<<< HEAD
         # One deliberate exception: a dangerous-class hit, or an unrelated
         # anomaly that pauses detection via "Stop feeder on anomaly", always
         # wins over the ejector, even on the very same frame that triggers
@@ -1840,6 +1905,21 @@ class DetectionWorker(QObject):
         if relay_detection_active:
             self._relay_last_anomaly_seen_time = now_ts
         if dangerous_hit or general_pause_triggered:
+=======
+        # One deliberate exception: a dangerous-class hit always wins over the
+        # ejector, even on the very same frame that triggers it. Danger pauses
+        # detection (see _handle_dangerous_detection), and no more frames get
+        # processed while paused, so nothing would normally re-issue a clear
+        # command until resume; forcing it off here (on the worker thread,
+        # synchronously) guarantees the ejector stays idle through the whole
+        # danger pause / auto-cleansing window instead of depending on the
+        # cross-thread pause signal winning a race against this same frame's
+        # relay trigger.
+        relay_detection_active = relay_class_ok if relay_class_filter_active else False
+        if relay_detection_active:
+            self._relay_last_anomaly_seen_time = now_ts
+        if dangerous_hit:
+>>>>>>> feature/huateng-camera-support
             if self._relay_last_signal == "trigger" or self._relay_trigger_timer is not None:
                 self._send_relay_clear()
         elif (
@@ -1880,8 +1960,13 @@ class DetectionWorker(QObject):
                 label_text=label_text,
             )
             save_ms = (time.perf_counter() - save_start) * 1000.0
+<<<<<<< HEAD
         elif danger_event_started or general_pause_triggered:
             # Danger and "Stop feeder on anomaly" stops always save a snapshot, even with auto-save off.
+=======
+        elif danger_event_started:
+            # Ensure dangerous classes always produce a popup snapshot even when auto-save is disabled.
+>>>>>>> feature/huateng-camera-support
             save_start = time.perf_counter()
             self._enqueue_detection_snapshot(
                 processed_frame,
@@ -1914,7 +1999,10 @@ class DetectionWorker(QObject):
         can_random_save = (
             self.random_save_enabled
             and not is_anomaly_present  # only keep clean frames for training
+<<<<<<< HEAD
             and not recon_detected
+=======
+>>>>>>> feature/huateng-camera-support
             and (now_ts - self.last_random_save_time) >= self.random_save_min_interval
         )
         if can_random_save:
@@ -2131,6 +2219,7 @@ class DetectionWorker(QObject):
         if not self.service_breaker_enabled:
             self._reset_service_breaker_state()
 
+<<<<<<< HEAD
     def set_capture_interval(self, value):
         """Cooldown (seconds) per class label shared by YOLO Capture Classes
         and the ejector-trigger capture; see class_capture_min_interval."""
@@ -2140,6 +2229,8 @@ class DetectionWorker(QObject):
             return
         self.class_capture_min_interval = max(0.0, interval)
 
+=======
+>>>>>>> feature/huateng-camera-support
     def reset_counter(self, force_clear=False):
         self.anomaly_count = 0
         self.detection_summary = {}
@@ -2153,6 +2244,7 @@ class DetectionWorker(QObject):
             self.detector.last_yolo_detections = []
         if hasattr(self.detector, 'last_yolo_class_ids'):
             self.detector.last_yolo_class_ids = []
+<<<<<<< HEAD
         if hasattr(self.detector, 'last_yolo_confidences'):
             self.detector.last_yolo_confidences = []
         if hasattr(self.detector, 'last_detection_sources'):
@@ -2167,6 +2259,12 @@ class DetectionWorker(QObject):
             and not recon_mode
             and self._arduino_last_signal == "trigger"
         ):
+=======
+        if hasattr(self.detector, 'last_detection_sources'):
+            self.detector.last_detection_sources = []
+        self._cancel_arduino_trigger_timer()
+        if self.arduino_enabled and (self.arduino_clear_enabled or force_clear):
+>>>>>>> feature/huateng-camera-support
             self._send_arduino_clear()
         self._cancel_relay_trigger_timer()
         if self.relay_enabled and (self.relay_clear_enabled or force_clear):
@@ -2473,9 +2571,13 @@ class MainWindow(QMainWindow):
         self._summary_text_edit = None
         self._danger_delayed_snapshot_pending = False
         self.danger_fan_start_delay_ms = 3000
+<<<<<<< HEAD
         self.danger_fan_clear_ms = 10000
         self.danger_ejector_delay_ms = 3000
         self.danger_ejector_blast_ms = 500
+=======
+        self.danger_fan_clear_ms = 20000
+>>>>>>> feature/huateng-camera-support
         self.danger_feeder_resume_delay_ms = 5000
         self._danger_clear_sequence_id = 0
         self._danger_clear_sequence_active = False
@@ -2547,8 +2649,11 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'service_breaker_check'):
             self.detection_worker.set_service_breaker_enabled(self.service_breaker_check.isChecked())
         self._update_random_save_status(self.random_save_check.isChecked())
+<<<<<<< HEAD
         if hasattr(self, 'capture_interval_spin'):
             self.detection_worker.set_capture_interval(self.capture_interval_spin.value())
+=======
+>>>>>>> feature/huateng-camera-support
         self._push_arduino_config()
         self._push_relay_config()
         self._handle_servo_state_changed(self.detection_worker._arduino_last_signal)
@@ -2575,6 +2680,7 @@ class MainWindow(QMainWindow):
         if not self.is_detection_running:
             return
         self._pause_detection()
+<<<<<<< HEAD
         # Redundant safety net (same pattern as _handle_dangerous_detection):
         # the worker thread already force-clears the ejector synchronously
         # when this pause fires, but if it was already mid-fire from an
@@ -2582,6 +2688,8 @@ class MainWindow(QMainWindow):
         # whole pause.
         if hasattr(self, 'detection_worker'):
             self.detection_worker.send_relay_clear_now()
+=======
+>>>>>>> feature/huateng-camera-support
         self.status_bar.showMessage(
             'Anomaly detected — feeder stopped, detection paused. Remove the item, then click Resume Detection.',
             8000,
@@ -2622,7 +2730,10 @@ class MainWindow(QMainWindow):
         self._danger_clear_sequence_active = False
         if stop_fan and was_active and serial is not None and self.arduino_manager.is_connected():
             self.detection_worker.send_arduino_fan_off()
+<<<<<<< HEAD
             self.detection_worker.send_relay_clear_now()
+=======
+>>>>>>> feature/huateng-camera-support
 
     def _start_danger_auto_fan_clear_sequence(self, message):
         if not self._danger_auto_fan_clear_enabled():
@@ -2659,6 +2770,7 @@ class MainWindow(QMainWindow):
             return
 
         self.detection_worker.send_arduino_fan_on()
+<<<<<<< HEAD
         QTimer.singleShot(
             self.danger_ejector_delay_ms,
             lambda sid=sequence_id: self._fire_danger_ejector_blast(sid),
@@ -2667,6 +2779,10 @@ class MainWindow(QMainWindow):
             f'Danger fan clearing rail for {self.danger_fan_clear_ms // 1000}s '
             f'(ejector blast {self.danger_ejector_blast_ms / 1000:g}s after '
             f'{self.danger_ejector_delay_ms / 1000:.0f}s).',
+=======
+        self.status_bar.showMessage(
+            f'Danger fan clearing rail for {self.danger_fan_clear_ms // 1000}s.',
+>>>>>>> feature/huateng-camera-support
             8000,
         )
         QTimer.singleShot(
@@ -2674,6 +2790,7 @@ class MainWindow(QMainWindow):
             lambda sid=sequence_id: self._finish_danger_fan_clear(sid),
         )
 
+<<<<<<< HEAD
     def _fire_danger_ejector_blast(self, sequence_id):
         if sequence_id != self._danger_clear_sequence_id or not self._danger_clear_sequence_active:
             return
@@ -2684,6 +2801,8 @@ class MainWindow(QMainWindow):
         self.detection_worker.send_relay_trigger_test()
         QTimer.singleShot(self.danger_ejector_blast_ms, self.detection_worker.send_relay_clear_now)
 
+=======
+>>>>>>> feature/huateng-camera-support
     def _finish_danger_fan_clear(self, sequence_id):
         if sequence_id != self._danger_clear_sequence_id or not self._danger_clear_sequence_active:
             return
@@ -2913,7 +3032,10 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage('Service breaker triggered: repeated detections. Detection paused.', 6000)
         if hasattr(self, 'detection_worker'):
             self.detection_worker._play_service_breaker_alarm()
+<<<<<<< HEAD
             self.detection_worker.send_relay_clear_now()
+=======
+>>>>>>> feature/huateng-camera-support
         self._pause_detection()
         if image_path:
             self._handle_stop_feed_detection_popup(image_path)
@@ -3073,6 +3195,7 @@ class MainWindow(QMainWindow):
         yolo_relay_row.addWidget(self.yolo_relay_class_status)
         thresholds_layout.addLayout(yolo_relay_row)
         self._update_yolo_relay_classes('')
+<<<<<<< HEAD
         yolo_relay_conf_row = QHBoxLayout()
         yolo_relay_conf_row.addWidget(QLabel('YOLO Air Ejector Confidence:'))
         self.yolo_relay_conf_slider = QSlider(Qt.Orientation.Horizontal)
@@ -3103,6 +3226,8 @@ class MainWindow(QMainWindow):
         capture_interval_row.addWidget(capture_interval_hint)
         capture_interval_row.addStretch()
         thresholds_layout.addLayout(capture_interval_row)
+=======
+>>>>>>> feature/huateng-camera-support
         thresholds_layout.addLayout(thr)
         thresholds_layout.addLayout(cvthr)
         thresholds_layout.addLayout(cont)
@@ -3166,6 +3291,22 @@ class MainWindow(QMainWindow):
         exposure_row.addWidget(self.exposure_label)
         exposure_row.addStretch()
         left.addLayout(exposure_row)
+<<<<<<< HEAD
+=======
+        self.exposure_hint_label = QLabel('-13 = Fast/Dark, 0 = Slow/Bright')
+        self.exposure_hint_label.setStyleSheet('color: #bdc3c7; font-size: 9pt;')
+        left.addWidget(self.exposure_hint_label)
+        wb_row = QHBoxLayout()
+        self.wb_once_btn = QPushButton('White Balance (Once)')
+        self.wb_once_btn.setToolTip('Point the camera at an empty/neutral part of the rail first, then click. HuaTeng SDK cameras only.')
+        self.wb_once_btn.clicked.connect(self._trigger_white_balance_once)
+        wb_row.addWidget(self.wb_once_btn)
+        wb_hint = QLabel('Aim at empty rail (no grain) before clicking, then re-sample Hue1/2/3.')
+        wb_hint.setStyleSheet('color: #bdc3c7; font-size: 9pt;')
+        wb_row.addWidget(wb_hint)
+        wb_row.addStretch()
+        left.addLayout(wb_row)
+>>>>>>> feature/huateng-camera-support
         left.addStretch()
 
         # right panel
@@ -3189,9 +3330,14 @@ class MainWindow(QMainWindow):
         auto_beep_row.addSpacing(24)
         self.stop_feed_on_detect_check = QCheckBox('Stop feeder on anomaly')
         self.stop_feed_on_detect_check.setToolTip(
+<<<<<<< HEAD
             'On any detection — Color/Recon anomaly or any YOLO box, including Capture and Air Ejector '
             'classes: send FEEDOFF, beep 5 times, save a snapshot, and pause detection (the ejector does '
             'not fire). Remove the item, then click Resume Detection manually.'
+=======
+            'On any new anomaly (including ones the model has never seen before): send FEEDOFF, '
+            'beep 5 times, and pause detection. Remove the item, then click Resume Detection manually.'
+>>>>>>> feature/huateng-camera-support
         )
         auto_beep_row.addWidget(self.stop_feed_on_detect_check)
         auto_beep_row.addSpacing(24)
@@ -3200,7 +3346,11 @@ class MainWindow(QMainWindow):
         auto_beep_row.addWidget(self.service_breaker_check)
         auto_beep_row.addSpacing(24)
         self.danger_auto_fan_clear_check = QCheckBox('Auto cleansing')
+<<<<<<< HEAD
         self.danger_auto_fan_clear_check.setToolTip('When a dangerous YOLO class pauses detection, turn feeder off, wait 3s, run the fan for 10s (with a 0.5s air ejector blast 3s after the fan starts), resume detection, then turn the feeder on after 5s.')
+=======
+        self.danger_auto_fan_clear_check.setToolTip('When a dangerous YOLO class pauses detection, turn feeder off, wait 3s, run the fan for 20s, resume detection, then turn the feeder on after 5s.')
+>>>>>>> feature/huateng-camera-support
         self.danger_auto_fan_clear_check.toggled.connect(self._handle_danger_auto_fan_clear_toggled)
         auto_beep_row.addWidget(self.danger_auto_fan_clear_check)
         auto_beep_row.addSpacing(24)
@@ -3232,6 +3382,7 @@ class MainWindow(QMainWindow):
         self.mode_combo = QComboBox(); self.mode_combo.addItems(['Reconstruction/Model','Color (HSV)','Hybrid (OR)','YOLO Only'])
         self.mode_combo.currentIndexChanged.connect(self._mode_changed)
         mode_row.addWidget(self.mode_combo)
+<<<<<<< HEAD
         mode_row.addSpacing(24)
         self.wb_once_btn = QPushButton('White Balance (Once)')
         self.wb_once_btn.setToolTip('Point the camera at an empty/neutral part of the rail first, then click. HuaTeng SDK cameras only.')
@@ -3240,6 +3391,8 @@ class MainWindow(QMainWindow):
         wb_hint = QLabel('Aim at empty rail (no grain) before clicking, then re-sample Hue1/2/3.')
         wb_hint.setStyleSheet('color: #bdc3c7; font-size: 9pt;')
         mode_row.addWidget(wb_hint)
+=======
+>>>>>>> feature/huateng-camera-support
         mode_row.addStretch()
         general_layout.addLayout(mode_row)
 
@@ -3394,9 +3547,12 @@ class MainWindow(QMainWindow):
         self.clear_all_btn.clicked.connect(self._clear_output_folder)
         self.train_btn = QPushButton('Train Model')
         self.train_btn.clicked.connect(self._start_training_pipeline)
+<<<<<<< HEAD
         self.save_settings_btn = QPushButton('Save Settings')
         self.save_settings_btn.setToolTip('Save all current settings to config.ini. Settings are no longer saved automatically on close.')
         self.save_settings_btn.clicked.connect(self._save_settings_clicked)
+=======
+>>>>>>> feature/huateng-camera-support
 
         buttons.addWidget(self.start_btn)
         buttons.addWidget(self.pause_btn)
@@ -3406,7 +3562,10 @@ class MainWindow(QMainWindow):
         buttons.addWidget(self.capture_btn)
         buttons.addWidget(self.train_btn)
         buttons.addWidget(self.clear_all_btn)
+<<<<<<< HEAD
         buttons.addWidget(self.save_settings_btn)
+=======
+>>>>>>> feature/huateng-camera-support
         buttons.addStretch()
 
         controls.addLayout(left,3); controls.addLayout(right,2)
@@ -3492,8 +3651,12 @@ class MainWindow(QMainWindow):
         layout.addLayout(hardware_row)
 
         enable_row = QHBoxLayout()
+<<<<<<< HEAD
         self.arduino_enable_check = QCheckBox('Enable servo on danger')
         self.arduino_enable_check.setToolTip('Open the servo gate (Pin 9) only when a YOLO Dangerous Class is detected. Other anomalies never move the servo.')
+=======
+        self.arduino_enable_check = QCheckBox('Enable trigger on anomaly')
+>>>>>>> feature/huateng-camera-support
         self.arduino_enable_check.toggled.connect(self._arduino_config_changed)
         enable_row.addWidget(self.arduino_enable_check)
         enable_row.addSpacing(12)
@@ -4153,6 +4316,7 @@ class MainWindow(QMainWindow):
         self.yolo_conf_label.setText(f"{conf:.2f}")
         self.detector.set_yolo_confidence(conf)
         self._reprocess_image()
+<<<<<<< HEAD
     def _update_yolo_relay_confidence(self, value):
         conf = max(1, min(99, int(value))) / 100.0
         self.yolo_relay_conf_label.setText(f"{conf:.2f}")
@@ -4160,6 +4324,8 @@ class MainWindow(QMainWindow):
     def _update_capture_interval(self, value):
         if hasattr(self, 'detection_worker'):
             self.detection_worker.set_capture_interval(value)
+=======
+>>>>>>> feature/huateng-camera-support
     def _update_hue_tolerance(self, value):
         tolerance = max(0, min(20, int(value)))
         self.hue_tolerance_label.setText(str(tolerance))
@@ -5211,6 +5377,7 @@ class MainWindow(QMainWindow):
             pixmap = pixmap.copy(crop_x, crop_y, zoom_w, zoom_h)
         return pixmap.scaled(target_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
 
+<<<<<<< HEAD
     def _save_settings_clicked(self):
         try:
             self._save_settings()
@@ -5219,16 +5386,21 @@ class MainWindow(QMainWindow):
             return
         self.status_bar.showMessage('Settings saved to config.ini.', 3000)
 
+=======
+>>>>>>> feature/huateng-camera-support
     def _save_settings(self):
         s = QSettings('config.ini', QSettings.Format.IniFormat)
         s.setValue('model_path', self.model_path_edit.text())
         s.setValue('mse_threshold', self.thresh_slider.value())
         s.setValue('cv_threshold', self.cv_thresh_slider.value())
         s.setValue('yolo_confidence', self.yolo_conf_slider.value())
+<<<<<<< HEAD
         if hasattr(self, 'yolo_relay_conf_slider'):
             s.setValue('yolo_relay_confidence', self.yolo_relay_conf_slider.value())
         if hasattr(self, 'capture_interval_spin'):
             s.setValue('capture_interval', self.capture_interval_spin.value())
+=======
+>>>>>>> feature/huateng-camera-support
         s.setValue('contour_area', self.contour_slider.value())
         if hasattr(self, 'backend_combo'):
             s.setValue('backend_index', self.backend_combo.currentIndex())
@@ -5329,6 +5501,7 @@ class MainWindow(QMainWindow):
         self.cv_thresh_slider.setValue(s.value('cv_threshold',40,type=int))
         default_yolo_conf = int(max(1, min(99, round(self.detector.yolo_confidence * 100))))
         self.yolo_conf_slider.setValue(s.value('yolo_confidence',default_yolo_conf,type=int))
+<<<<<<< HEAD
         if hasattr(self, 'yolo_relay_conf_slider'):
             default_yolo_relay_conf = int(max(1, min(99, round(self.detector.yolo_relay_confidence * 100))))
             saved_relay_conf = s.value('yolo_relay_confidence', default_yolo_relay_conf, type=int)
@@ -5346,6 +5519,8 @@ class MainWindow(QMainWindow):
             self.capture_interval_spin.setValue(saved_capture_interval)
             self.capture_interval_spin.blockSignals(False)
             self._update_capture_interval(self.capture_interval_spin.value())
+=======
+>>>>>>> feature/huateng-camera-support
         if hasattr(self, 'yolo_class_filter_edit'):
             saved_filter = s.value('yolo_class_filter', '', type=str)
             self.yolo_class_filter_edit.blockSignals(True)
@@ -5563,6 +5738,10 @@ class MainWindow(QMainWindow):
             self.start_btn.setDisabled(False); self.test_image_btn.setDisabled(False)
 
     def closeEvent(self, event):
+<<<<<<< HEAD
+=======
+        self._save_settings()
+>>>>>>> feature/huateng-camera-support
         self._stop_monitor(notify=False)
         self._stop_detection(show_summary=False)
         self.monitor_window.close()
