@@ -1,5 +1,16 @@
 แกหแกห
 
+## 2026-11-25
+
+- New `onefileV22.py` (copy of `onefileV21.py`) with a **defect size gate for the air ejector**. Problem: the camera magnifies grains, so tiny spots look large and many good grains were blown out (ejector classes `paddy,Black_head,dot_dust,Discolored_Grain,Damaged_Grain,rice_big_dot`).
+- Training labels for Black_head / rice_dot / rice_big_dot / Discolored_Grain box the WHOLE grain (~110x55 px), so the box size says nothing about the spot size. V22 measures the spot inside the box instead: LAB crop, pixels darker than the box median by `dark_delta` or more yellow by `yellow_delta`, 3x3 opening (removes tray stripes), largest connected blob -> mm^2 via `px_per_mm`.
+- Rules live in new `defect_size_rules.ini` (created automatically next to the script, re-read on every Start Detection): `mode = off | log | on`, `px_per_mm`, `dark_delta`, `yellow_delta`, `[min_spot_mm2]` per class, optional `[min_conf]` per class. Only classes in `[min_spot_mm2]` are measured; other ejector classes (paddy, Damaged_Grain), Dangerous classes and the servo are unchanged.
+- Default `mode = log`: measures, shows `<label> <conf> <x.xx>mm2 EJECT/PASS` on the box, writes `output/defect_size/defect_size_log.csv` and crops `output/defect_size/crops/<class>/<time>_<mm2>_<EJECT|PASS>.png`, but the ejector behaves exactly as V21. Set `mode = on` after calibrating; blocked boxes are drawn green and do not fire the ejector.
+- Code: `DefectSizeGate` class (before `AnomalyDetector`); `AnomalyDetector.defect_gate`, `last_yolo_ejector_allowed`; `_run_yolo_detection` measures; `_get_relay_yolo_hits(..., ejector_allowed)` skips blocked boxes; `reset_counter` reloads the ini.
+- Offline test: synthetic spots measured within ~5% of true area; on a real new-camera frame, random grain boxes gave a spot >= 0.3 mm^2 in 3% of boxes with the final deltas (64% with the first, too-sensitive version). Not tested on the live rail.
+- TODO: measure `px_per_mm` with a ruler on each camera (default 16 is a guess; new camera is roughly 1.4x larger), collect QC accept/reject on the saved crops, set `[min_spot_mm2]`, then `mode = on`.
+- Files: `onefileV22.py` (new), `HISTORY.md`. Verified with `python3 -m py_compile onefileV22.py`.
+
 ## 2026-10-20
 
 - `onefileV21.py`: added a gray hint label after the "Capture Interval (s)" spinbox: "Used by: YOLO Capture, Ejector capture, Recon training (0 = every frame)".
